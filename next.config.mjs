@@ -9,9 +9,7 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  experimental: {
-    serverComponentsExternalPackages: ['xml2js', 'csv-writer', 'glob']
-  },
+  serverExternalPackages: ['xml2js', 'csv-writer', 'glob'],
   webpack: (config) => {
     config.resolve.fallback = {
       ...config.resolve.fallback,

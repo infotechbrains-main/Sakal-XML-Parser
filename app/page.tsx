@@ -41,12 +41,9 @@ export default function Home() {
   const errorsEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Simulate WebSocket connection for demo purposes
+  // Initialize
   useEffect(() => {
-    // In a real implementation, you would connect to your WebSocket server
     setIsConnected(true)
-
-    // Add some demo logs
     setLogs(["XML Parser initialized successfully", "Ready to process files", "Waiting for configuration..."])
   }, [])
 
@@ -83,61 +80,6 @@ export default function Home() {
     }
   }
 
-  const simulateProcessing = async () => {
-    const totalFiles = Math.floor(Math.random() * 1000) + 500 // Random between 500-1500
-
-    setStats((prev) => ({
-      ...prev,
-      totalFiles,
-      startTime: Date.now(),
-    }))
-
-    setLogs((prev) => [...prev, `Found ${totalFiles} XML files to process`])
-    setLogs((prev) => [...prev, `Starting processing with ${workers} workers...`])
-
-    // Simulate processing
-    for (let i = 0; i <= totalFiles; i += Math.floor(Math.random() * 20) + 10) {
-      await new Promise((resolve) => setTimeout(resolve, 100))
-
-      const processed = Math.min(i, totalFiles)
-      const successful = Math.floor(processed * 0.95) // 95% success rate
-      const errorFiles = processed - successful
-
-      setStats((prev) => ({
-        ...prev,
-        processedFiles: processed,
-        successfulFiles: successful,
-        errorFiles,
-      }))
-
-      setProgress((processed / totalFiles) * 100)
-
-      // Add occasional logs
-      if (i % 100 === 0 && i > 0) {
-        setLogs((prev) => [
-          ...prev,
-          `Processed ${processed}/${totalFiles} files (${successful} successful, ${errorFiles} errors)`,
-        ])
-      }
-
-      // Add occasional errors
-      if (Math.random() < 0.1 && errorFiles > 0) {
-        setErrors((prev) => [...prev, `Error processing file_${processed}.xml: Invalid XML structure`])
-      }
-    }
-
-    // Complete processing
-    setStats((prev) => ({
-      ...prev,
-      endTime: Date.now(),
-    }))
-
-    setLogs((prev) => [...prev, `Processing completed successfully!`])
-    setLogs((prev) => [...prev, `CSV file generated: ${outputFile}`])
-    setStatus("completed")
-    setDownloadUrl(`/api/download?file=${encodeURIComponent(outputFile)}`)
-  }
-
   const handleStartParsing = async () => {
     if (!rootDir) {
       alert("Please select a root directory first")
@@ -161,9 +103,59 @@ export default function Home() {
     setActiveTab("logs")
     setDownloadUrl("")
 
-    // In a real implementation, you would send this to your WebSocket server
-    // For demo purposes, we'll simulate the processing
-    await simulateProcessing()
+    try {
+      // Call the real API
+      const response = await fetch("/api/parse", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          rootDir,
+          outputFile,
+          workers,
+          batchSize,
+          verbose,
+        }),
+      })
+
+      const result = await response.json()
+
+      if (response.ok) {
+        setLogs((prev) => [...prev, `Found ${result.stats.totalFiles} XML files to process`])
+        setLogs((prev) => [...prev, `Processing completed successfully!`])
+        setLogs((prev) => [...prev, `Processed ${result.stats.processedFiles} files`])
+        setLogs((prev) => [...prev, `Successful: ${result.stats.successfulFiles}`])
+        setLogs((prev) => [...prev, `Errors: ${result.stats.errorFiles}`])
+        setLogs((prev) => [...prev, `Records written: ${result.stats.recordsWritten}`])
+        setLogs((prev) => [...prev, `CSV file generated: ${outputFile}`])
+
+        setStats((prev) => ({
+          ...prev,
+          totalFiles: result.stats.totalFiles,
+          processedFiles: result.stats.processedFiles,
+          successfulFiles: result.stats.successfulFiles,
+          errorFiles: result.stats.errorFiles,
+          endTime: Date.now(),
+        }))
+
+        setProgress(100)
+        setStatus("completed")
+        setDownloadUrl(`/api/download?file=${encodeURIComponent(outputFile)}`)
+
+        // Add errors to error log
+        if (result.errors && result.errors.length > 0) {
+          setErrors(result.errors)
+        }
+      } else {
+        setLogs((prev) => [...prev, `Error: ${result.error}`])
+        setLogs((prev) => [...prev, `Message: ${result.message || "Unknown error"}`])
+        setStatus("error")
+      }
+    } catch (error) {
+      setLogs((prev) => [...prev, `Network error: ${error instanceof Error ? error.message : "Unknown error"}`])
+      setStatus("error")
+    }
   }
 
   const handleDownloadCSV = () => {
@@ -206,7 +198,7 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
         )
       case "completed":
         return (
-          <Badge variant="success">
+          <Badge variant="default" className="bg-green-600">
             <CheckCircle className="h-3 w-3 mr-1" />
             Completed
           </Badge>
@@ -240,7 +232,7 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
 
   const getConnectionStatus = () => {
     return isConnected ? (
-      <Badge variant="success">
+      <Badge variant="default" className="bg-green-600">
         <CheckCircle className="h-3 w-3 mr-1" />
         Connected
       </Badge>
@@ -294,7 +286,7 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                         id="rootDir"
                         value={rootDir}
                         onChange={(e) => setRootDir(e.target.value)}
-                        placeholder="Select or enter path to images directory"
+                        placeholder="Enter full path to your XML directory (e.g., C:\path\to\Sample_Images)"
                         className="flex-1"
                       />
                       <Button variant="outline" onClick={handleSelectDirectory}>
@@ -312,7 +304,8 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                       style={{ display: "none" }}
                     />
                     <p className="text-sm text-muted-foreground">
-                      Select the root directory containing your image folders (City/Year/Month structure)
+                      Enter the full path to your directory containing XML files (e.g.,
+                      C:\Users\Aman\Desktop\Sample_Images)
                     </p>
                   </div>
 
@@ -375,7 +368,7 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                     size="lg"
                   >
                     <Play className="h-4 w-4 mr-2" />
-                    Start Processing
+                    Start Real Processing
                   </Button>
                 </CardFooter>
               </Card>

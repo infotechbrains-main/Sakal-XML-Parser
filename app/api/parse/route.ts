@@ -45,21 +45,57 @@ const CSV_HEADERS = [
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { rootDir, outputFile, workers, batchSize, verbose } = body
+    const { rootDir, outputFile = "image_metadata.csv", batchSize = 100, verbose = false } = body
+
+    console.log("Received request:", { rootDir, outputFile, batchSize, verbose })
 
     if (!rootDir) {
       return NextResponse.json({ error: "Root directory is required" }, { status: 400 })
     }
 
-    // Find all XML files using glob pattern
-    const xmlPattern = path.join(rootDir, "**", "processed", "*.xml")
-    const xmlFiles = await glob(xmlPattern)
+    // Create output file path in the project root
+    const outputPath = path.join(process.cwd(), outputFile)
+    console.log("Output path:", outputPath)
+
+    // Find all XML files using multiple patterns to be more flexible
+    const xmlPatterns = [
+      path.join(rootDir, "**", "processed", "*.xml"),
+      path.join(rootDir, "**", "*.xml"),
+      path.join(rootDir, "processed", "*.xml"),
+    ]
+
+    let xmlFiles: string[] = []
+
+    for (const pattern of xmlPatterns) {
+      console.log(`Searching with pattern: ${pattern}`)
+      try {
+        const files = await glob(pattern, { windowsPathsNoEscape: true })
+        if (files.length > 0) {
+          xmlFiles = files
+          console.log(`Found ${files.length} XML files with pattern: ${pattern}`)
+          break
+        }
+      } catch (error) {
+        console.log(`Pattern ${pattern} failed:`, error)
+      }
+    }
 
     if (xmlFiles.length === 0) {
+      // Try to list directory contents for debugging
+      try {
+        const dirContents = await fs.readdir(rootDir, { recursive: true })
+        const xmlInDir = dirContents.filter((file) => file.toString().endsWith(".xml"))
+        console.log(`Directory contents: ${dirContents.length} total files, ${xmlInDir.length} XML files`)
+        console.log("Sample XML files found:", xmlInDir.slice(0, 5))
+      } catch (dirError) {
+        console.log("Could not read directory:", dirError)
+      }
+
       return NextResponse.json(
         {
           error: "No XML files found",
-          message: "Please check the directory structure",
+          message: `Please check the directory structure. Searched in: ${rootDir}`,
+          searchPatterns: xmlPatterns,
         },
         { status: 404 },
       )
@@ -70,9 +106,13 @@ export async function POST(request: NextRequest) {
     let processedCount = 0
     let successCount = 0
     let errorCount = 0
+    const errors: string[] = []
+
+    console.log(`Starting to process ${xmlFiles.length} XML files`)
 
     for (let i = 0; i < xmlFiles.length; i += batchSize) {
       const batch = xmlFiles.slice(i, i + batchSize)
+      console.log(`Processing batch ${Math.floor(i / batchSize) + 1}: ${batch.length} files`)
 
       for (const xmlFile of batch) {
         try {
@@ -82,24 +122,39 @@ export async function POST(request: NextRequest) {
             successCount++
           } else {
             errorCount++
+            errors.push(`Failed to extract data from ${xmlFile}`)
           }
           processedCount++
+
+          // Log progress every 50 files
+          if (processedCount % 50 === 0) {
+            console.log(`Progress: ${processedCount}/${xmlFiles.length} files processed`)
+          }
         } catch (error) {
           errorCount++
+          const errorMsg = `Error processing ${xmlFile}: ${error instanceof Error ? error.message : "Unknown error"}`
+          errors.push(errorMsg)
           if (verbose) {
-            console.error(`Error processing ${xmlFile}:`, error)
+            console.error(errorMsg)
           }
         }
       }
     }
 
-    // Write CSV file
-    const csvWriter = createObjectCsvWriter({
-      path: outputFile,
-      header: CSV_HEADERS,
-    })
+    console.log(`Processing complete. ${successCount} successful, ${errorCount} errors`)
 
-    await csvWriter.writeRecords(allRecords)
+    // Write CSV file
+    if (allRecords.length > 0) {
+      const csvWriter = createObjectCsvWriter({
+        path: outputPath,
+        header: CSV_HEADERS,
+      })
+
+      await csvWriter.writeRecords(allRecords)
+      console.log(`CSV file written to: ${outputPath}`)
+    } else {
+      console.log("No records to write to CSV")
+    }
 
     return NextResponse.json({
       success: true,
@@ -108,8 +163,10 @@ export async function POST(request: NextRequest) {
         processedFiles: processedCount,
         successfulFiles: successCount,
         errorFiles: errorCount,
+        recordsWritten: allRecords.length,
       },
-      outputFile,
+      outputFile: outputPath,
+      errors: verbose ? errors : errors.slice(0, 10), // Limit errors in response
     })
   } catch (error) {
     console.error("Error in parse API:", error)
@@ -124,8 +181,10 @@ export async function POST(request: NextRequest) {
 }
 
 // Process a single XML file
-async function processXmlFile(xmlFilePath: string) {
+async function processXmlFile(xmlFilePath: string): Promise<any | null> {
   try {
+    console.log(`Processing: ${xmlFilePath}`)
+
     // Read and parse XML file
     const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
     const result = await parseStringPromise(xmlContent, {
@@ -146,6 +205,18 @@ async function processXmlFile(xmlFilePath: string) {
         year = pathParts[i + 2]
         month = pathParts[i + 3]
         break
+      }
+    }
+
+    // If not found with "images", try to extract from any part of the path
+    if (!city || !year || !month) {
+      // Look for year pattern (4 digits)
+      const yearMatch = pathParts.find((part) => /^\d{4}$/.test(part))
+      if (yearMatch) {
+        const yearIndex = pathParts.indexOf(yearMatch)
+        if (yearIndex > 0) city = pathParts[yearIndex - 1]
+        year = yearMatch
+        if (yearIndex + 1 < pathParts.length) month = pathParts[yearIndex + 1]
       }
     }
 
