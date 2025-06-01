@@ -3,7 +3,6 @@ import fs from "fs/promises"
 import path from "path"
 import { parseStringPromise } from "xml2js"
 import { createObjectCsvWriter } from "csv-writer"
-import { glob } from "glob"
 
 // CSV header definition
 const CSV_HEADERS = [
@@ -45,9 +44,9 @@ const CSV_HEADERS = [
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { rootDir, outputFile = "image_metadata.csv", batchSize = 100, verbose = false } = body
+    const { rootDir, outputFile = "image_metadata.csv", batchSize = 100, verbose = false, filterConfig = null } = body
 
-    console.log("Received request:", { rootDir, outputFile, batchSize, verbose })
+    console.log("Received request:", { rootDir, outputFile, batchSize, verbose, filterConfig })
 
     if (!rootDir) {
       return NextResponse.json({ error: "Root directory is required" }, { status: 400 })
@@ -57,48 +56,52 @@ export async function POST(request: NextRequest) {
     const outputPath = path.join(process.cwd(), outputFile)
     console.log("Output path:", outputPath)
 
-    // Find all XML files using multiple patterns to be more flexible
-    const xmlPatterns = [
-      path.join(rootDir, "**", "processed", "*.xml"),
-      path.join(rootDir, "**", "*.xml"),
-      path.join(rootDir, "processed", "*.xml"),
-    ]
-
-    let xmlFiles: string[] = []
-
-    for (const pattern of xmlPatterns) {
-      console.log(`Searching with pattern: ${pattern}`)
+    // Create filtered images folder if needed
+    let filteredImagesPath = ""
+    if (filterConfig?.moveImages && filterConfig?.outputFolder) {
+      filteredImagesPath = path.join(rootDir, filterConfig.outputFolder)
       try {
-        const files = await glob(pattern, { windowsPathsNoEscape: true })
-        if (files.length > 0) {
-          xmlFiles = files
-          console.log(`Found ${files.length} XML files with pattern: ${pattern}`)
-          break
-        }
+        await fs.mkdir(filteredImagesPath, { recursive: true })
+        console.log(`Created filtered images folder: ${filteredImagesPath}`)
       } catch (error) {
-        console.log(`Pattern ${pattern} failed:`, error)
+        console.log(`Error creating filtered folder: ${error}`)
       }
     }
 
+    // Find XML files using manual directory traversal
+    console.log("Searching for XML files...")
+    const xmlFiles = await findXmlFilesManually(rootDir)
+    console.log(`Found ${xmlFiles.length} XML files`)
+
     if (xmlFiles.length === 0) {
-      // Try to list directory contents for debugging
       try {
         const dirContents = await fs.readdir(rootDir, { recursive: true })
-        const xmlInDir = dirContents.filter((file) => file.toString().endsWith(".xml"))
-        console.log(`Directory contents: ${dirContents.length} total files, ${xmlInDir.length} XML files`)
-        console.log("Sample XML files found:", xmlInDir.slice(0, 5))
-      } catch (dirError) {
-        console.log("Could not read directory:", dirError)
-      }
+        const allFiles = dirContents.map((f) => f.toString())
+        const xmlInDir = allFiles.filter((file) => file.toLowerCase().endsWith(".xml"))
+        const sampleFiles = allFiles.slice(0, 20)
 
-      return NextResponse.json(
-        {
-          error: "No XML files found",
-          message: `Please check the directory structure. Searched in: ${rootDir}`,
-          searchPatterns: xmlPatterns,
-        },
-        { status: 404 },
-      )
+        return NextResponse.json(
+          {
+            error: "No XML files found",
+            message: `Searched in: ${rootDir}`,
+            debug: {
+              totalFiles: allFiles.length,
+              xmlFiles: xmlInDir.length,
+              sampleFiles: sampleFiles,
+              xmlFilesFound: xmlInDir.slice(0, 10),
+            },
+          },
+          { status: 404 },
+        )
+      } catch (dirError) {
+        return NextResponse.json(
+          {
+            error: "Directory read error",
+            message: `Could not read directory: ${rootDir}`,
+          },
+          { status: 404 },
+        )
+      }
     }
 
     // Process files in batches
@@ -106,9 +109,14 @@ export async function POST(request: NextRequest) {
     let processedCount = 0
     let successCount = 0
     let errorCount = 0
+    let filteredCount = 0
+    let movedCount = 0
     const errors: string[] = []
 
     console.log(`Starting to process ${xmlFiles.length} XML files`)
+    if (filterConfig?.enabled) {
+      console.log("Filtering enabled:", filterConfig)
+    }
 
     for (let i = 0; i < xmlFiles.length; i += batchSize) {
       const batch = xmlFiles.slice(i, i + batchSize)
@@ -116,13 +124,26 @@ export async function POST(request: NextRequest) {
 
       for (const xmlFile of batch) {
         try {
-          const record = await processXmlFile(xmlFile)
-          if (record) {
-            allRecords.push(record)
-            successCount++
+          const result = await processXmlFile(xmlFile, filterConfig, filteredImagesPath)
+          if (result) {
+            if (result.record) {
+              allRecords.push(result.record)
+              successCount++
+
+              if (result.passedFilter) {
+                filteredCount++
+              }
+
+              if (result.imageMoved) {
+                movedCount++
+              }
+            } else {
+              errorCount++
+              errors.push(`Failed to extract data from ${xmlFile}`)
+            }
           } else {
             errorCount++
-            errors.push(`Failed to extract data from ${xmlFile}`)
+            errors.push(`Failed to process ${xmlFile}`)
           }
           processedCount++
 
@@ -141,7 +162,9 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    console.log(`Processing complete. ${successCount} successful, ${errorCount} errors`)
+    console.log(
+      `Processing complete. ${successCount} successful, ${errorCount} errors, ${filteredCount} filtered, ${movedCount} moved`,
+    )
 
     // Write CSV file
     if (allRecords.length > 0) {
@@ -164,9 +187,11 @@ export async function POST(request: NextRequest) {
         successfulFiles: successCount,
         errorFiles: errorCount,
         recordsWritten: allRecords.length,
+        filteredFiles: filteredCount,
+        movedFiles: movedCount,
       },
       outputFile: outputPath,
-      errors: verbose ? errors : errors.slice(0, 10), // Limit errors in response
+      errors: verbose ? errors : errors.slice(0, 10),
     })
   } catch (error) {
     console.error("Error in parse API:", error)
@@ -180,8 +205,90 @@ export async function POST(request: NextRequest) {
   }
 }
 
+// Manual directory traversal function
+async function findXmlFilesManually(rootDir: string): Promise<string[]> {
+  const xmlFiles: string[] = []
+
+  async function traverse(dir: string) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true })
+
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+
+        if (entry.isDirectory()) {
+          await traverse(fullPath)
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
+          xmlFiles.push(fullPath)
+        }
+      }
+    } catch (error) {
+      console.log(`Error traversing ${dir}:`, error)
+    }
+  }
+
+  await traverse(rootDir)
+  return xmlFiles
+}
+
+// Check if image passes filter criteria
+function passesFilter(record: any, filterConfig: any): boolean {
+  if (!filterConfig?.enabled) return true
+
+  const imageWidth = Number.parseInt(record.imageWidth) || 0
+  const imageHeight = Number.parseInt(record.imageHeight) || 0
+  const fileSize = Number.parseInt(record.imageSize) || 0
+
+  // Check image dimensions
+  if (filterConfig.minWidth && imageWidth < filterConfig.minWidth) {
+    return false
+  }
+
+  if (filterConfig.minHeight && imageHeight < filterConfig.minHeight) {
+    return false
+  }
+
+  // Check file size
+  if (filterConfig.minFileSize && fileSize < filterConfig.minFileSize) {
+    return false
+  }
+
+  if (filterConfig.maxFileSize && fileSize > filterConfig.maxFileSize) {
+    return false
+  }
+
+  return true
+}
+
+// Move image file to filtered folder
+async function moveImageToFilteredFolder(imagePath: string, filteredImagesPath: string): Promise<boolean> {
+  try {
+    if (!imagePath || !filteredImagesPath) return false
+
+    // Check if source image exists
+    await fs.access(imagePath)
+
+    // Create destination path
+    const fileName = path.basename(imagePath)
+    const destPath = path.join(filteredImagesPath, fileName)
+
+    // Create subdirectories if needed
+    const destDir = path.dirname(destPath)
+    await fs.mkdir(destDir, { recursive: true })
+
+    // Copy the file (we use copy instead of move to preserve original)
+    await fs.copyFile(imagePath, destPath)
+
+    console.log(`Moved image: ${imagePath} -> ${destPath}`)
+    return true
+  } catch (error) {
+    console.log(`Error moving image ${imagePath}:`, error)
+    return false
+  }
+}
+
 // Process a single XML file
-async function processXmlFile(xmlFilePath: string): Promise<any | null> {
+async function processXmlFile(xmlFilePath: string, filterConfig: any, filteredImagesPath: string): Promise<any | null> {
   try {
     console.log(`Processing: ${xmlFilePath}`)
 
@@ -383,8 +490,8 @@ async function processXmlFile(xmlFilePath: string): Promise<any | null> {
       }
     }
 
-    // Return record for CSV
-    return {
+    // Create record for CSV
+    const record = {
       city,
       year,
       month,
@@ -418,6 +525,26 @@ async function processXmlFile(xmlFilePath: string): Promise<any | null> {
       creationDate,
       revisionDate,
       commentData,
+    }
+
+    // Check if record passes filter
+    const passedFilter = passesFilter(record, filterConfig)
+    let imageMoved = false
+
+    // If filtering is enabled and record doesn't pass, return null (skip this record)
+    if (filterConfig?.enabled && !passedFilter) {
+      return { record: null, passedFilter: false, imageMoved: false }
+    }
+
+    // Move image if filtering is enabled, record passed, and move option is enabled
+    if (filterConfig?.enabled && passedFilter && filterConfig?.moveImages && imageExists && imagePath) {
+      imageMoved = await moveImageToFilteredFolder(imagePath, filteredImagesPath)
+    }
+
+    return {
+      record: passedFilter ? record : null,
+      passedFilter,
+      imageMoved,
     }
   } catch (err) {
     console.error(`Error extracting data from ${xmlFilePath}:`, err)

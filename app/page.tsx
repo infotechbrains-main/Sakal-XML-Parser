@@ -13,7 +13,20 @@ import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { AlertCircle, CheckCircle, Clock, FileDown, FolderOpen, Play, Settings, Upload } from "lucide-react"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import {
+  AlertCircle,
+  CheckCircle,
+  Clock,
+  FileDown,
+  FolderOpen,
+  Play,
+  Settings,
+  Upload,
+  Filter,
+  ImageIcon,
+  HardDrive,
+} from "lucide-react"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 
 export default function Home() {
@@ -22,6 +35,18 @@ export default function Home() {
   const [workers, setWorkers] = useState(4)
   const [batchSize, setBatchSize] = useState(100)
   const [verbose, setVerbose] = useState(true)
+
+  // Filter settings
+  const [enableFiltering, setEnableFiltering] = useState(false)
+  const [minImageSize, setMinImageSize] = useState("512")
+  const [customMinWidth, setCustomMinWidth] = useState("")
+  const [customMinHeight, setCustomMinHeight] = useState("")
+  const [minFileSize, setMinFileSize] = useState("")
+  const [maxFileSize, setMaxFileSize] = useState("")
+  const [fileSizeUnit, setFileSizeUnit] = useState("KB")
+  const [moveFilteredImages, setMoveFilteredImages] = useState(false)
+  const [filteredImagesFolder, setFilteredImagesFolder] = useState("filtered_images")
+
   const [status, setStatus] = useState("idle") // idle, running, completed, error
   const [logs, setLogs] = useState<string[]>([])
   const [errors, setErrors] = useState<string[]>([])
@@ -31,6 +56,8 @@ export default function Home() {
     processedFiles: 0,
     successfulFiles: 0,
     errorFiles: 0,
+    filteredFiles: 0,
+    movedFiles: 0,
     startTime: 0,
     endTime: 0,
   })
@@ -80,6 +107,39 @@ export default function Home() {
     }
   }
 
+  const getFilterConfig = () => {
+    if (!enableFiltering) return null
+
+    const config: any = {
+      enabled: true,
+      moveImages: moveFilteredImages,
+      outputFolder: filteredImagesFolder,
+    }
+
+    // Image size filters
+    if (minImageSize === "custom") {
+      config.minWidth = Number.parseInt(customMinWidth) || 0
+      config.minHeight = Number.parseInt(customMinHeight) || 0
+    } else if (minImageSize !== "none") {
+      const size = Number.parseInt(minImageSize)
+      config.minWidth = size
+      config.minHeight = size
+    }
+
+    // File size filters
+    if (minFileSize) {
+      const multiplier = fileSizeUnit === "MB" ? 1024 * 1024 : 1024
+      config.minFileSize = Number.parseInt(minFileSize) * multiplier
+    }
+
+    if (maxFileSize) {
+      const multiplier = fileSizeUnit === "MB" ? 1024 * 1024 : 1024
+      config.maxFileSize = Number.parseInt(maxFileSize) * multiplier
+    }
+
+    return config
+  }
+
   const handleStartParsing = async () => {
     if (!rootDir) {
       alert("Please select a root directory first")
@@ -89,6 +149,27 @@ export default function Home() {
     // Reset state
     setLogs((prev) => [...prev, "=".repeat(50)])
     setLogs((prev) => [...prev, "Starting new parsing session..."])
+
+    if (enableFiltering) {
+      setLogs((prev) => [...prev, "Filtering enabled - only matching images will be processed"])
+      const filterConfig = getFilterConfig()
+      if (filterConfig?.minWidth || filterConfig?.minHeight) {
+        setLogs((prev) => [
+          ...prev,
+          `Image size filter: min ${filterConfig.minWidth || 0}x${filterConfig.minHeight || 0} pixels`,
+        ])
+      }
+      if (filterConfig?.minFileSize || filterConfig?.maxFileSize) {
+        setLogs((prev) => [
+          ...prev,
+          `File size filter: ${filterConfig.minFileSize ? `min ${Math.round(filterConfig.minFileSize / 1024)}KB` : ""} ${filterConfig.maxFileSize ? `max ${Math.round(filterConfig.maxFileSize / 1024)}KB` : ""}`,
+        ])
+      }
+      if (moveFilteredImages) {
+        setLogs((prev) => [...prev, `Filtered images will be moved to: ${filteredImagesFolder}`])
+      }
+    }
+
     setErrors([])
     setProgress(0)
     setStats({
@@ -96,6 +177,8 @@ export default function Home() {
       processedFiles: 0,
       successfulFiles: 0,
       errorFiles: 0,
+      filteredFiles: 0,
+      movedFiles: 0,
       startTime: Date.now(),
       endTime: 0,
     })
@@ -116,6 +199,7 @@ export default function Home() {
           workers,
           batchSize,
           verbose,
+          filterConfig: getFilterConfig(),
         }),
       })
 
@@ -123,6 +207,12 @@ export default function Home() {
 
       if (response.ok) {
         setLogs((prev) => [...prev, `Found ${result.stats.totalFiles} XML files to process`])
+        if (result.stats.filteredFiles !== undefined) {
+          setLogs((prev) => [...prev, `${result.stats.filteredFiles} files matched the filter criteria`])
+        }
+        if (result.stats.movedFiles !== undefined && result.stats.movedFiles > 0) {
+          setLogs((prev) => [...prev, `${result.stats.movedFiles} images moved to filtered folder`])
+        }
         setLogs((prev) => [...prev, `Processing completed successfully!`])
         setLogs((prev) => [...prev, `Processed ${result.stats.processedFiles} files`])
         setLogs((prev) => [...prev, `Successful: ${result.stats.successfulFiles}`])
@@ -136,6 +226,8 @@ export default function Home() {
           processedFiles: result.stats.processedFiles,
           successfulFiles: result.stats.successfulFiles,
           errorFiles: result.stats.errorFiles,
+          filteredFiles: result.stats.filteredFiles || 0,
+          movedFiles: result.stats.movedFiles || 0,
           endTime: Date.now(),
         }))
 
@@ -252,12 +344,18 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
             <div>
               <CardTitle className="text-3xl font-bold">XML Image Metadata Parser</CardTitle>
               <CardDescription className="text-lg">
-                Extract metadata from XML files and generate comprehensive CSV reports
+                Extract metadata from XML files with advanced filtering options
               </CardDescription>
             </div>
             <div className="flex gap-2">
               {getConnectionStatus()}
               {getStatusBadge()}
+              {enableFiltering && (
+                <Badge variant="outline">
+                  <Filter className="h-3 w-3 mr-1" />
+                  Filtering Enabled
+                </Badge>
+              )}
             </div>
           </div>
         </CardHeader>
@@ -266,8 +364,9 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         <div className="lg:col-span-3">
           <Tabs value={activeTab} onValueChange={setActiveTab}>
-            <TabsList className="grid grid-cols-3 mb-4">
+            <TabsList className="grid grid-cols-4 mb-4">
               <TabsTrigger value="config">Configuration</TabsTrigger>
+              <TabsTrigger value="filters">Filters</TabsTrigger>
               <TabsTrigger value="logs">Processing Logs</TabsTrigger>
               <TabsTrigger value="results">Results & Download</TabsTrigger>
             </TabsList>
@@ -304,8 +403,7 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                       style={{ display: "none" }}
                     />
                     <p className="text-sm text-muted-foreground">
-                      Enter the full path to your directory containing XML files (e.g.,
-                      C:\Users\Aman\Desktop\Sample_Images)
+                      Enter the full path to your directory containing XML files
                     </p>
                   </div>
 
@@ -360,17 +458,180 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                     <p className="text-sm text-muted-foreground ml-2">Show detailed processing information</p>
                   </div>
                 </CardContent>
-                <CardFooter>
-                  <Button
-                    onClick={handleStartParsing}
-                    disabled={status === "running" || !rootDir}
-                    className="w-full"
-                    size="lg"
-                  >
-                    <Play className="h-4 w-4 mr-2" />
-                    Start Real Processing
-                  </Button>
-                </CardFooter>
+              </Card>
+            </TabsContent>
+
+            <TabsContent value="filters">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Filter className="h-5 w-5" />
+                    Image Filtering Options
+                  </CardTitle>
+                  <CardDescription>Filter images by size and move matching images to a separate folder</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                  <div className="flex items-center space-x-2">
+                    <Switch id="enableFiltering" checked={enableFiltering} onCheckedChange={setEnableFiltering} />
+                    <Label htmlFor="enableFiltering">Enable Image Filtering</Label>
+                    <p className="text-sm text-muted-foreground ml-2">Only process images that match the criteria</p>
+                  </div>
+
+                  {enableFiltering && (
+                    <>
+                      <div className="border rounded-lg p-4 space-y-4">
+                        <div className="flex items-center gap-2 mb-3">
+                          <ImageIcon className="h-4 w-4" />
+                          <h3 className="font-medium">Image Dimensions Filter</h3>
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label>Minimum Image Size</Label>
+                          <Select value={minImageSize} onValueChange={setMinImageSize}>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select minimum size" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="none">No size filter</SelectItem>
+                              <SelectItem value="512">512x512 pixels</SelectItem>
+                              <SelectItem value="720">720x720 pixels</SelectItem>
+                              <SelectItem value="1024">1024x1024 pixels</SelectItem>
+                              <SelectItem value="1280">1280x1280 pixels</SelectItem>
+                              <SelectItem value="1920">1920x1920 pixels</SelectItem>
+                              <SelectItem value="custom">Custom size</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        {minImageSize === "custom" && (
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <Label htmlFor="customMinWidth">Min Width (px)</Label>
+                              <Input
+                                id="customMinWidth"
+                                type="number"
+                                value={customMinWidth}
+                                onChange={(e) => setCustomMinWidth(e.target.value)}
+                                placeholder="e.g., 800"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="customMinHeight">Min Height (px)</Label>
+                              <Input
+                                id="customMinHeight"
+                                type="number"
+                                value={customMinHeight}
+                                onChange={(e) => setCustomMinHeight(e.target.value)}
+                                placeholder="e.g., 600"
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="border rounded-lg p-4 space-y-4">
+                        <div className="flex items-center gap-2 mb-3">
+                          <HardDrive className="h-4 w-4" />
+                          <h3 className="font-medium">File Size Filter</h3>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-4">
+                          <div className="space-y-2">
+                            <Label htmlFor="minFileSize">Min File Size</Label>
+                            <Input
+                              id="minFileSize"
+                              type="number"
+                              value={minFileSize}
+                              onChange={(e) => setMinFileSize(e.target.value)}
+                              placeholder="e.g., 100"
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label htmlFor="maxFileSize">Max File Size</Label>
+                            <Input
+                              id="maxFileSize"
+                              type="number"
+                              value={maxFileSize}
+                              onChange={(e) => setMaxFileSize(e.target.value)}
+                              placeholder="e.g., 5000"
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label>Unit</Label>
+                            <Select value={fileSizeUnit} onValueChange={setFileSizeUnit}>
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="KB">KB</SelectItem>
+                                <SelectItem value="MB">MB</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </div>
+                        <p className="text-sm text-muted-foreground">Leave empty to skip file size filtering</p>
+                      </div>
+
+                      <div className="border rounded-lg p-4 space-y-4">
+                        <div className="flex items-center gap-2 mb-3">
+                          <FolderOpen className="h-4 w-4" />
+                          <h3 className="font-medium">Move Filtered Images</h3>
+                        </div>
+
+                        <div className="flex items-center space-x-2">
+                          <Switch
+                            id="moveFilteredImages"
+                            checked={moveFilteredImages}
+                            onCheckedChange={setMoveFilteredImages}
+                          />
+                          <Label htmlFor="moveFilteredImages">Move matching images to separate folder</Label>
+                        </div>
+
+                        {moveFilteredImages && (
+                          <div className="space-y-2">
+                            <Label htmlFor="filteredImagesFolder">Filtered Images Folder</Label>
+                            <Input
+                              id="filteredImagesFolder"
+                              value={filteredImagesFolder}
+                              onChange={(e) => setFilteredImagesFolder(e.target.value)}
+                              placeholder="filtered_images"
+                            />
+                            <p className="text-sm text-muted-foreground">
+                              Folder name where filtered images will be moved (relative to root directory)
+                            </p>
+                          </div>
+                        )}
+                      </div>
+
+                      <Alert>
+                        <Filter className="h-4 w-4" />
+                        <AlertTitle>Filter Summary</AlertTitle>
+                        <AlertDescription>
+                          {minImageSize !== "none" && (
+                            <div>
+                              Image size:{" "}
+                              {minImageSize === "custom"
+                                ? `${customMinWidth || 0}x${customMinHeight || 0}`
+                                : `${minImageSize}x${minImageSize}`}{" "}
+                              pixels minimum
+                            </div>
+                          )}
+                          {(minFileSize || maxFileSize) && (
+                            <div>
+                              File size: {minFileSize && `${minFileSize}${fileSizeUnit} min`}{" "}
+                              {maxFileSize && `${maxFileSize}${fileSizeUnit} max`}
+                            </div>
+                          )}
+                          {moveFilteredImages && <div>Images will be moved to: {filteredImagesFolder}</div>}
+                          {!minImageSize ||
+                            (minImageSize === "none" && !minFileSize && !maxFileSize && (
+                              <div>No filters active - all images will be processed</div>
+                            ))}
+                        </AlertDescription>
+                      </Alert>
+                    </>
+                  )}
+                </CardContent>
               </Card>
             </TabsContent>
 
@@ -463,7 +724,7 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                     </Alert>
                   ) : (
                     <>
-                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
                         <Card>
                           <CardHeader className="p-4">
                             <CardTitle className="text-sm text-muted-foreground">Total Files</CardTitle>
@@ -492,10 +753,18 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                         </Card>
                         <Card>
                           <CardHeader className="p-4">
-                            <CardTitle className="text-sm text-muted-foreground">Errors</CardTitle>
+                            <CardTitle className="text-sm text-muted-foreground">Filtered</CardTitle>
                           </CardHeader>
                           <CardContent className="p-4 pt-0">
-                            <p className="text-3xl font-bold text-red-600">{stats.errorFiles.toLocaleString()}</p>
+                            <p className="text-3xl font-bold text-blue-600">{stats.filteredFiles.toLocaleString()}</p>
+                          </CardContent>
+                        </Card>
+                        <Card>
+                          <CardHeader className="p-4">
+                            <CardTitle className="text-sm text-muted-foreground">Moved</CardTitle>
+                          </CardHeader>
+                          <CardContent className="p-4 pt-0">
+                            <p className="text-3xl font-bold text-purple-600">{stats.movedFiles.toLocaleString()}</p>
                           </CardContent>
                         </Card>
                       </div>
@@ -523,10 +792,14 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                         </Card>
                         <Card>
                           <CardHeader className="p-4">
-                            <CardTitle className="text-sm text-muted-foreground">Output File</CardTitle>
+                            <CardTitle className="text-sm text-muted-foreground">Filter Rate</CardTitle>
                           </CardHeader>
                           <CardContent className="p-4 pt-0">
-                            <p className="text-xl font-medium truncate">{outputFile}</p>
+                            <p className="text-xl font-medium">
+                              {stats.totalFiles > 0 && enableFiltering
+                                ? `${Math.round((stats.filteredFiles / stats.totalFiles) * 100)}%`
+                                : "N/A"}
+                            </p>
                           </CardContent>
                         </Card>
                       </div>
@@ -536,8 +809,11 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                           <CheckCircle className="h-4 w-4 text-green-600" />
                           <AlertTitle className="text-green-600">Processing completed successfully!</AlertTitle>
                           <AlertDescription>
-                            All files have been processed and the CSV has been generated. You can now download the
-                            results.
+                            All files have been processed and the CSV has been generated.
+                            {enableFiltering && ` ${stats.filteredFiles} images matched your filter criteria.`}
+                            {moveFilteredImages &&
+                              stats.movedFiles > 0 &&
+                              ` ${stats.movedFiles} images were moved to the filtered folder.`}
                           </AlertDescription>
                         </Alert>
                       )}
@@ -599,6 +875,18 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                   <span className="text-muted-foreground">Processed:</span>
                   <span className="font-medium">{stats.processedFiles.toLocaleString()}</span>
                 </div>
+                {enableFiltering && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Filtered:</span>
+                    <span className="font-medium text-blue-600">{stats.filteredFiles.toLocaleString()}</span>
+                  </div>
+                )}
+                {moveFilteredImages && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Moved:</span>
+                    <span className="font-medium text-purple-600">{stats.movedFiles.toLocaleString()}</span>
+                  </div>
+                )}
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">Success Rate:</span>
                   <span className="font-medium text-green-600">
@@ -657,6 +945,10 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
               >
                 <Settings className="h-4 w-4 mr-2" />
                 Configuration
+              </Button>
+              <Button variant="outline" className="w-full" onClick={() => setActiveTab("filters")}>
+                <Filter className="h-4 w-4 mr-2" />
+                Filters
               </Button>
               <Button variant="outline" className="w-full" onClick={() => setActiveTab("logs")}>
                 <Upload className="h-4 w-4 mr-2" />
