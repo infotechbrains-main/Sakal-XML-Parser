@@ -16,6 +16,7 @@ const nextConfig = {
       fs: false,
       path: false,
       os: false,
+      worker_threads: false,
     };
     return config;
   },

@@ -50,7 +50,6 @@
     "lucide-react": "^0.454.0",
     "next": "15.2.4",
     "next-themes": "^0.4.4",
-    "os": "latest",
     "path": "latest",
     "react": "^19",
     "react-day-picker": "8.10.1",
@@ -62,7 +61,6 @@
     "tailwind-merge": "^2.5.5",
     "tailwindcss-animate": "^1.0.7",
     "vaul": "^0.9.6",
-    "worker_threads": "latest",
     "xml2js": "latest",
     "zod": "^3.24.1"
   },
