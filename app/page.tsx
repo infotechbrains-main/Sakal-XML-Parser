@@ -457,6 +457,17 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                     <Label htmlFor="verbose">Verbose Logging</Label>
                     <p className="text-sm text-muted-foreground ml-2">Show detailed processing information</p>
                   </div>
+                  <div className="mt-6 pt-4 border-t">
+                    <Button
+                      onClick={handleStartParsing}
+                      disabled={status === "running" || !rootDir}
+                      className="w-full"
+                      size="lg"
+                    >
+                      <Play className="h-4 w-4 mr-2" />
+                      Start Processing
+                    </Button>
+                  </div>
                 </CardContent>
               </Card>
             </TabsContent>
@@ -629,7 +640,33 @@ Delhi,2010,09,2010-09-01_13-01-54_MED_838EB5AE_N_000_000_000_org,"Another Headli
                             ))}
                         </AlertDescription>
                       </Alert>
+
+                      <div className="mt-6 pt-4 border-t">
+                        <Button
+                          onClick={handleStartParsing}
+                          disabled={status === "running" || !rootDir}
+                          className="w-full"
+                          size="lg"
+                        >
+                          <Play className="h-4 w-4 mr-2" />
+                          Start Processing with Filters
+                        </Button>
+                      </div>
                     </>
+                  )}
+
+                  {!enableFiltering && (
+                    <div className="mt-6 pt-4 border-t">
+                      <Button
+                        onClick={handleStartParsing}
+                        disabled={status === "running" || !rootDir}
+                        className="w-full"
+                        size="lg"
+                      >
+                        <Play className="h-4 w-4 mr-2" />
+                        Start Processing (No Filters)
+                      </Button>
+                    </div>
                   )}
                 </CardContent>
               </Card>
