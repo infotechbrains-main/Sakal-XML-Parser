@@ -107,14 +107,28 @@ function passesFilter(record, filterConfig) {
     return false
   }
 
-  // FIXED: File size filters - convert bytes to the correct unit
-  const fileSizeBytes = Number.parseInt(record.imageSize) || 0
+  // FIXED: File size filters - convert bytes to the correct unit and add detailed logging
+  const fileSizeBytes = record.actualFileSize || Number.parseInt(record.imageSize) || 0
+  const sizeSource = record.actualFileSize ? "filesystem" : "XML"
+  const verbose = workerData.verbose
+  const workerId = workerData.workerId
+
+  if (verbose) {
+    console.log(`[Worker ${workerId}] File size check for ${record.imageHref}:`)
+    console.log(`  - Size source: ${sizeSource}`)
+    console.log(`  - File size: ${fileSizeBytes} bytes (${Math.round((fileSizeBytes / 1024 / 1024) * 100) / 100}MB)`)
+  }
 
   if (filterConfig.minFileSize) {
+    if (verbose) {
+      console.log(
+        `  - Min file size filter: ${filterConfig.minFileSize} bytes (${Math.round(filterConfig.minFileSize / 1024)}KB)`,
+      )
+    }
     if (fileSizeBytes < filterConfig.minFileSize) {
-      if (workerData.verbose) {
+      if (verbose) {
         console.log(
-          `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round(fileSizeBytes / 1024)}KB) < ${filterConfig.minFileSize} bytes (${Math.round(filterConfig.minFileSize / 1024)}KB)`,
+          `[Worker ${workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round(fileSizeBytes / 1024)}KB) < ${filterConfig.minFileSize} bytes (${Math.round(filterConfig.minFileSize / 1024)}KB)`,
         )
       }
       return false
@@ -122,10 +136,15 @@ function passesFilter(record, filterConfig) {
   }
 
   if (filterConfig.maxFileSize) {
+    if (verbose) {
+      console.log(
+        `  - Max file size filter: ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
+      )
+    }
     if (fileSizeBytes > filterConfig.maxFileSize) {
-      if (workerData.verbose) {
+      if (verbose) {
         console.log(
-          `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round((fileSizeBytes / 1024 / 1024) * 100) / 100}MB) > ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
+          `[Worker ${workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round((fileSizeBytes / 1024 / 1024) * 100) / 100}MB) > ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
         )
       }
       return false
@@ -401,6 +420,28 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       }
     }
 
+    let actualFileSize = 0
+    if (imageExists && imagePath) {
+      try {
+        const stats = await fs.stat(imagePath)
+        actualFileSize = stats.size
+        if (verbose) {
+          console.log(
+            `[Worker ${workerId}] Actual file size from filesystem: ${actualFileSize} bytes (${Math.round((actualFileSize / 1024 / 1024) * 100) / 100}MB)`,
+          )
+          if (imageSize && Number.parseInt(imageSize) !== actualFileSize) {
+            console.log(
+              `[Worker ${workerId}] WARNING: XML size (${imageSize}) differs from actual file size (${actualFileSize})`,
+            )
+          }
+        }
+      } catch (err) {
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Could not get actual file size: ${err.message}`)
+        }
+      }
+    }
+
     const record = {
       city,
       year,
@@ -431,6 +472,7 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       imageWidth,
       imageHeight,
       imageSize,
+      actualFileSize,
       imageHref,
       xmlPath: xmlFilePath,
       imagePath,
@@ -441,11 +483,16 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
     }
 
     if (verbose) {
-      console.log(`[Worker ${workerId}] Extracted data for ${path.basename(xmlFilePath)}:`)
-      console.log(`  - Image: ${imageHref} (${imageWidth}x${imageHeight}, ${imageSize} bytes)`)
-      console.log(`  - CreditLine: "${creditline}" (length: ${creditline.length})`)
-      console.log(`  - UsageType: "${usageType}"`)
-      console.log(`  - RightsHolder: "${rightsHolder}"`)
+      console.log(`[Worker ${workerId}] Extracted image metadata for ${path.basename(xmlFilePath)}:`)
+      console.log(`  - Image file: ${imageHref}`)
+      console.log(`  - Raw size from XML: "${imageSize}"`)
+      console.log(`  - Dimensions: ${imageWidth}x${imageHeight}`)
+      console.log(`  - Image exists: ${imageExists}`)
+      if (imageSize) {
+        const sizeBytes = Number.parseInt(imageSize) || 0
+        console.log(`  - Size in bytes: ${sizeBytes}`)
+        console.log(`  - Size in MB: ${Math.round((sizeBytes / 1024 / 1024) * 100) / 100}MB`)
+      }
     }
 
     const passed = passesFilter(record, filterConfig)

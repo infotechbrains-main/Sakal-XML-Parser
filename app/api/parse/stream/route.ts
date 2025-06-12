@@ -3,7 +3,7 @@ import fs from "fs/promises"
 import path from "path"
 import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
-import { CSV_HEADERS } from "../route"
+import { CSV_HEADERS_MAIN } from "../route"
 
 // Manual directory traversal function
 async function findXmlFilesManually(rootDir: string): Promise<string[]> {
@@ -252,7 +252,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       sendMessage("log", { message: "Writing CSV file..." })
       const csvWriterInstance = createObjectCsvWriter({
         path: outputPath,
-        header: CSV_HEADERS,
+        header: CSV_HEADERS_MAIN,
       })
       await csvWriterInstance.writeRecords(allRecords)
       sendMessage("log", { message: `CSV file written: ${path.basename(outputPath)}` })
