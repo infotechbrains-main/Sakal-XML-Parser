@@ -420,10 +420,7 @@ export default function Home() {
         <CardHeader>
           <div className="flex justify-between items-center">
             <div>
-              <CardTitle className="text-3xl font-bold">XML Image Metadata Parser</CardTitle>
-              <CardDescription className="text-lg">
-                Extract metadata from XML files with advanced filtering options
-              </CardDescription>
+              <CardTitle className="text-3xl font-bold">Sakal Image Metadata Parser</CardTitle>
             </div>
             <div className="flex gap-2">
               {getConnectionStatus()}
@@ -527,14 +524,6 @@ export default function Home() {
                       Automatically process new files added to the root folder.
                     </p>
                   </div>
-                  <Alert variant="destructive" className="mt-4">
-                    <AlertCircle className="h-4 w-4" />
-                    <AlertTitle>Development Only Feature</AlertTitle>
-                    <AlertDescription>
-                      Watch Mode runs as a persistent process and is only suitable for local development. It will not
-                      work when deployed to serverless environments like Vercel.
-                    </AlertDescription>
-                  </Alert>
                   <div className="mt-6 pt-4 border-t">
                     {enableWatchMode ? (
                       isWatching ? (
