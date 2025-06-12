@@ -1,10 +1,11 @@
 import { type NextRequest, NextResponse } from "next/server"
 import fs from "fs/promises"
 import path from "path"
-import { parseStringPromise } from "xml2js"
+// parseStringPromise is now used in the worker
 import { createObjectCsvWriter } from "csv-writer"
+import { Worker } from "worker_threads" // Import Worker
 
-// CSV header definition
+// CSV header definition (remains the same)
 const CSV_HEADERS = [
   { id: "city", title: "City" },
   { id: "year", title: "Year" },
@@ -16,10 +17,11 @@ const CSV_HEADERS = [
   { id: "byline", title: "Byline" },
   { id: "dateline", title: "Date Line" },
   { id: "creditline", title: "Credit Line" },
+  { id: "copyrightLine", title: "Copyright Line" },
   { id: "slugline", title: "Slug Line" },
   { id: "keywords", title: "Keywords" },
   { id: "edition", title: "Edition" },
-  { id: "location", title: "Location" },
+  { id: "location", title: "Location (AdminMeta)" },
   { id: "country", title: "Country" },
   { id: "city_meta", title: "City (Metadata)" },
   { id: "pageNumber", title: "Page Number" },
@@ -29,6 +31,8 @@ const CSV_HEADERS = [
   { id: "subject", title: "Subject" },
   { id: "processed", title: "Processed" },
   { id: "published", title: "Published" },
+  { id: "usageType", title: "Usage Type" },
+  { id: "rightsHolder", title: "Rights Holder" },
   { id: "imageWidth", title: "Image Width" },
   { id: "imageHeight", title: "Image Height" },
   { id: "imageSize", title: "Image Size (bytes)" },
@@ -41,39 +45,61 @@ const CSV_HEADERS = [
   { id: "commentData", title: "Comment Data" },
 ]
 
+// Manual directory traversal function (remains the same)
+async function findXmlFilesManually(rootDir: string): Promise<string[]> {
+  const xmlFiles: string[] = []
+  async function traverse(dir: string) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          await traverse(fullPath)
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
+          xmlFiles.push(fullPath)
+        }
+      }
+    } catch (error) {
+      console.log(`Error traversing ${dir}:`, error)
+    }
+  }
+  await traverse(rootDir)
+  return xmlFiles
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { rootDir, outputFile = "image_metadata.csv", batchSize = 100, verbose = false, filterConfig = null } = body
+    // Use 'numWorkers' to avoid conflict with Worker class
+    const { rootDir, outputFile = "image_metadata.csv", numWorkers = 4, verbose = false, filterConfig = null } = body
 
-    console.log("Received request:", { rootDir, outputFile, batchSize, verbose, filterConfig })
+    console.log("Received request:", { rootDir, outputFile, numWorkers, verbose, filterConfig })
 
     if (!rootDir) {
       return NextResponse.json({ error: "Root directory is required" }, { status: 400 })
     }
 
-    // Create output file path in the project root
     const outputPath = path.join(process.cwd(), outputFile)
     console.log("Output path:", outputPath)
 
-    // Create filtered images folder if needed
     let filteredImagesPath = ""
     if (filterConfig?.moveImages && filterConfig?.outputFolder) {
-      filteredImagesPath = path.join(rootDir, filterConfig.outputFolder)
+      filteredImagesPath = path.join(rootDir, filterConfig.outputFolder) // Ensure this is an absolute path or resolvable
       try {
         await fs.mkdir(filteredImagesPath, { recursive: true })
         console.log(`Created filtered images folder: ${filteredImagesPath}`)
       } catch (error) {
         console.log(`Error creating filtered folder: ${error}`)
+        // Decide if this is a fatal error or if processing should continue without moving
       }
     }
 
-    // Find XML files using manual directory traversal
     console.log("Searching for XML files...")
     const xmlFiles = await findXmlFilesManually(rootDir)
     console.log(`Found ${xmlFiles.length} XML files`)
 
     if (xmlFiles.length === 0) {
+      // ... (no XML files found response remains the same)
       try {
         const dirContents = await fs.readdir(rootDir, { recursive: true })
         const allFiles = dirContents.map((f) => f.toString())
@@ -104,75 +130,142 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Process files in batches
-    const allRecords = []
+    const allRecords: any[] = []
     let processedCount = 0
     let successCount = 0
     let errorCount = 0
-    let filteredCount = 0
+    let filteredCount = 0 // Files that passed the filter
     let movedCount = 0
     const errors: string[] = []
+    const activeWorkers = new Set<Worker>()
 
-    console.log(`Starting to process ${xmlFiles.length} XML files`)
+    console.log(`Starting to process ${xmlFiles.length} XML files with ${numWorkers} worker(s)`)
     if (filterConfig?.enabled) {
       console.log("Filtering enabled:", filterConfig)
     }
 
-    for (let i = 0; i < xmlFiles.length; i += batchSize) {
-      const batch = xmlFiles.slice(i, i + batchSize)
-      console.log(`Processing batch ${Math.floor(i / batchSize) + 1}: ${batch.length} files`)
+    // Path to the worker script. Ensure this resolves correctly.
+    // In Next.js, API routes are typically bundled, so relative paths might need care.
+    // Using path.resolve assumes the worker script is at the specified location relative to project root after build.
+    const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
+    // Check if worker file exists (for debugging, remove in prod)
+    try {
+      await fs.access(workerScriptPath)
+    } catch (e) {
+      console.error("Worker script not found at:", workerScriptPath)
+      console.error(
+        "Make sure 'app/api/parse/xml-parser-worker.ts' is compiled to 'app/api/parse/xml-parser-worker.js' in the output directory (e.g. .next/server/app/api/parse/) or adjust path accordingly.",
+      )
+      return NextResponse.json({ error: "Worker script misconfiguration." }, { status: 500 })
+    }
 
-      for (const xmlFile of batch) {
-        try {
-          const result = await processXmlFile(xmlFile, filterConfig, filteredImagesPath)
-          if (result) {
+    await new Promise<void>((resolveAllFiles) => {
+      let fileIndex = 0
+      let workersLaunched = 0
+
+      const launchWorkerIfNeeded = () => {
+        while (activeWorkers.size < numWorkers && fileIndex < xmlFiles.length) {
+          const currentFile = xmlFiles[fileIndex++]
+          const workerId = workersLaunched++
+
+          // Check if workerScriptPath is correct. For Next.js, it might be tricky due to bundling.
+          // A common pattern is to place worker files in `public` or ensure they are correctly copied/referenced post-build.
+          // For server-side workers, they should be part of the server bundle.
+          // The path needs to point to the *transpiled* JavaScript file.
+          const worker = new Worker(workerScriptPath, {
+            workerData: {
+              xmlFilePath: currentFile,
+              filterConfig,
+              filteredImagesPath,
+              workerId,
+              verbose,
+            },
+          })
+          activeWorkers.add(worker)
+
+          if (verbose) console.log(`[Main] Worker ${workerId} started for ${currentFile}`)
+
+          worker.on("message", (result: any) => {
+            processedCount++
             if (result.record) {
               allRecords.push(result.record)
               successCount++
-
-              if (result.passedFilter) {
-                filteredCount++
-              }
-
-              if (result.imageMoved) {
-                movedCount++
-              }
-            } else {
-              errorCount++
-              errors.push(`Failed to extract data from ${xmlFile}`)
             }
-          } else {
-            errorCount++
-            errors.push(`Failed to process ${xmlFile}`)
-          }
-          processedCount++
+            if (result.passedFilter && result.record) {
+              // Only count if record was processed and passed
+              filteredCount++
+            }
+            if (result.imageMoved) {
+              movedCount++
+            }
+            if (result.error) {
+              errorCount++
+              errors.push(`Error in ${currentFile} (Worker ${result.workerId}): ${result.error}`)
+            }
 
-          // Log progress every 50 files
-          if (processedCount % 50 === 0) {
-            console.log(`Progress: ${processedCount}/${xmlFiles.length} files processed`)
-          }
-        } catch (error) {
-          errorCount++
-          const errorMsg = `Error processing ${xmlFile}: ${error instanceof Error ? error.message : "Unknown error"}`
-          errors.push(errorMsg)
-          if (verbose) {
-            console.error(errorMsg)
-          }
+            if (verbose && processedCount % 50 === 0) {
+              console.log(`[Main] Progress: ${processedCount}/${xmlFiles.length} files processed by workers.`)
+            }
+
+            activeWorkers.delete(worker)
+            worker.terminate()
+
+            if (fileIndex < xmlFiles.length) {
+              launchWorkerIfNeeded() // Launch another worker for the next file
+            } else if (activeWorkers.size === 0) {
+              resolveAllFiles() // All files processed and all workers finished
+            }
+          })
+
+          worker.on("error", (err) => {
+            console.error(`[Main] Worker ${workerId} for ${currentFile} errored:`, err)
+            errorCount++
+            errors.push(`Worker error for ${currentFile}: ${err.message}`)
+            activeWorkers.delete(worker)
+            // worker.terminate(); // Already terminated on error?
+
+            if (fileIndex < xmlFiles.length) {
+              launchWorkerIfNeeded()
+            } else if (activeWorkers.size === 0) {
+              resolveAllFiles()
+            }
+          })
+
+          worker.on("exit", (code) => {
+            if (code !== 0) {
+              // console.warn(`[Main] Worker ${workerId} for ${currentFile} exited with code ${code}`);
+              // This might already be handled by 'error' event if it was an unhandled exception.
+            }
+            // Ensure worker is removed if it exits unexpectedly
+            activeWorkers.delete(worker)
+            if (fileIndex < xmlFiles.length && activeWorkers.size < numWorkers) {
+              // If a worker exited and there are still files and capacity, try to launch a new one.
+              // This is a simple retry, more robust handling might be needed for persistent worker failures.
+              // launchWorkerIfNeeded();
+            } else if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
+              resolveAllFiles()
+            }
+          })
         }
       }
-    }
+
+      launchWorkerIfNeeded() // Start initial batch of workers
+
+      if (xmlFiles.length === 0) {
+        // Handle case with no files to process by workers
+        resolveAllFiles()
+      }
+    })
 
     console.log(
-      `Processing complete. ${successCount} successful, ${errorCount} errors, ${filteredCount} filtered, ${movedCount} moved`,
+      `Processing complete. ${successCount} successful, ${errorCount} errors, ${filteredCount} passed filter, ${movedCount} moved.`,
     )
 
-    // Write CSV file
     if (allRecords.length > 0) {
       const csvWriter = createObjectCsvWriter({
         path: outputPath,
         header: CSV_HEADERS,
       })
-
       await csvWriter.writeRecords(allRecords)
       console.log(`CSV file written to: ${outputPath}`)
     } else {
@@ -190,8 +283,8 @@ export async function POST(request: NextRequest) {
         filteredFiles: filteredCount,
         movedFiles: movedCount,
       },
-      outputFile: outputPath,
-      errors: verbose ? errors : errors.slice(0, 10),
+      outputFile: path.basename(outputPath), // Send only filename for download URL
+      errors: verbose ? errors : errors.slice(0, 10), // Full errors if verbose
     })
   } catch (error) {
     console.error("Error in parse API:", error)
@@ -205,381 +298,5 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Manual directory traversal function
-async function findXmlFilesManually(rootDir: string): Promise<string[]> {
-  const xmlFiles: string[] = []
-
-  async function traverse(dir: string) {
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true })
-
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name)
-
-        if (entry.isDirectory()) {
-          await traverse(fullPath)
-        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
-          xmlFiles.push(fullPath)
-        }
-      }
-    } catch (error) {
-      console.log(`Error traversing ${dir}:`, error)
-    }
-  }
-
-  await traverse(rootDir)
-  return xmlFiles
-}
-
-// Check if image passes filter criteria
-function passesFilter(record: any, filterConfig: any): boolean {
-  if (!filterConfig?.enabled) return true
-
-  const imageWidth = Number.parseInt(record.imageWidth) || 0
-  const imageHeight = Number.parseInt(record.imageHeight) || 0
-  const fileSize = Number.parseInt(record.imageSize) || 0
-
-  // Check image dimensions
-  if (filterConfig.minWidth && imageWidth < filterConfig.minWidth) {
-    return false
-  }
-
-  if (filterConfig.minHeight && imageHeight < filterConfig.minHeight) {
-    return false
-  }
-
-  // Check file size
-  if (filterConfig.minFileSize && fileSize < filterConfig.minFileSize) {
-    return false
-  }
-
-  if (filterConfig.maxFileSize && fileSize > filterConfig.maxFileSize) {
-    return false
-  }
-
-  return true
-}
-
-// Move image file to filtered folder
-async function moveImageToFilteredFolder(imagePath: string, filteredImagesPath: string): Promise<boolean> {
-  try {
-    if (!imagePath || !filteredImagesPath) return false
-
-    // Check if source image exists
-    await fs.access(imagePath)
-
-    // Create destination path
-    const fileName = path.basename(imagePath)
-    const destPath = path.join(filteredImagesPath, fileName)
-
-    // Create subdirectories if needed
-    const destDir = path.dirname(destPath)
-    await fs.mkdir(destDir, { recursive: true })
-
-    // Copy the file (we use copy instead of move to preserve original)
-    await fs.copyFile(imagePath, destPath)
-
-    console.log(`Moved image: ${imagePath} -> ${destPath}`)
-    return true
-  } catch (error) {
-    console.log(`Error moving image ${imagePath}:`, error)
-    return false
-  }
-}
-
-// Process a single XML file
-async function processXmlFile(xmlFilePath: string, filterConfig: any, filteredImagesPath: string): Promise<any | null> {
-  try {
-    console.log(`Processing: ${xmlFilePath}`)
-
-    // Read and parse XML file
-    const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
-    const result = await parseStringPromise(xmlContent, {
-      explicitArray: false,
-      mergeAttrs: true,
-    })
-
-    // Extract path components
-    const pathParts = xmlFilePath.split(path.sep)
-
-    // Find city, year, month from path
-    let city = "",
-      year = "",
-      month = ""
-    for (let i = 0; i < pathParts.length; i++) {
-      if (pathParts[i] === "images" && i + 3 < pathParts.length) {
-        city = pathParts[i + 1]
-        year = pathParts[i + 2]
-        month = pathParts[i + 3]
-        break
-      }
-    }
-
-    // If not found with "images", try to extract from any part of the path
-    if (!city || !year || !month) {
-      // Look for year pattern (4 digits)
-      const yearMatch = pathParts.find((part) => /^\d{4}$/.test(part))
-      if (yearMatch) {
-        const yearIndex = pathParts.indexOf(yearMatch)
-        if (yearIndex > 0) city = pathParts[yearIndex - 1]
-        year = yearMatch
-        if (yearIndex + 1 < pathParts.length) month = pathParts[yearIndex + 1]
-      }
-    }
-
-    // Extract data from XML structure
-    const newsML = result.NewsML
-    if (!newsML) throw new Error("Invalid XML structure: NewsML not found")
-
-    const newsItem = newsML.NewsItem
-    if (!newsItem) throw new Error("Invalid XML structure: NewsItem not found")
-
-    const newsIdentifier = newsItem.Identification?.NewsIdentifier
-    if (!newsIdentifier) throw new Error("Invalid XML structure: NewsIdentifier not found")
-
-    const newsItemId = newsIdentifier.NewsItemId || ""
-    const dateId = newsIdentifier.DateId || ""
-    const providerId = newsIdentifier.ProviderId || ""
-
-    // Extract news management data
-    const newsManagement = newsItem.NewsManagement || {}
-    const status = newsManagement.Status?.FormalName || ""
-    const urgency = newsManagement.Urgency?.FormalName || ""
-    const creationDate = newsManagement.FirstCreated || ""
-    const revisionDate = newsManagement.ThisRevisionCreated || ""
-
-    // Find the main news component
-    const mainComponent = findMainNewsComponent(newsItem.NewsComponent)
-    if (!mainComponent) throw new Error("Main news component not found")
-
-    // Extract comment data
-    let commentData = ""
-    if (mainComponent.Comment) {
-      commentData = extractCData(mainComponent.Comment)
-    }
-
-    // Extract headline and other metadata
-    let headline = "",
-      byline = "",
-      dateline = "",
-      creditline = "",
-      slugline = "",
-      keywords = ""
-    let edition = "",
-      location = "",
-      pageNumber = "",
-      country = "",
-      city_meta = ""
-    let language = "",
-      subject = "",
-      processed = "",
-      published = ""
-    let imageWidth = "",
-      imageHeight = "",
-      imageSize = "",
-      imageHref = ""
-
-    if (mainComponent.NewsLines) {
-      headline = extractCData(mainComponent.NewsLines.HeadLine)
-      byline = extractCData(mainComponent.NewsLines.ByLine)
-      dateline = extractCData(mainComponent.NewsLines.DateLine)
-      creditline = extractCData(mainComponent.NewsLines.CreditLine)
-      slugline = extractCData(mainComponent.NewsLines.SlugLine)
-
-      // Extract keywords
-      if (mainComponent.NewsLines.KeywordLine) {
-        const keywordLines = Array.isArray(mainComponent.NewsLines.KeywordLine)
-          ? mainComponent.NewsLines.KeywordLine
-          : [mainComponent.NewsLines.KeywordLine]
-
-        keywords = keywordLines
-          .map((k) => extractCData(k))
-          .filter(Boolean)
-          .join(", ")
-      }
-    }
-
-    // Extract administrative metadata
-    if (mainComponent.AdministrativeMetadata) {
-      const adminMeta = mainComponent.AdministrativeMetadata
-
-      if (adminMeta.Property) {
-        const props = Array.isArray(adminMeta.Property) ? adminMeta.Property : [adminMeta.Property]
-
-        for (const prop of props) {
-          if (prop.FormalName === "Edition") edition = prop.Value || ""
-          if (prop.FormalName === "Location") location = prop.Value || ""
-          if (prop.FormalName === "PageNumber") pageNumber = prop.Value || ""
-        }
-      }
-    }
-
-    // Extract descriptive metadata
-    if (mainComponent.DescriptiveMetadata) {
-      const descMeta = mainComponent.DescriptiveMetadata
-
-      language = descMeta.Language?.FormalName || ""
-      subject = descMeta.SubjectCode?.Subject?.FormalName || ""
-
-      if (descMeta.Property) {
-        const props = Array.isArray(descMeta.Property) ? descMeta.Property : [descMeta.Property]
-
-        for (const prop of props) {
-          if (prop.FormalName === "Processed") processed = prop.Value || ""
-          if (prop.FormalName === "Published") published = prop.Value || ""
-
-          if (prop.FormalName === "Location") {
-            if (prop.Property) {
-              const locProps = Array.isArray(prop.Property) ? prop.Property : [prop.Property]
-
-              for (const locProp of locProps) {
-                if (locProp.FormalName === "Country") country = locProp.Value || ""
-                if (locProp.FormalName === "City") city_meta = locProp.Value || ""
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Extract image characteristics
-    if (mainComponent.ContentItem) {
-      const contentItems = Array.isArray(mainComponent.ContentItem)
-        ? mainComponent.ContentItem
-        : [mainComponent.ContentItem]
-
-      for (const item of contentItems) {
-        if (item.Href && item.Href.endsWith(".jpg") && !item.Href.includes("_th.jpg")) {
-          imageHref = item.Href
-
-          if (item.Characteristics) {
-            imageSize = item.Characteristics.SizeInBytes || ""
-
-            if (item.Characteristics.Property) {
-              const props = Array.isArray(item.Characteristics.Property)
-                ? item.Characteristics.Property
-                : [item.Characteristics.Property]
-
-              for (const prop of props) {
-                if (prop.FormalName === "width") imageWidth = prop.Value || ""
-                if (prop.FormalName === "height") imageHeight = prop.Value || ""
-              }
-            }
-          }
-          break
-        }
-      }
-    }
-
-    // Construct expected image path
-    const expectedImageDir = path.join(
-      path.dirname(path.dirname(xmlFilePath)), // go up from processed dir
-      "media",
-    )
-
-    const imagePath = imageHref ? path.join(expectedImageDir, imageHref) : ""
-    let imageExists = false
-
-    // Check if image exists
-    if (imagePath) {
-      try {
-        await fs.access(imagePath)
-        imageExists = true
-      } catch {
-        // Image doesn't exist
-      }
-    }
-
-    // Create record for CSV
-    const record = {
-      city,
-      year,
-      month,
-      newsItemId,
-      dateId,
-      providerId,
-      headline,
-      byline,
-      dateline,
-      creditline,
-      slugline,
-      keywords,
-      edition,
-      location,
-      country,
-      city_meta,
-      pageNumber,
-      status,
-      urgency,
-      language,
-      subject,
-      processed,
-      published,
-      imageWidth,
-      imageHeight,
-      imageSize,
-      imageHref,
-      xmlPath: xmlFilePath,
-      imagePath,
-      imageExists: imageExists ? "Yes" : "No",
-      creationDate,
-      revisionDate,
-      commentData,
-    }
-
-    // Check if record passes filter
-    const passedFilter = passesFilter(record, filterConfig)
-    let imageMoved = false
-
-    // If filtering is enabled and record doesn't pass, return null (skip this record)
-    if (filterConfig?.enabled && !passedFilter) {
-      return { record: null, passedFilter: false, imageMoved: false }
-    }
-
-    // Move image if filtering is enabled, record passed, and move option is enabled
-    if (filterConfig?.enabled && passedFilter && filterConfig?.moveImages && imageExists && imagePath) {
-      imageMoved = await moveImageToFilteredFolder(imagePath, filteredImagesPath)
-    }
-
-    return {
-      record: passedFilter ? record : null,
-      passedFilter,
-      imageMoved,
-    }
-  } catch (err) {
-    console.error(`Error extracting data from ${xmlFilePath}:`, err)
-    return null
-  }
-}
-
-// Helper function to find the main news component
-function findMainNewsComponent(newsComponent: any): any {
-  if (!newsComponent) return null
-
-  // If NewsComponent has Role with FormalName="PICTURE", it's what we want
-  if (newsComponent.Role && newsComponent.Role.FormalName === "PICTURE") {
-    return newsComponent
-  }
-
-  // Otherwise, check nested NewsComponent
-  if (newsComponent.NewsComponent) {
-    if (Array.isArray(newsComponent.NewsComponent)) {
-      for (const comp of newsComponent.NewsComponent) {
-        const found = findMainNewsComponent(comp)
-        if (found) return found
-      }
-    } else {
-      return findMainNewsComponent(newsComponent.NewsComponent)
-    }
-  }
-
-  return null
-}
-
-// Helper function to extract CDATA content
-function extractCData(element: any): string {
-  if (!element) return ""
-  if (typeof element === "string") return element.trim()
-  if (element._) return element._.trim()
-  return ""
-}
+// processXmlFile, passesFilter, moveImageToFilteredFolder, findMainNewsComponent, extractCData
+// are now moved to xml-parser-worker.ts
