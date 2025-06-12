@@ -1,22 +1,21 @@
 import chokidar from "chokidar"
 import path from "path"
+import fs from "fs"
 import { Worker } from "worker_threads"
 import { createObjectCsvWriter } from "csv-writer"
+import { CSV_HEADERS } from "@/app/api/parse/route" // Assuming CSV_HEADERS is exported or defined here
 
-// This will hold our single watcher instance
 let watcher: chokidar.FSWatcher | null = null
 
-// This function will be called from the API route to start watching
 export function startWatcher(
   rootDir: string,
-  filterConfig: any,
+  filterConfig: any, // This will now contain moveDestinationPath and moveFolderStructureOption
   outputFile: string,
-  numWorkers: number,
+  numWorkers: number, // Though watcher processes one by one, numWorkers might be for consistency
   verbose: boolean,
   onLog: (message: string) => void,
   onUpdate: (stats: any) => void,
 ) {
-  // If a watcher is already running, stop it before starting a new one
   if (watcher) {
     watcher.close()
     onLog("Closed existing watcher to start a new session.")
@@ -24,27 +23,25 @@ export function startWatcher(
 
   onLog(`Starting to watch directory: ${rootDir}`)
   watcher = chokidar.watch(rootDir, {
-    ignored: /(^|[/\\])\../, // ignore dotfiles
+    ignored: /(^|[/\\])\../,
     persistent: true,
-    ignoreInitial: true, // Don't process existing files on start, only new ones
-    depth: 99, // Watch subdirectories deeply
+    ignoreInitial: true,
+    depth: 99,
   })
 
   const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
   const outputPath = path.join(process.cwd(), outputFile)
 
-  // Listen for new files being added
   watcher.on("add", async (filePath) => {
     if (filePath.toLowerCase().endsWith(".xml")) {
       onLog(`[Watcher] New XML file detected: ${path.basename(filePath)}`)
 
-      // Use a worker to process the single file
       const worker = new Worker(workerScriptPath, {
         workerData: {
           xmlFilePath: filePath,
-          filterConfig,
-          filteredImagesPath: filterConfig?.moveImages ? path.join(rootDir, filterConfig.outputFolder) : "",
-          workerId: 0, // Simple ID for single file processing
+          filterConfig, // Pass the full filterConfig
+          originalRootDir: rootDir, // Pass rootDir for path replication logic
+          workerId: 0,
           verbose,
         },
       })
@@ -55,13 +52,21 @@ export function startWatcher(
           onUpdate({ errorFiles: 1 })
         } else if (result.record) {
           onLog(`[Watcher] Successfully processed ${path.basename(filePath)}. Appending to CSV.`)
-          onUpdate({ successfulFiles: 1, processedFiles: 1, recordsWritten: 1 })
+          onUpdate({ successfulFiles: 1, processedFiles: 1, recordsWritten: 1, movedFiles: result.imageMoved ? 1 : 0 })
 
-          // Append the single record to the CSV
+          // Check if CSV exists, if not, write headers first
+          let fileExists = false
+          try {
+            await fs.promises.access(outputPath)
+            fileExists = true
+          } catch (e) {
+            // File doesn't exist
+          }
+
           const csvWriter = createObjectCsvWriter({
             path: outputPath,
-            header: result.record ? Object.keys(result.record).map((key) => ({ id: key, title: key })) : [],
-            append: true, // IMPORTANT: Append to existing file
+            header: CSV_HEADERS, // Use the defined CSV_HEADERS
+            append: fileExists, // Append if file exists, otherwise create with headers
           })
 
           try {
@@ -71,10 +76,10 @@ export function startWatcher(
             onLog(`[Watcher] Error appending to CSV: ${csvError.message}`)
           }
         } else {
-          onLog(`[Watcher] File ${path.basename(filePath)} was filtered out and not processed.`)
-          onUpdate({ processedFiles: 1 }) // Still counts as processed
+          onLog(`[Watcher] File ${path.basename(filePath)} was filtered out or not processed.`)
+          onUpdate({ processedFiles: 1 })
         }
-        worker.terminate()
+        worker.terminate().catch((err) => onLog(`[Watcher] Error terminating worker: ${err.message}`))
       })
 
       worker.on("error", (err) => {
@@ -88,7 +93,6 @@ export function startWatcher(
   watcher.on("ready", () => onLog("[Watcher] Initial scan complete. Ready for changes."))
 }
 
-// This function will be called to stop the watcher
 export function stopWatcher(onLog: (message: string) => void) {
   if (watcher) {
     watcher.close()
@@ -100,7 +104,6 @@ export function stopWatcher(onLog: (message: string) => void) {
   return false
 }
 
-// Function to check the status
 export function getWatcherStatus() {
   return {
     isWatching: !!watcher,

@@ -84,23 +84,42 @@ function passesFilter(record: any, filterConfig: any): boolean {
   return true
 }
 
-// Move image file to filtered folder (moved from main route)
-async function moveImageToFilteredFolder(imagePath: string, filteredImagesPath: string): Promise<boolean> {
+// Updated move image file to filtered folder (moved from main route)
+async function moveImageToFilteredFolder(
+  originalImageAbsPath: string,
+  userDefinedDestAbsPath: string, // This is filterConfig.moveDestinationPath
+  folderStructureOption: "replicate" | "single",
+  originalRootDirForScan: string, // This is the rootDir from the UI
+  verbose: boolean,
+  workerId: number,
+): Promise<boolean> {
   try {
-    if (!imagePath || !filteredImagesPath) return false
-    await fs.access(imagePath) // Check if source exists
+    if (!originalImageAbsPath || !userDefinedDestAbsPath) {
+      if (verbose) console.log(`[Worker ${workerId}] Missing paths for move operation.`)
+      return false
+    }
+    await fs.access(originalImageAbsPath) // Check if source exists
 
-    const fileName = path.basename(imagePath)
-    const destPath = path.join(filteredImagesPath, fileName)
+    const fileName = path.basename(originalImageAbsPath)
+    let finalDestPath: string
+    let finalDestDir: string
 
-    const destDir = path.dirname(destPath)
-    await fs.mkdir(destDir, { recursive: true })
+    if (folderStructureOption === "replicate") {
+      const relativePathFromRoot = path.relative(originalRootDirForScan, path.dirname(originalImageAbsPath))
+      finalDestDir = path.join(userDefinedDestAbsPath, relativePathFromRoot)
+      finalDestPath = path.join(finalDestDir, fileName)
+    } else {
+      // "single"
+      finalDestDir = userDefinedDestAbsPath
+      finalDestPath = path.join(finalDestDir, fileName)
+    }
 
-    await fs.copyFile(imagePath, destPath)
-    // For debugging in worker: console.log(`[Worker] Moved image: ${imagePath} -> ${destPath}`);
+    await fs.mkdir(finalDestDir, { recursive: true })
+    await fs.copyFile(originalImageAbsPath, finalDestPath)
+    if (verbose) console.log(`[Worker ${workerId}] Moved image: ${originalImageAbsPath} -> ${finalDestPath}`)
     return true
-  } catch (error) {
-    // For debugging in worker: console.error(`[Worker] Error moving image ${imagePath}:`, error);
+  } catch (error: any) {
+    if (verbose) console.error(`[Worker ${workerId}] Error moving image ${originalImageAbsPath}:`, error.message)
     return false
   }
 }
@@ -109,7 +128,7 @@ async function moveImageToFilteredFolder(imagePath: string, filteredImagesPath: 
 async function processXmlFileInWorker(
   xmlFilePath: string,
   filterConfig: any,
-  filteredImagesPath: string,
+  originalRootDir: string, // Renamed from filteredImagesPath for clarity, now it's the scan root
   workerId: number,
   verbose: boolean,
 ): Promise<any> {
@@ -364,8 +383,23 @@ async function processXmlFileInWorker(
       return { record: null, passedFilter: false, imageMoved: false, workerId }
     }
 
-    if (filterConfig?.enabled && passed && filterConfig?.moveImages && imageExists && imagePath && filteredImagesPath) {
-      moved = await moveImageToFilteredFolder(imagePath, filteredImagesPath)
+    if (
+      filterConfig?.enabled &&
+      passed &&
+      filterConfig?.moveImages &&
+      filterConfig?.moveDestinationPath && // Ensure destination path is provided
+      filterConfig?.moveFolderStructureOption && // Ensure folder structure option is provided
+      imageExists &&
+      imagePath
+    ) {
+      moved = await moveImageToFilteredFolder(
+        imagePath,
+        filterConfig.moveDestinationPath,
+        filterConfig.moveFolderStructureOption,
+        originalRootDir, // Pass the original root directory for path replication
+        verbose,
+        workerId,
+      )
     }
 
     return { record: passed ? record : null, passedFilter: passed, imageMoved: moved, workerId }
@@ -377,8 +411,8 @@ async function processXmlFileInWorker(
 
 if (parentPort) {
   parentPort.on("message", async (task) => {
-    const { xmlFilePath, filterConfig, filteredImagesPath, workerId, verbose } = task
-    const result = await processXmlFileInWorker(xmlFilePath, filterConfig, filteredImagesPath, workerId, verbose)
+    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose } = task
+    const result = await processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose)
     parentPort.postMessage(result)
   })
 } else {

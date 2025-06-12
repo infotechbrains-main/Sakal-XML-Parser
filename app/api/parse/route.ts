@@ -1,9 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server"
 import fs from "fs/promises"
 import path from "path"
-// parseStringPromise is now used in the worker
 import { createObjectCsvWriter } from "csv-writer"
-import { Worker } from "worker_threads" // Import Worker
+import { Worker } from "worker_threads"
 
 // CSV header definition (remains the same)
 const CSV_HEADERS = [
@@ -70,29 +69,28 @@ async function findXmlFilesManually(rootDir: string): Promise<string[]> {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    // Use 'numWorkers' to avoid conflict with Worker class
-    const { rootDir, outputFile = "image_metadata.csv", numWorkers = 4, verbose = false, filterConfig = null } = body
+    const {
+      rootDir,
+      outputFile = "image_metadata.csv",
+      numWorkers = 4, // Ensure this matches frontend state name if different
+      verbose = false,
+      filterConfig = null,
+    } = body
 
     console.log("Received request:", { rootDir, outputFile, numWorkers, verbose, filterConfig })
 
     if (!rootDir) {
       return NextResponse.json({ error: "Root directory is required" }, { status: 400 })
     }
+    if (filterConfig?.moveImages && !filterConfig?.moveDestinationPath) {
+      return NextResponse.json({ error: "Move destination path is required when moving images." }, { status: 400 })
+    }
 
     const outputPath = path.join(process.cwd(), outputFile)
     console.log("Output path:", outputPath)
 
-    let filteredImagesPath = ""
-    if (filterConfig?.moveImages && filterConfig?.outputFolder) {
-      filteredImagesPath = path.join(rootDir, filterConfig.outputFolder) // Ensure this is an absolute path or resolvable
-      try {
-        await fs.mkdir(filteredImagesPath, { recursive: true })
-        console.log(`Created filtered images folder: ${filteredImagesPath}`)
-      } catch (error) {
-        console.log(`Error creating filtered folder: ${error}`)
-        // Decide if this is a fatal error or if processing should continue without moving
-      }
-    }
+    // The filteredImagesPath is now the absolute path from filterConfig
+    // No need to create it here as the worker will handle directory creation based on the absolute path.
 
     console.log("Searching for XML files...")
     const xmlFiles = await findXmlFilesManually(rootDir)
@@ -134,7 +132,7 @@ export async function POST(request: NextRequest) {
     let processedCount = 0
     let successCount = 0
     let errorCount = 0
-    let filteredCount = 0 // Files that passed the filter
+    let filteredCount = 0
     let movedCount = 0
     const errors: string[] = []
     const activeWorkers = new Set<Worker>()
@@ -144,18 +142,11 @@ export async function POST(request: NextRequest) {
       console.log("Filtering enabled:", filterConfig)
     }
 
-    // Path to the worker script. Ensure this resolves correctly.
-    // In Next.js, API routes are typically bundled, so relative paths might need care.
-    // Using path.resolve assumes the worker script is at the specified location relative to project root after build.
     const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
-    // Check if worker file exists (for debugging, remove in prod)
     try {
       await fs.access(workerScriptPath)
     } catch (e) {
       console.error("Worker script not found at:", workerScriptPath)
-      console.error(
-        "Make sure 'app/api/parse/xml-parser-worker.ts' is compiled to 'app/api/parse/xml-parser-worker.js' in the output directory (e.g. .next/server/app/api/parse/) or adjust path accordingly.",
-      )
       return NextResponse.json({ error: "Worker script misconfiguration." }, { status: 500 })
     }
 
@@ -168,15 +159,11 @@ export async function POST(request: NextRequest) {
           const currentFile = xmlFiles[fileIndex++]
           const workerId = workersLaunched++
 
-          // Check if workerScriptPath is correct. For Next.js, it might be tricky due to bundling.
-          // A common pattern is to place worker files in `public` or ensure they are correctly copied/referenced post-build.
-          // For server-side workers, they should be part of the server bundle.
-          // The path needs to point to the *transpiled* JavaScript file.
           const worker = new Worker(workerScriptPath, {
             workerData: {
               xmlFilePath: currentFile,
-              filterConfig,
-              filteredImagesPath,
+              filterConfig, // This now contains moveDestinationPath and moveFolderStructureOption
+              originalRootDir: rootDir, // Pass original rootDir for path replication
               workerId,
               verbose,
             },
@@ -192,7 +179,6 @@ export async function POST(request: NextRequest) {
               successCount++
             }
             if (result.passedFilter && result.record) {
-              // Only count if record was processed and passed
               filteredCount++
             }
             if (result.imageMoved) {
@@ -200,29 +186,29 @@ export async function POST(request: NextRequest) {
             }
             if (result.error) {
               errorCount++
-              errors.push(`Error in ${currentFile} (Worker ${result.workerId}): ${result.error}`)
+              errors.push(`Error in ${path.basename(currentFile)} (Worker ${result.workerId}): ${result.error}`)
             }
 
             if (verbose && processedCount % 50 === 0) {
-              console.log(`[Main] Progress: ${processedCount}/${xmlFiles.length} files processed by workers.`)
+              console.log(`[Main] Progress: ${processedCount}/${xmlFiles.length} files processed.`)
             }
 
             activeWorkers.delete(worker)
-            worker.terminate()
+            worker.terminate().catch((err) => console.error(`Error terminating worker ${workerId}:`, err))
 
             if (fileIndex < xmlFiles.length) {
-              launchWorkerIfNeeded() // Launch another worker for the next file
+              launchWorkerIfNeeded()
             } else if (activeWorkers.size === 0) {
-              resolveAllFiles() // All files processed and all workers finished
+              resolveAllFiles()
             }
           })
 
           worker.on("error", (err) => {
-            console.error(`[Main] Worker ${workerId} for ${currentFile} errored:`, err)
+            console.error(`[Main] Worker ${workerId} for ${path.basename(currentFile)} errored:`, err)
             errorCount++
-            errors.push(`Worker error for ${currentFile}: ${err.message}`)
+            errors.push(`Worker error for ${path.basename(currentFile)}: ${err.message}`)
             activeWorkers.delete(worker)
-            // worker.terminate(); // Already terminated on error?
+            // worker.terminate() // Already terminated on error?
 
             if (fileIndex < xmlFiles.length) {
               launchWorkerIfNeeded()
@@ -232,29 +218,20 @@ export async function POST(request: NextRequest) {
           })
 
           worker.on("exit", (code) => {
-            if (code !== 0) {
-              // console.warn(`[Main] Worker ${workerId} for ${currentFile} exited with code ${code}`);
-              // This might already be handled by 'error' event if it was an unhandled exception.
+            activeWorkers.delete(worker) // Ensure worker is removed
+            if (code !== 0 && verbose) {
+              // console.warn(`[Main] Worker ${workerId} for ${path.basename(currentFile)} exited with code ${code}`);
             }
-            // Ensure worker is removed if it exits unexpectedly
-            activeWorkers.delete(worker)
             if (fileIndex < xmlFiles.length && activeWorkers.size < numWorkers) {
-              // If a worker exited and there are still files and capacity, try to launch a new one.
-              // This is a simple retry, more robust handling might be needed for persistent worker failures.
-              // launchWorkerIfNeeded();
+              // launchWorkerIfNeeded(); // Avoid re-launching on exit if error already handled
             } else if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
               resolveAllFiles()
             }
           })
         }
       }
-
-      launchWorkerIfNeeded() // Start initial batch of workers
-
-      if (xmlFiles.length === 0) {
-        // Handle case with no files to process by workers
-        resolveAllFiles()
-      }
+      launchWorkerIfNeeded()
+      if (xmlFiles.length === 0) resolveAllFiles()
     })
 
     console.log(
@@ -262,11 +239,11 @@ export async function POST(request: NextRequest) {
     )
 
     if (allRecords.length > 0) {
-      const csvWriter = createObjectCsvWriter({
+      const csvWriterInstance = createObjectCsvWriter({
         path: outputPath,
         header: CSV_HEADERS,
       })
-      await csvWriter.writeRecords(allRecords)
+      await csvWriterInstance.writeRecords(allRecords)
       console.log(`CSV file written to: ${outputPath}`)
     } else {
       console.log("No records to write to CSV")
@@ -283,8 +260,8 @@ export async function POST(request: NextRequest) {
         filteredFiles: filteredCount,
         movedFiles: movedCount,
       },
-      outputFile: path.basename(outputPath), // Send only filename for download URL
-      errors: verbose ? errors : errors.slice(0, 10), // Full errors if verbose
+      outputFile: path.basename(outputPath),
+      errors: verbose ? errors : errors.slice(0, 10),
     })
   } catch (error) {
     console.error("Error in parse API:", error)
@@ -297,6 +274,3 @@ export async function POST(request: NextRequest) {
     )
   }
 }
-
-// processXmlFile, passesFilter, moveImageToFilteredFolder, findMainNewsComponent, extractCData
-// are now moved to xml-parser-worker.ts
