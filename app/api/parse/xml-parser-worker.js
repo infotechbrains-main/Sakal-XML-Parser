@@ -1,4 +1,4 @@
-const { parentPort } = require("worker_threads")
+const { parentPort, workerData } = require("worker_threads")
 const fs = require("fs/promises")
 const path = require("path")
 const { parseStringPromise } = require("xml2js")
@@ -380,23 +380,58 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
         filterConfig.moveFolderStructureOption,
         originalRootDir,
         verbose,
-        workerId,
+        workerData.workerId,
       )
     }
 
     return { record: passed ? record : null, passedFilter: passed, imageMoved: moved, workerId }
   } catch (err) {
-    if (verbose) console.error(`[Worker ${workerId}] Error processing ${xmlFilePath}:`, err.message)
-    return { record: null, passedFilter: false, imageMoved: false, error: err.message, workerId }
+    if (verbose) console.error(`[Worker ${workerData.workerId}] Error processing ${xmlFilePath}:`, err.message)
+    return { record: null, passedFilter: false, imageMoved: false, error: err.message, workerId: workerData.workerId }
   }
 }
 
-if (parentPort) {
-  parentPort.on("message", async (task) => {
-    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose } = task
+// Main worker execution - process the file immediately when worker starts
+async function main() {
+  try {
+    if (!workerData) {
+      throw new Error("No workerData provided")
+    }
+
+    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose } = workerData
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Starting to process: ${path.basename(xmlFilePath)}`)
+    }
+
     const result = await processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose)
-    parentPort.postMessage(result)
-  })
-} else {
-  console.log("Worker started without parentPort. This script is intended to be run as a worker thread.")
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Finished processing: ${path.basename(xmlFilePath)}`)
+    }
+
+    // Send result back to main thread
+    if (parentPort) {
+      parentPort.postMessage(result)
+    } else {
+      console.error(`[Worker ${workerId}] No parentPort available to send result`)
+    }
+  } catch (error) {
+    console.error(`[Worker ${workerData.workerId}] Fatal error:`, error.message)
+    if (parentPort) {
+      parentPort.postMessage({
+        record: null,
+        passedFilter: false,
+        imageMoved: false,
+        error: error.message,
+        workerId: workerData.workerId,
+      })
+    }
+  }
 }
+
+// Execute main function
+main().catch((error) => {
+  console.error("Worker main function failed:", error)
+  process.exit(1)
+})

@@ -5,7 +5,7 @@ import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
 
 // CSV header definition (remains the same)
-const CSV_HEADERS = [
+export const CSV_HEADERS = [
   { id: "city", title: "City" },
   { id: "year", title: "Year" },
   { id: "month", title: "Month" },
@@ -69,13 +69,7 @@ async function findXmlFilesManually(rootDir: string): Promise<string[]> {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const {
-      rootDir,
-      outputFile = "image_metadata.csv",
-      numWorkers = 4, // Ensure this matches frontend state name if different
-      verbose = false,
-      filterConfig = null,
-    } = body
+    const { rootDir, outputFile = "image_metadata.csv", numWorkers = 4, verbose = false, filterConfig = null } = body
 
     console.log("Received request:", { rootDir, outputFile, numWorkers, verbose, filterConfig })
 
@@ -89,15 +83,11 @@ export async function POST(request: NextRequest) {
     const outputPath = path.join(process.cwd(), outputFile)
     console.log("Output path:", outputPath)
 
-    // The filteredImagesPath is now the absolute path from filterConfig
-    // No need to create it here as the worker will handle directory creation based on the absolute path.
-
     console.log("Searching for XML files...")
     const xmlFiles = await findXmlFilesManually(rootDir)
     console.log(`Found ${xmlFiles.length} XML files`)
 
     if (xmlFiles.length === 0) {
-      // ... (no XML files found response remains the same)
       try {
         const dirContents = await fs.readdir(rootDir, { recursive: true })
         const allFiles = dirContents.map((f) => f.toString())
@@ -142,7 +132,6 @@ export async function POST(request: NextRequest) {
       console.log("Filtering enabled:", filterConfig)
     }
 
-    // Updated worker script path resolution for both dev and production
     const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
     try {
       await fs.access(workerScriptPath)
@@ -163,17 +152,15 @@ export async function POST(request: NextRequest) {
           const worker = new Worker(workerScriptPath, {
             workerData: {
               xmlFilePath: currentFile,
-              filterConfig, // This now contains moveDestinationPath and moveFolderStructureOption
-              originalRootDir: rootDir, // Pass original rootDir for path replication
+              filterConfig,
+              originalRootDir: rootDir,
               workerId,
               verbose,
             },
-            // Add execArgv for TypeScript support in development
-            execArgv: process.env.NODE_ENV === "development" ? ["--loader", "tsx/esm"] : undefined,
           })
           activeWorkers.add(worker)
 
-          if (verbose) console.log(`[Main] Worker ${workerId} started for ${currentFile}`)
+          if (verbose) console.log(`[Main] Worker ${workerId} started for ${path.basename(currentFile)}`)
 
           worker.on("message", (result: any) => {
             processedCount++
@@ -211,7 +198,6 @@ export async function POST(request: NextRequest) {
             errorCount++
             errors.push(`Worker error for ${path.basename(currentFile)}: ${err.message}`)
             activeWorkers.delete(worker)
-            // worker.terminate() // Already terminated on error?
 
             if (fileIndex < xmlFiles.length) {
               launchWorkerIfNeeded()
@@ -221,13 +207,11 @@ export async function POST(request: NextRequest) {
           })
 
           worker.on("exit", (code) => {
-            activeWorkers.delete(worker) // Ensure worker is removed
+            activeWorkers.delete(worker)
             if (code !== 0 && verbose) {
-              // console.warn(`[Main] Worker ${workerId} for ${path.basename(currentFile)} exited with code ${code}`);
+              console.warn(`[Main] Worker ${workerId} for ${path.basename(currentFile)} exited with code ${code}`)
             }
-            if (fileIndex < xmlFiles.length && activeWorkers.size < numWorkers) {
-              // launchWorkerIfNeeded(); // Avoid re-launching on exit if error already handled
-            } else if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
+            if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
               resolveAllFiles()
             }
           })
