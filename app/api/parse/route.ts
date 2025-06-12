@@ -4,7 +4,6 @@ import path from "path"
 import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
 
-// CSV header definition (remains the same)
 export const CSV_HEADERS = [
   { id: "city", title: "City" },
   { id: "year", title: "Year" },
@@ -44,7 +43,6 @@ export const CSV_HEADERS = [
   { id: "commentData", title: "Comment Data" },
 ]
 
-// Manual directory traversal function (remains the same)
 async function findXmlFilesManually(rootDir: string): Promise<string[]> {
   const xmlFiles: string[] = []
   async function traverse(dir: string) {
@@ -130,6 +128,21 @@ export async function POST(request: NextRequest) {
     console.log(`Starting to process ${xmlFiles.length} XML files with ${numWorkers} worker(s)`)
     if (filterConfig?.enabled) {
       console.log("Filtering enabled:", filterConfig)
+
+      // Log filter details for debugging
+      if (filterConfig.minWidth || filterConfig.minHeight) {
+        console.log(`Image size filter: min ${filterConfig.minWidth || 0}x${filterConfig.minHeight || 0} pixels`)
+      }
+      if (filterConfig.minFileSize) {
+        console.log(
+          `Min file size filter: ${filterConfig.minFileSize} bytes (${Math.round((filterConfig.minFileSize / 1024 / 1024) * 100) / 100}MB)`,
+        )
+      }
+      if (filterConfig.maxFileSize) {
+        console.log(
+          `Max file size filter: ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
+        )
+      }
     }
 
     const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
@@ -143,6 +156,7 @@ export async function POST(request: NextRequest) {
     await new Promise<void>((resolveAllFiles) => {
       let fileIndex = 0
       let workersLaunched = 0
+      let lastProgressReport = 0
 
       const launchWorkerIfNeeded = () => {
         while (activeWorkers.size < numWorkers && fileIndex < xmlFiles.length) {
@@ -179,8 +193,15 @@ export async function POST(request: NextRequest) {
               errors.push(`Error in ${path.basename(currentFile)} (Worker ${result.workerId}): ${result.error}`)
             }
 
-            if (verbose && processedCount % 50 === 0) {
-              console.log(`[Main] Progress: ${processedCount}/${xmlFiles.length} files processed.`)
+            // Progress reporting every 100 files or every 10% of total files
+            const progressInterval = Math.max(100, Math.floor(xmlFiles.length / 10))
+            if (processedCount - lastProgressReport >= progressInterval || processedCount === xmlFiles.length) {
+              const progressPercent = Math.round((processedCount / xmlFiles.length) * 100)
+              console.log(`[Main] Progress: ${processedCount}/${xmlFiles.length} files processed (${progressPercent}%)`)
+              console.log(
+                `[Main] Current stats: ${successCount} successful, ${filteredCount} filtered, ${movedCount} moved, ${errorCount} errors`,
+              )
+              lastProgressReport = processedCount
             }
 
             activeWorkers.delete(worker)

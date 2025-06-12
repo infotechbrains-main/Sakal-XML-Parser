@@ -22,33 +22,27 @@ function findMainNewsComponent(newsComponent) {
   return null
 }
 
-// Helper function to extract CDATA content - FIXED to handle empty CDATA properly
+// Helper function to extract CDATA content
 function extractCData(element) {
   if (!element) return ""
 
-  // Handle string directly
   if (typeof element === "string") {
     return element.trim()
   }
 
-  // Handle object with _ property (CDATA content)
   if (element && typeof element === "object" && element.hasOwnProperty("_")) {
     const content = String(element._).trim()
     return content
   }
 
-  // Handle object with $ property and Value
   if (element && typeof element === "object" && element.$ && element.$.Value) {
     return String(element.$.Value).trim()
   }
 
-  // Handle direct object content
   if (element && typeof element === "object") {
-    // Check if it's an empty object or has no meaningful content
     const keys = Object.keys(element)
     if (keys.length === 0) return ""
 
-    // If it has content, try to extract it
     if (element.toString && element.toString() !== "[object Object]") {
       return element.toString().trim()
     }
@@ -57,14 +51,13 @@ function extractCData(element) {
   return ""
 }
 
-// Check if image passes filter criteria - IMPROVED
+// Check if image passes filter criteria - FIXED FILE SIZE LOGIC
 function passesFilter(record, filterConfig) {
   if (!filterConfig?.enabled) return true
 
   const applyTextFilter = (fieldValue, filter) => {
     if (!filter || !filter.operator) return true
 
-    // Ensure fieldValue is a string and handle undefined/null
     const val = String(fieldValue || "")
       .toLowerCase()
       .trim()
@@ -114,23 +107,29 @@ function passesFilter(record, filterConfig) {
     return false
   }
 
-  // File size filters
-  const fileSize = Number.parseInt(record.imageSize) || 0
-  if (filterConfig.minFileSize && fileSize < filterConfig.minFileSize) {
-    if (workerData.verbose) {
-      console.log(
-        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSize} < ${filterConfig.minFileSize}`,
-      )
+  // FIXED: File size filters - convert bytes to the correct unit
+  const fileSizeBytes = Number.parseInt(record.imageSize) || 0
+
+  if (filterConfig.minFileSize) {
+    if (fileSizeBytes < filterConfig.minFileSize) {
+      if (workerData.verbose) {
+        console.log(
+          `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round(fileSizeBytes / 1024)}KB) < ${filterConfig.minFileSize} bytes (${Math.round(filterConfig.minFileSize / 1024)}KB)`,
+        )
+      }
+      return false
     }
-    return false
   }
-  if (filterConfig.maxFileSize && fileSize > filterConfig.maxFileSize) {
-    if (workerData.verbose) {
-      console.log(
-        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSize} > ${filterConfig.maxFileSize}`,
-      )
+
+  if (filterConfig.maxFileSize) {
+    if (fileSizeBytes > filterConfig.maxFileSize) {
+      if (workerData.verbose) {
+        console.log(
+          `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round((fileSizeBytes / 1024 / 1024) * 100) / 100}MB) > ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
+        )
+      }
+      return false
     }
-    return false
   }
 
   // Text filters
@@ -187,7 +186,7 @@ async function moveImageToFilteredFolder(
       if (verbose) console.log(`[Worker ${workerId}] Missing paths for move operation.`)
       return false
     }
-    await fs.access(originalImageAbsPath) // Check if source exists
+    await fs.access(originalImageAbsPath)
 
     const fileName = path.basename(originalImageAbsPath)
     let finalDestPath
@@ -198,7 +197,6 @@ async function moveImageToFilteredFolder(
       finalDestDir = path.join(userDefinedDestAbsPath, relativePathFromRoot)
       finalDestPath = path.join(finalDestDir, fileName)
     } else {
-      // "single"
       finalDestDir = userDefinedDestAbsPath
       finalDestPath = path.join(finalDestDir, fileName)
     }
@@ -213,7 +211,7 @@ async function moveImageToFilteredFolder(
   }
 }
 
-// Process a single XML file - IMPROVED ERROR HANDLING
+// Process a single XML file
 async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose) {
   try {
     if (verbose) console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
@@ -229,7 +227,6 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       year = "",
       month = ""
 
-    // Simplified path parsing
     const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
     if (yearIndex !== -1) {
       year = pathParts[yearIndex]
@@ -239,7 +236,6 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       }
     }
 
-    // Fallback logic for city/year/month
     for (let i = 0; i < pathParts.length; i++) {
       if (pathParts[i].toLowerCase() === "images" && i + 3 < pathParts.length) {
         city = pathParts[i + 1]
@@ -349,7 +345,6 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       }
     }
 
-    // FIXED: Handle RightsMetadata structure correctly
     if (mainComponent.RightsMetadata?.UsageRights) {
       usageType = extractCData(mainComponent.RightsMetadata.UsageRights.UsageType)
       rightsHolder = extractCData(mainComponent.RightsMetadata.UsageRights.RightsHolder)
@@ -358,7 +353,6 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       rightsHolder = extractCData(mainComponent.UsageRights.RightsHolder)
     }
 
-    // Handle copyright from UsageRights if not found in NewsLines
     if (!copyrightLine && mainComponent.RightsMetadata?.UsageRights?.Property) {
       const usageProps = Array.isArray(mainComponent.RightsMetadata.UsageRights.Property)
         ? mainComponent.RightsMetadata.UsageRights.Property
@@ -376,7 +370,6 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
         ? mainComponent.ContentItem
         : [mainComponent.ContentItem]
       for (const item of contentItems) {
-        // Look for HIGHRES or Picture media type
         if (item.MediaType && (item.MediaType.FormalName === "HIGHRES" || item.MediaType.FormalName === "Picture")) {
           if (item.Characteristics) {
             imageSize = item.Characteristics.SizeInBytes || ""
@@ -391,7 +384,7 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
             }
           }
           imageHref = item.Href || ""
-          break // Use the first HIGHRES image found
+          break
         }
       }
     }
@@ -500,7 +493,7 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
   }
 }
 
-// Main worker execution - process the file immediately when worker starts
+// Main worker execution
 async function main() {
   try {
     if (!workerData) {
@@ -522,7 +515,6 @@ async function main() {
       console.log(`[Worker ${workerId}] Finished processing: ${path.basename(xmlFilePath)}`)
     }
 
-    // Send result back to main thread
     if (parentPort) {
       parentPort.postMessage(result)
     } else {
@@ -539,12 +531,10 @@ async function main() {
         workerId: workerData?.workerId || 0,
       })
     }
-    // Exit with error code
     process.exit(1)
   }
 }
 
-// Execute main function
 main().catch((error) => {
   console.error("Worker main function failed:", error)
   process.exit(1)

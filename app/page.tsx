@@ -12,7 +12,7 @@ import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group" // Import RadioGroup
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import {
   AlertCircle,
   CheckCircle,
@@ -28,6 +28,7 @@ import {
   ImageIcon,
   HardDrive,
   Newspaper,
+  Square,
 } from "lucide-react"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 
@@ -40,20 +41,16 @@ export default function Home() {
 
   // Filter settings
   const [enableFiltering, setEnableFiltering] = useState(false)
-  // Image Dimension Filters
   const [minImageSize, setMinImageSize] = useState("512")
   const [customMinWidth, setCustomMinWidth] = useState("")
   const [customMinHeight, setCustomMinHeight] = useState("")
-  // File Size Filters
   const [minFileSize, setMinFileSize] = useState("")
   const [maxFileSize, setMaxFileSize] = useState("")
   const [fileSizeUnit, setFileSizeUnit] = useState("KB")
 
-  // --- New Move Images Settings ---
   const [moveFilteredImages, setMoveFilteredImages] = useState(false)
-  const [moveDestinationPath, setMoveDestinationPath] = useState("") // Full absolute path
-  const [moveFolderStructure, setMoveFolderStructure] = useState("replicate") // "replicate" or "single"
-  // --- End New Move Images Settings ---
+  const [moveDestinationPath, setMoveDestinationPath] = useState("")
+  const [moveFolderStructure, setMoveFolderStructure] = useState("replicate")
 
   const [creditLineFilter, setCreditLineFilter] = useState({ value: "", operator: "like" })
   const [copyrightFilter, setCopyrightFilter] = useState({ value: "", operator: "like" })
@@ -64,7 +61,7 @@ export default function Home() {
   const [enableWatchMode, setEnableWatchMode] = useState(false)
   const [isWatching, setIsWatching] = useState(false)
 
-  const [status, setStatus] = useState("idle") // idle, running, completed, error
+  const [status, setStatus] = useState("idle")
   const [logs, setLogs] = useState<string[]>([])
   const [errors, setErrors] = useState<string[]>([])
   const [progress, setProgress] = useState(0)
@@ -81,6 +78,12 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState("config")
   const [isConnected, setIsConnected] = useState(false)
   const [downloadUrl, setDownloadUrl] = useState("")
+  const [isProcessing, setIsProcessing] = useState(false)
+
+  // SSE connection ref
+  const eventSourceRef = useRef<EventSource | null>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
+
   const logsEndRef = useRef<HTMLDivElement>(null)
   const errorsEndRef = useRef<HTMLDivElement>(null)
 
@@ -112,16 +115,31 @@ export default function Home() {
     }
   }, [errors])
 
+  // Cleanup SSE connection on unmount
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close()
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+    }
+  }, [])
+
+  const addLog = (message: string) => {
+    const timestamp = new Date().toLocaleTimeString()
+    setLogs((prev) => [...prev, `[${timestamp}]${message}`])
+  }
+
   const getFilterConfig = () => {
     if (!enableFiltering) return null
 
     const config: any = {
       enabled: true,
       moveImages: moveFilteredImages,
-      // --- Pass new move settings ---
       moveDestinationPath: moveFilteredImages ? moveDestinationPath : undefined,
       moveFolderStructureOption: moveFilteredImages ? moveFolderStructure : undefined,
-      // --- End new move settings ---
     }
 
     if (minImageSize === "custom") {
@@ -169,51 +187,8 @@ export default function Home() {
       return
     }
 
-    setLogs((prev) => [...prev, "=".repeat(50), "Starting new parsing session..."])
-    const currentFilterConfig = getFilterConfig()
-
-    if (enableFiltering && currentFilterConfig) {
-      setLogs((prev) => [...prev, "Filtering enabled with the following criteria:"])
-      if (currentFilterConfig.minWidth || currentFilterConfig.minHeight) {
-        setLogs((prev) => [
-          ...prev,
-          `  Image size: min ${currentFilterConfig.minWidth || 0}x${currentFilterConfig.minHeight || 0} pixels`,
-        ])
-      }
-      if (currentFilterConfig.minFileSize || currentFilterConfig.maxFileSize) {
-        setLogs((prev) => [
-          ...prev,
-          `  File size: ${currentFilterConfig.minFileSize ? `min ${Math.round(currentFilterConfig.minFileSize / 1024)}KB` : ""} ${currentFilterConfig.maxFileSize ? `max ${Math.round(currentFilterConfig.maxFileSize / 1024)}KB` : ""}`,
-        ])
-      }
-      const logMetaFilter = (label: string, filterDetail?: { value: string; operator: string }) => {
-        if (filterDetail) {
-          const opLabel =
-            TEXT_FILTER_OPERATORS.find((op) => op.value === filterDetail.operator)?.label || filterDetail.operator
-          if (filterDetail.operator === "notBlank" || filterDetail.operator === "isBlank") {
-            setLogs((prev) => [...prev, `  ${label}: ${opLabel}`])
-          } else if (filterDetail.value) {
-            setLogs((prev) => [...prev, `  ${label}: ${opLabel} "${filterDetail.value}"`])
-          }
-        }
-      }
-      logMetaFilter("CreditLine", currentFilterConfig.creditLine)
-      logMetaFilter("Copyright", currentFilterConfig.copyright)
-      logMetaFilter("UsageType", currentFilterConfig.usageType)
-      logMetaFilter("RightsHolder", currentFilterConfig.rightsHolder)
-      logMetaFilter("Location", currentFilterConfig.location)
-
-      if (currentFilterConfig.moveImages) {
-        setLogs((prev) => [
-          ...prev,
-          `  Filtered images will be moved to: ${currentFilterConfig.moveDestinationPath}`,
-          `  Folder structure for moved images: ${currentFilterConfig.moveFolderStructureOption === "replicate" ? "Replicate source structure" : "Single folder"}`,
-        ])
-      }
-    } else {
-      setLogs((prev) => [...prev, "No filters applied or filtering disabled."])
-    }
-
+    // Reset state
+    setLogs([])
     setErrors([])
     setProgress(0)
     setStats({
@@ -227,54 +202,122 @@ export default function Home() {
       endTime: 0,
     })
     setStatus("running")
+    setIsProcessing(true)
     setActiveTab("logs")
     setDownloadUrl("")
 
+    const currentFilterConfig = getFilterConfig()
+
     try {
-      const response = await fetch("/api/parse", {
+      // Close any existing SSE connection
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close()
+      }
+
+      // Create abort controller for the fetch request
+      abortControllerRef.current = new AbortController()
+
+      // Start SSE processing
+      const response = await fetch("/api/parse/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           rootDir,
           outputFile,
-          numWorkers: workers, // Changed from 'workers' to 'numWorkers' to match backend
-          batchSize,
+          numWorkers: workers,
           verbose,
           filterConfig: currentFilterConfig,
         }),
+        signal: abortControllerRef.current.signal,
       })
-      const result = await response.json()
 
-      if (response.ok) {
-        setLogs((prev) => [...prev, `Found ${result.stats.totalFiles} XML files to process`])
-        if (result.stats.filteredFiles !== undefined) {
-          setLogs((prev) => [...prev, `${result.stats.filteredFiles} files matched the filter criteria`])
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
+
+      // Create EventSource-like functionality with fetch
+      const reader = response.body?.getReader()
+      const decoder = new TextDecoder()
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          const chunk = decoder.decode(value)
+          const lines = chunk.split("\n")
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                const data = JSON.parse(line.slice(6))
+                handleSSEMessage(data)
+              } catch (e) {
+                console.error("Error parsing SSE data:", e)
+              }
+            }
+          }
         }
-        if (result.stats.movedFiles !== undefined && result.stats.movedFiles > 0) {
-          setLogs((prev) => [...prev, `${result.stats.movedFiles} images moved to destination`])
-        }
-        setLogs((prev) => [
-          ...prev,
-          `Processing completed successfully!`,
-          `Processed ${result.stats.processedFiles} files`,
-          `Successful: ${result.stats.successfulFiles}`,
-          `Errors: ${result.stats.errorFiles}`,
-          `Records written: ${result.stats.recordsWritten}`,
-          `CSV file generated: ${result.outputFile}`, // Use outputFile from response
-        ])
-        setStats((prev) => ({ ...prev, ...result.stats, endTime: Date.now() }))
-        setProgress(100)
-        setStatus("completed")
-        setDownloadUrl(`/api/download?file=${encodeURIComponent(result.outputFile)}`) // Use outputFile from response
-        if (result.errors && result.errors.length > 0) setErrors(result.errors)
+      }
+    } catch (error: any) {
+      if (error.name === "AbortError") {
+        addLog("Processing was cancelled")
+        setStatus("idle")
       } else {
-        setLogs((prev) => [...prev, `Error: ${result.error}`, `Message: ${result.message || "Unknown error"}`])
+        addLog(`Network error: ${error.message}`)
         setStatus("error")
       }
-    } catch (error) {
-      setLogs((prev) => [...prev, `Network error: ${error instanceof Error ? error.message : "Unknown error"}`])
-      setStatus("error")
+    } finally {
+      setIsProcessing(false)
     }
+  }
+
+  const handleSSEMessage = (data: any) => {
+    switch (data.type) {
+      case "log":
+        addLog(data.message)
+        break
+      case "progress":
+        setProgress(data.percentage)
+        setStats((prev) => ({
+          ...prev,
+          processedFiles: data.processed,
+          totalFiles: data.total,
+          successfulFiles: data.successful,
+          filteredFiles: data.filtered,
+          movedFiles: data.moved,
+          errorFiles: data.errors,
+        }))
+        break
+      case "error":
+        addLog(`Error: ${data.message}`)
+        setErrors((prev) => [...prev, data.message])
+        setStatus("error")
+        setIsProcessing(false)
+        break
+      case "complete":
+        setStats((prev) => ({ ...prev, ...data.stats, endTime: Date.now() }))
+        setProgress(100)
+        setStatus("completed")
+        setDownloadUrl(`/api/download?file=${encodeURIComponent(data.outputFile)}`)
+        setIsProcessing(false)
+        if (data.errors && data.errors.length > 0) {
+          setErrors(data.errors)
+        }
+        break
+    }
+  }
+
+  const handleStopProcessing = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close()
+    }
+    setIsProcessing(false)
+    setStatus("idle")
+    addLog("Processing stopped by user")
   }
 
   const handleDownloadCSV = () => {
@@ -306,7 +349,8 @@ export default function Home() {
     setIsWatching(true)
     setStatus("running")
     setActiveTab("logs")
-    setLogs((prev) => [...prev, "=".repeat(50), "Attempting to start watch mode..."])
+    addLog("=".repeat(50))
+    addLog("Attempting to start watch mode...")
 
     const currentFilterConfig = getFilterConfig()
 
@@ -319,36 +363,36 @@ export default function Home() {
           outputFile,
           numWorkers: workers,
           verbose,
-          filterConfig: currentFilterConfig, // This now includes moveDestinationPath and moveFolderStructureOption
+          filterConfig: currentFilterConfig,
         }),
       })
       const result = await response.json()
       if (response.ok) {
-        setLogs((prev) => [...prev, "Watch mode started successfully. Monitoring for new XML files."])
+        addLog("Watch mode started successfully. Monitoring for new XML files.")
       } else {
-        setLogs((prev) => [...prev, `Error starting watcher: ${result.message}`])
+        addLog(`Error starting watcher: ${result.message}`)
         setIsWatching(false)
         setStatus("error")
       }
     } catch (error) {
-      setLogs((prev) => [...prev, `Network error: ${error instanceof Error ? error.message : "Unknown error"}`])
+      addLog(`Network error: ${error instanceof Error ? error.message : "Unknown error"}`)
       setIsWatching(false)
       setStatus("error")
     }
   }
 
   const handleStopWatching = async () => {
-    setLogs((prev) => [...prev, "Attempting to stop watch mode..."])
+    addLog("Attempting to stop watch mode...")
     try {
       const response = await fetch("/api/watch/stop", { method: "POST" })
       const result = await response.json()
       if (response.ok) {
-        setLogs((prev) => [...prev, "Watch mode stopped."])
+        addLog("Watch mode stopped.")
       } else {
-        setLogs((prev) => [...prev, `Could not stop watcher: ${result.message}`])
+        addLog(`Could not stop watcher: ${result.message}`)
       }
     } catch (error) {
-      setLogs((prev) => [...prev, `Network error: ${error instanceof Error ? error.message : "Unknown error"}`])
+      addLog(`Network error: ${error instanceof Error ? error.message : "Unknown error"}`)
     } finally {
       setIsWatching(false)
       setStatus("idle")
@@ -453,7 +497,6 @@ export default function Home() {
                   <CardDescription>Configure the XML parser settings before starting</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-6">
-                  {/* Root Directory, Output File, Workers, Batch Size, Verbose Logging */}
                   <div className="space-y-2">
                     <Label htmlFor="rootDir">Root Directory (Full Absolute Path)</Label>
                     <Input
@@ -537,6 +580,11 @@ export default function Home() {
                           Start Watching Folder
                         </Button>
                       )
+                    ) : isProcessing ? (
+                      <Button onClick={handleStopProcessing} className="w-full" size="lg" variant="destructive">
+                        <Square className="h-4 w-4 mr-2" />
+                        Stop Processing
+                      </Button>
                     ) : (
                       <Button
                         onClick={handleStartParsing}
@@ -570,7 +618,6 @@ export default function Home() {
 
                   {enableFiltering && (
                     <>
-                      {/* Image Dimension & File Size Filters remain the same */}
                       <Card className="p-4">
                         <CardHeader className="p-0 pb-3">
                           <CardTitle className="text-base flex items-center gap-2">
@@ -578,7 +625,6 @@ export default function Home() {
                           </CardTitle>
                         </CardHeader>
                         <CardContent className="p-0 space-y-4">
-                          {/* ... Dimension filter UI ... */}
                           <div className="space-y-2">
                             <Label>Minimum Image Size</Label>
                             <Select value={minImageSize} onValueChange={setMinImageSize}>
@@ -664,7 +710,6 @@ export default function Home() {
                         </CardContent>
                       </Card>
 
-                      {/* Metadata Filters remain the same */}
                       <Card className="p-4">
                         <CardHeader className="p-0 pb-3">
                           <CardTitle className="text-base flex items-center gap-2">
@@ -672,8 +717,6 @@ export default function Home() {
                           </CardTitle>
                         </CardHeader>
                         <CardContent className="p-0 space-y-4">
-                          {/* ... All metadata filter UI (CreditLine, Copyright, etc.) ... */}
-                          {/* CreditLine Filter */}
                           <div className="space-y-2">
                             <Label htmlFor="creditLineFilterValue">CreditLine</Label>
                             <div className="flex gap-2">
@@ -703,7 +746,6 @@ export default function Home() {
                               )}
                             </div>
                           </div>
-                          {/* Copyright Filter */}
                           <div className="space-y-2">
                             <Label htmlFor="copyrightFilterValue">Copyright</Label>
                             <div className="flex gap-2">
@@ -733,7 +775,6 @@ export default function Home() {
                               )}
                             </div>
                           </div>
-                          {/* UsageType Filter */}
                           <div className="space-y-2">
                             <Label htmlFor="usageTypeFilterValue">UsageType</Label>
                             <div className="flex gap-2">
@@ -763,7 +804,6 @@ export default function Home() {
                               )}
                             </div>
                           </div>
-                          {/* RightsHolder Filter */}
                           <div className="space-y-2">
                             <Label htmlFor="rightsHolderFilterValue">RightsHolder</Label>
                             <div className="flex gap-2">
@@ -796,7 +836,6 @@ export default function Home() {
                                 )}
                             </div>
                           </div>
-                          {/* Location Filter */}
                           <div className="space-y-2">
                             <Label htmlFor="locationFilterValue">Location</Label>
                             <div className="flex gap-2">
@@ -829,7 +868,6 @@ export default function Home() {
                         </CardContent>
                       </Card>
 
-                      {/* --- New Move Filtered Images Section --- */}
                       <Card className="p-4">
                         <CardHeader className="p-0 pb-3">
                           <CardTitle className="text-base flex items-center gap-2">
@@ -887,14 +925,11 @@ export default function Home() {
                           )}
                         </CardContent>
                       </Card>
-                      {/* --- End New Move Filtered Images Section --- */}
 
-                      {/* Filter Summary Alert remains the same */}
                       <Alert>
                         <Filter className="h-4 w-4" />
                         <AlertTitle>Current Filter Summary</AlertTitle>
                         <AlertDescription className="space-y-1 text-xs">
-                          {/* ... (existing summary logic, can be expanded for new move options) ... */}
                           {minImageSize !== "none" && (
                             <div>
                               Image size:{" "}
@@ -948,14 +983,12 @@ export default function Home() {
                               </div>
                             </>
                           )}
-                          {/* ... (no specific filters message) ... */}
                         </AlertDescription>
                       </Alert>
                     </>
                   )}
 
                   <div className="mt-6 pt-4 border-t">
-                    {/* Button logic remains the same, but ensure `handleStartParsing` and `handleStartWatching` use the new config */}
                     {enableWatchMode ? (
                       isWatching ? (
                         <Button onClick={handleStopWatching} className="w-full" size="lg" variant="destructive">
@@ -971,6 +1004,11 @@ export default function Home() {
                           <Play className="h-4 w-4 mr-2" /> Start Watching with Filters
                         </Button>
                       )
+                    ) : isProcessing ? (
+                      <Button onClick={handleStopProcessing} className="w-full" size="lg" variant="destructive">
+                        <Square className="h-4 w-4 mr-2" />
+                        Stop Processing
+                      </Button>
                     ) : (
                       <Button
                         onClick={handleStartParsing}
@@ -987,9 +1025,7 @@ export default function Home() {
               </Card>
             </TabsContent>
 
-            {/* Logs Tab remains the same */}
             <TabsContent value="logs">
-              {/* ... (Logs tab content as before) ... */}
               <Card className="h-[700px] flex flex-col">
                 <CardHeader>
                   <CardTitle>Processing Logs</CardTitle>
@@ -1008,7 +1044,6 @@ export default function Home() {
                         ) : (
                           logs.map((log, index) => (
                             <div key={index} className="text-xs font-mono mb-1 py-1">
-                              <span className="text-muted-foreground mr-2">[{new Date().toLocaleTimeString()}]</span>
                               {log}
                             </div>
                           ))
@@ -1027,7 +1062,6 @@ export default function Home() {
                         ) : (
                           errors.map((error, index) => (
                             <div key={index} className="text-xs font-mono text-red-600 mb-1 py-1">
-                              <span className="text-muted-foreground mr-2">[{new Date().toLocaleTimeString()}]</span>
                               {error}
                             </div>
                           ))
@@ -1053,9 +1087,7 @@ export default function Home() {
               </Card>
             </TabsContent>
 
-            {/* Results Tab remains the same */}
             <TabsContent value="results">
-              {/* ... (Results tab content as before) ... */}
               <Card>
                 <CardHeader>
                   <CardTitle>Processing Results</CardTitle>
@@ -1194,9 +1226,7 @@ export default function Home() {
           </Tabs>
         </div>
 
-        {/* Live Statistics Panel remains the same */}
         <div className="lg:col-span-1">
-          {/* ... (Live Statistics Panel content as before) ... */}
           <Card className="h-full">
             <CardHeader>
               <CardTitle>Live Statistics</CardTitle>
