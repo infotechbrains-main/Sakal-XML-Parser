@@ -1,10 +1,10 @@
-import { parentPort } from "worker_threads"
-import fs from "fs/promises"
-import path from "path"
-import { parseStringPromise } from "xml2js"
+const { parentPort } = require("worker_threads")
+const fs = require("fs/promises")
+const path = require("path")
+const { parseStringPromise } = require("xml2js")
 
-// Helper function to find the main news component (moved from main route)
-function findMainNewsComponent(newsComponent: any): any {
+// Helper function to find the main news component
+function findMainNewsComponent(newsComponent) {
   if (!newsComponent) return null
   if (typeof newsComponent !== "object") return null
 
@@ -22,8 +22,8 @@ function findMainNewsComponent(newsComponent: any): any {
   return null
 }
 
-// Helper function to extract CDATA content (moved from main route)
-function extractCData(element: any): string {
+// Helper function to extract CDATA content
+function extractCData(element) {
   if (!element) return ""
   if (typeof element === "string") return element.trim()
   if (element && typeof element === "object" && element._) return String(element._).trim()
@@ -31,14 +31,11 @@ function extractCData(element: any): string {
   return ""
 }
 
-// Check if image passes filter criteria (moved from main route)
-function passesFilter(record: any, filterConfig: any): boolean {
+// Check if image passes filter criteria
+function passesFilter(record, filterConfig) {
   if (!filterConfig?.enabled) return true
 
-  const applyTextFilter = (
-    fieldValue: string | undefined,
-    filter: { value: string; operator: string } | undefined,
-  ): boolean => {
+  const applyTextFilter = (fieldValue, filter) => {
     if (!filter || !filter.operator) return true
 
     const val = (fieldValue || "").toLowerCase()
@@ -84,15 +81,15 @@ function passesFilter(record: any, filterConfig: any): boolean {
   return true
 }
 
-// Updated move image file to filtered folder (moved from main route)
+// Move image file to filtered folder
 async function moveImageToFilteredFolder(
-  originalImageAbsPath: string,
-  userDefinedDestAbsPath: string, // This is filterConfig.moveDestinationPath
-  folderStructureOption: "replicate" | "single",
-  originalRootDirForScan: string, // This is the rootDir from the UI
-  verbose: boolean,
-  workerId: number,
-): Promise<boolean> {
+  originalImageAbsPath,
+  userDefinedDestAbsPath,
+  folderStructureOption,
+  originalRootDirForScan,
+  verbose,
+  workerId,
+) {
   try {
     if (!originalImageAbsPath || !userDefinedDestAbsPath) {
       if (verbose) console.log(`[Worker ${workerId}] Missing paths for move operation.`)
@@ -101,8 +98,8 @@ async function moveImageToFilteredFolder(
     await fs.access(originalImageAbsPath) // Check if source exists
 
     const fileName = path.basename(originalImageAbsPath)
-    let finalDestPath: string
-    let finalDestDir: string
+    let finalDestPath
+    let finalDestDir
 
     if (folderStructureOption === "replicate") {
       const relativePathFromRoot = path.relative(originalRootDirForScan, path.dirname(originalImageAbsPath))
@@ -118,20 +115,14 @@ async function moveImageToFilteredFolder(
     await fs.copyFile(originalImageAbsPath, finalDestPath)
     if (verbose) console.log(`[Worker ${workerId}] Moved image: ${originalImageAbsPath} -> ${finalDestPath}`)
     return true
-  } catch (error: any) {
+  } catch (error) {
     if (verbose) console.error(`[Worker ${workerId}] Error moving image ${originalImageAbsPath}:`, error.message)
     return false
   }
 }
 
-// Process a single XML file (adapted for worker)
-async function processXmlFileInWorker(
-  xmlFilePath: string,
-  filterConfig: any,
-  originalRootDir: string, // Renamed from filteredImagesPath for clarity, now it's the scan root
-  workerId: number,
-  verbose: boolean,
-): Promise<any> {
+// Process a single XML file
+async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose) {
   try {
     if (verbose) console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
 
@@ -146,19 +137,17 @@ async function processXmlFileInWorker(
       year = "",
       month = ""
 
-    // Simplified path parsing, adjust if needed for your structure
+    // Simplified path parsing
     const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
     if (yearIndex !== -1) {
       year = pathParts[yearIndex]
       if (yearIndex > 0) city = pathParts[yearIndex - 1]
       if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
         month = pathParts[yearIndex + 1]
-      } else if (yearIndex + 1 < pathParts.length) {
-        // If month is not numeric, take the next part as is, or leave blank
-        // This part might need refinement based on actual folder structures
       }
     }
-    // Fallback or more specific logic for city/year/month if the above is too simple
+
+    // Fallback logic for city/year/month
     for (let i = 0; i < pathParts.length; i++) {
       if (pathParts[i].toLowerCase() === "images" && i + 3 < pathParts.length) {
         city = pathParts[i + 1]
@@ -229,7 +218,7 @@ async function processXmlFileInWorker(
           ? mainComponent.NewsLines.KeywordLine
           : [mainComponent.NewsLines.KeywordLine]
         keywords = keywordLines
-          .map((k: any) => extractCData(k))
+          .map((k) => extractCData(k))
           .filter(Boolean)
           .join(", ")
       }
@@ -256,7 +245,6 @@ async function processXmlFileInWorker(
           if (prop.FormalName === "Processed") processed = prop.Value || ""
           if (prop.FormalName === "Published") published = prop.Value || ""
           if (prop.FormalName === "Location") {
-            // Nested Location under DescriptiveMetadata
             if (prop.Property) {
               const locProps = Array.isArray(prop.Property) ? prop.Property : [prop.Property]
               for (const locProp of locProps) {
@@ -291,9 +279,7 @@ async function processXmlFileInWorker(
         : [mainComponent.ContentItem]
       for (const item of contentItems) {
         if (item.MediaType && item.MediaType.FormalName === "Picture") {
-          // More robust check for picture
           if (item.DataContent && item.DataContent.Characteristics) {
-            // Check if characteristics are under DataContent
             imageSize = item.DataContent.Characteristics.SizeInBytes || ""
             if (item.DataContent.Characteristics.Property) {
               const props = Array.isArray(item.DataContent.Characteristics.Property)
@@ -305,7 +291,6 @@ async function processXmlFileInWorker(
               }
             }
           } else if (item.Characteristics) {
-            // Fallback to direct Characteristics
             imageSize = item.Characteristics.SizeInBytes || ""
             if (item.Characteristics.Property) {
               const props = Array.isArray(item.Characteristics.Property)
@@ -318,9 +303,6 @@ async function processXmlFileInWorker(
             }
           }
           imageHref = item.Href || (item.DataContent ? item.DataContent.Href : "") || ""
-          if (imageHref && imageHref.toLowerCase().endsWith(".jpg") && !imageHref.toLowerCase().includes("_th.jpg")) {
-            // Found primary image, break if necessary or continue if multiple images possible
-          }
         }
       }
     }
@@ -387,8 +369,8 @@ async function processXmlFileInWorker(
       filterConfig?.enabled &&
       passed &&
       filterConfig?.moveImages &&
-      filterConfig?.moveDestinationPath && // Ensure destination path is provided
-      filterConfig?.moveFolderStructureOption && // Ensure folder structure option is provided
+      filterConfig?.moveDestinationPath &&
+      filterConfig?.moveFolderStructureOption &&
       imageExists &&
       imagePath
     ) {
@@ -396,14 +378,14 @@ async function processXmlFileInWorker(
         imagePath,
         filterConfig.moveDestinationPath,
         filterConfig.moveFolderStructureOption,
-        originalRootDir, // Pass the original root directory for path replication
+        originalRootDir,
         verbose,
         workerId,
       )
     }
 
     return { record: passed ? record : null, passedFilter: passed, imageMoved: moved, workerId }
-  } catch (err: any) {
+  } catch (err) {
     if (verbose) console.error(`[Worker ${workerId}] Error processing ${xmlFilePath}:`, err.message)
     return { record: null, passedFilter: false, imageMoved: false, error: err.message, workerId }
   }
@@ -416,6 +398,5 @@ if (parentPort) {
     parentPort.postMessage(result)
   })
 } else {
-  // This allows testing the worker directly if needed, though not typical for worker_threads
   console.log("Worker started without parentPort. This script is intended to be run as a worker thread.")
 }

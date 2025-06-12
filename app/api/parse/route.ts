@@ -142,6 +142,7 @@ export async function POST(request: NextRequest) {
       console.log("Filtering enabled:", filterConfig)
     }
 
+    // Updated worker script path resolution for both dev and production
     const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
     try {
       await fs.access(workerScriptPath)
@@ -167,6 +168,8 @@ export async function POST(request: NextRequest) {
               workerId,
               verbose,
             },
+            // Add execArgv for TypeScript support in development
+            execArgv: process.env.NODE_ENV === "development" ? ["--loader", "tsx/esm"] : undefined,
           })
           activeWorkers.add(worker)
 
