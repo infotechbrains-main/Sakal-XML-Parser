@@ -3,7 +3,7 @@ import fs from "fs/promises"
 import path from "path"
 import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
-import { CSV_HEADERS_MAIN } from "../route"
+import { CSV_HEADERS } from "../route"
 
 // Manual directory traversal function
 async function findXmlFilesManually(rootDir: string): Promise<string[]> {
@@ -37,6 +37,8 @@ export async function POST(request: NextRequest) {
 
   // Create SSE response
   const encoder = new TextEncoder()
+  let isControllerClosed = false
+
   const stream = new ReadableStream({
     start(controller) {
       // Send initial message
@@ -46,16 +48,25 @@ export async function POST(request: NextRequest) {
       // Start processing in background
       processFiles(controller, encoder, { rootDir, outputFile, numWorkers, verbose, filterConfig })
         .then(() => {
-          controller.close()
+          if (!isControllerClosed) {
+            isControllerClosed = true
+            controller.close()
+          }
         })
         .catch((error) => {
-          const errorData = `data: ${JSON.stringify({
-            type: "error",
-            message: `Processing failed: ${error.message}`,
-          })}\n\n`
-          controller.enqueue(encoder.encode(errorData))
-          controller.close()
+          if (!isControllerClosed) {
+            const errorData = `data: ${JSON.stringify({
+              type: "error",
+              message: `Processing failed: ${error.message}`,
+            })}\n\n`
+            controller.enqueue(encoder.encode(errorData))
+            isControllerClosed = true
+            controller.close()
+          }
         })
+    },
+    cancel() {
+      isControllerClosed = true
     },
   })
 
@@ -72,10 +83,19 @@ export async function POST(request: NextRequest) {
 
 async function processFiles(controller: ReadableStreamDefaultController, encoder: TextEncoder, config: any) {
   const { rootDir, outputFile, numWorkers, verbose, filterConfig } = config
+  let isControllerClosed = false
 
   const sendMessage = (type: string, data: any) => {
-    const message = `data: ${JSON.stringify({ type, ...data })}\n\n`
-    controller.enqueue(encoder.encode(message))
+    if (isControllerClosed) {
+      return // Don't try to send if controller is closed
+    }
+    try {
+      const message = `data: ${JSON.stringify({ type, ...data })}\n\n`
+      controller.enqueue(encoder.encode(message))
+    } catch (error) {
+      console.error("Error sending SSE message:", error)
+      isControllerClosed = true
+    }
   }
 
   try {
@@ -147,13 +167,29 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       percentage: 0,
     })
 
-    await new Promise<void>((resolveAllFiles) => {
+    await new Promise<void>((resolveAllFiles, rejectAllFiles) => {
       let fileIndex = 0
       let workersLaunched = 0
       let lastProgressReport = 0
+      let completedWorkers = 0
+
+      const cleanup = () => {
+        // Terminate all active workers
+        activeWorkers.forEach((worker) => {
+          worker.terminate().catch((err) => console.error("Error terminating worker:", err))
+        })
+        activeWorkers.clear()
+      }
+
+      const checkCompletion = () => {
+        if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
+          cleanup()
+          resolveAllFiles()
+        }
+      }
 
       const launchWorkerIfNeeded = () => {
-        while (activeWorkers.size < numWorkers && fileIndex < xmlFiles.length) {
+        while (activeWorkers.size < numWorkers && fileIndex < xmlFiles.length && !isControllerClosed) {
           const currentFile = xmlFiles[fileIndex++]
           const workerId = workersLaunched++
 
@@ -170,6 +206,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
 
           worker.on("message", (result: any) => {
             processedCount++
+            completedWorkers++
 
             if (result.record) {
               allRecords.push(result.record)
@@ -211,10 +248,10 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             activeWorkers.delete(worker)
             worker.terminate().catch((err) => console.error(`Error terminating worker ${workerId}:`, err))
 
-            if (fileIndex < xmlFiles.length) {
+            if (fileIndex < xmlFiles.length && !isControllerClosed) {
               launchWorkerIfNeeded()
-            } else if (activeWorkers.size === 0) {
-              resolveAllFiles()
+            } else {
+              checkCompletion()
             }
           })
 
@@ -224,10 +261,10 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             sendMessage("log", { message: `Worker error for ${path.basename(currentFile)}: ${err.message}` })
             activeWorkers.delete(worker)
 
-            if (fileIndex < xmlFiles.length) {
+            if (fileIndex < xmlFiles.length && !isControllerClosed) {
               launchWorkerIfNeeded()
-            } else if (activeWorkers.size === 0) {
-              resolveAllFiles()
+            } else {
+              checkCompletion()
             }
           })
 
@@ -236,52 +273,71 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             if (code !== 0) {
               sendMessage("log", { message: `Worker exited with code ${code} for ${path.basename(currentFile)}` })
             }
-            if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
-              resolveAllFiles()
-            }
+            checkCompletion()
           })
         }
       }
 
+      // Handle controller being closed early
+      const checkInterval = setInterval(() => {
+        if (isControllerClosed) {
+          clearInterval(checkInterval)
+          cleanup()
+          rejectAllFiles(new Error("Stream was closed"))
+        }
+      }, 1000)
+
       launchWorkerIfNeeded()
-      if (xmlFiles.length === 0) resolveAllFiles()
+
+      if (xmlFiles.length === 0) {
+        clearInterval(checkInterval)
+        resolveAllFiles()
+      }
     })
 
     // Write CSV file
-    if (allRecords.length > 0) {
+    if (allRecords.length > 0 && !isControllerClosed) {
       sendMessage("log", { message: "Writing CSV file..." })
       const csvWriterInstance = createObjectCsvWriter({
         path: outputPath,
-        header: CSV_HEADERS_MAIN,
+        header: CSV_HEADERS,
       })
       await csvWriterInstance.writeRecords(allRecords)
       sendMessage("log", { message: `CSV file written: ${path.basename(outputPath)}` })
-    } else {
+    } else if (allRecords.length === 0) {
       sendMessage("log", { message: "No records to write to CSV" })
     }
 
     // Send final results
-    sendMessage("complete", {
-      stats: {
-        totalFiles: xmlFiles.length,
-        processedFiles: processedCount,
-        successfulFiles: successCount,
-        errorFiles: errorCount,
-        recordsWritten: allRecords.length,
-        filteredFiles: filteredCount,
-        movedFiles: movedCount,
-      },
-      outputFile: path.basename(outputPath),
-      errors: errors.slice(0, 10),
-    })
+    if (!isControllerClosed) {
+      sendMessage("complete", {
+        stats: {
+          totalFiles: xmlFiles.length,
+          processedFiles: processedCount,
+          successfulFiles: successCount,
+          errorFiles: errorCount,
+          recordsWritten: allRecords.length,
+          filteredFiles: filteredCount,
+          movedFiles: movedCount,
+        },
+        outputFile: path.basename(outputPath),
+        errors: errors.slice(0, 10),
+      })
 
-    sendMessage("log", { message: "Processing completed successfully!" })
-    sendMessage("log", { message: `Processed ${processedCount} files` })
-    sendMessage("log", { message: `Successful: ${successCount}` })
-    sendMessage("log", { message: `Filtered: ${filteredCount}` })
-    sendMessage("log", { message: `Moved: ${movedCount}` })
-    sendMessage("log", { message: `Errors: ${errorCount}` })
+      sendMessage("log", { message: "Processing completed successfully!" })
+      sendMessage("log", { message: `Processed ${processedCount} files` })
+      sendMessage("log", { message: `Successful: ${successCount}` })
+      sendMessage("log", { message: `Filtered: ${filteredCount}` })
+      sendMessage("log", { message: `Moved: ${movedCount}` })
+      sendMessage("log", { message: `Errors: ${errorCount}` })
+    }
   } catch (error) {
-    sendMessage("error", { message: `Processing failed: ${error instanceof Error ? error.message : "Unknown error"}` })
+    if (!isControllerClosed) {
+      sendMessage("error", {
+        message: `Processing failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+      })
+    }
+  } finally {
+    isControllerClosed = true
   }
 }
