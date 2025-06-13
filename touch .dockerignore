@@ -1,0 +1,6 @@
+node_modules
+.next/cache
+.dockerignore
+Dockerfile
+pnpm-lock.yaml
+README.md
