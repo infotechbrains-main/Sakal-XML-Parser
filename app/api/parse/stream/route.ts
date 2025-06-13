@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server"
 import fs from "fs/promises"
 import path from "path"
 import { createObjectCsvWriter } from "csv-writer"
-import { Worker } from "worker_threads"
+import { Worker } from "worker_threads" // This is correct - worker_threads is a built-in Node.js module
 import { CSV_HEADERS } from "../route"
 
 // Manual directory traversal function
@@ -171,7 +171,6 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       let fileIndex = 0
       let workersLaunched = 0
       let lastProgressReport = 0
-      let completedWorkers = 0
 
       const cleanup = () => {
         // Terminate all active workers
@@ -206,7 +205,6 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
 
           worker.on("message", (result: any) => {
             processedCount++
-            completedWorkers++
 
             if (result.record) {
               allRecords.push(result.record)
