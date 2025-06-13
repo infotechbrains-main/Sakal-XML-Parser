@@ -27,9 +27,11 @@
     "glob": "^11.0.0",
     "lucide-react": "^0.454.0",
     "next": "15.2.4",
+    "os": "latest",
     "path": "latest",
     "react": "^19",
     "react-dom": "^19",
+    "stream": "latest",
     "tailwind-merge": "^2.5.5",
     "worker_threads": "latest",
     "xml2js": "latest"

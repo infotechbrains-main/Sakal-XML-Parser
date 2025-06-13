@@ -2,8 +2,16 @@ import type { NextRequest } from "next/server"
 import fs from "fs/promises"
 import path from "path"
 import { createObjectCsvWriter } from "csv-writer"
-import { Worker } from "worker_threads" // This is correct - worker_threads is a built-in Node.js module
+import { Worker } from "worker_threads"
 import { CSV_HEADERS } from "../route"
+import {
+  isRemotePath,
+  scanRemoteDirectory,
+  downloadFile,
+  createTempDirectory,
+  cleanupTempDirectory,
+  type RemoteFile,
+} from "@/lib/remote-file-handler"
 
 // Manual directory traversal function
 async function findXmlFilesManually(rootDir: string): Promise<string[]> {
@@ -84,6 +92,7 @@ export async function POST(request: NextRequest) {
 async function processFiles(controller: ReadableStreamDefaultController, encoder: TextEncoder, config: any) {
   const { rootDir, outputFile, numWorkers, verbose, filterConfig } = config
   let isControllerClosed = false
+  let tempDir: string | null = null
 
   const sendMessage = (type: string, data: any) => {
     if (isControllerClosed) {
@@ -99,10 +108,62 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
   }
 
   try {
-    sendMessage("log", { message: "Searching for XML files..." })
+    sendMessage("log", { message: "Checking if path is remote or local..." })
 
-    const xmlFiles = await findXmlFilesManually(rootDir)
-    sendMessage("log", { message: `Found ${xmlFiles.length} XML files` })
+    let xmlFiles: string[] = []
+    let remoteFiles: RemoteFile[] = []
+    const isRemote = await isRemotePath(rootDir)
+
+    if (isRemote) {
+      sendMessage("log", { message: `Detected remote path: ${rootDir}` })
+      sendMessage("log", { message: "Scanning remote directory for XML files..." })
+
+      try {
+        remoteFiles = await scanRemoteDirectory(rootDir)
+        sendMessage("log", { message: `Found ${remoteFiles.length} XML files in remote directory` })
+
+        if (remoteFiles.length === 0) {
+          sendMessage("error", { message: "No XML files found in the remote directory" })
+          return
+        }
+
+        // Create temp directory for downloaded files
+        tempDir = await createTempDirectory()
+        sendMessage("log", { message: `Created temporary directory: ${tempDir}` })
+
+        // Download files
+        sendMessage("log", { message: "Downloading XML files to temporary directory..." })
+        for (let i = 0; i < remoteFiles.length; i++) {
+          const file = remoteFiles[i]
+          try {
+            const localPath = await downloadFile(file.url, tempDir)
+            remoteFiles[i].localPath = localPath
+
+            sendMessage("log", {
+              message: `Downloaded ${i + 1}/${remoteFiles.length}: ${file.name}`,
+            })
+          } catch (error) {
+            sendMessage("log", {
+              message: `Error downloading ${file.name}: ${error instanceof Error ? error.message : "Unknown error"}`,
+            })
+          }
+        }
+
+        // Get local paths of downloaded files
+        xmlFiles = remoteFiles.filter((file) => file.localPath).map((file) => file.localPath!) // Non-null assertion as we filtered out nulls
+
+        sendMessage("log", { message: `Successfully downloaded ${xmlFiles.length} XML files` })
+      } catch (error) {
+        sendMessage("error", {
+          message: `Error accessing remote directory: ${error instanceof Error ? error.message : "Unknown error"}`,
+        })
+        return
+      }
+    } else {
+      sendMessage("log", { message: "Searching for XML files in local directory..." })
+      xmlFiles = await findXmlFilesManually(rootDir)
+      sendMessage("log", { message: `Found ${xmlFiles.length} XML files` })
+    }
 
     if (xmlFiles.length === 0) {
       sendMessage("error", { message: "No XML files found in the specified directory" })
@@ -196,9 +257,10 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             workerData: {
               xmlFilePath: currentFile,
               filterConfig,
-              originalRootDir: rootDir,
+              originalRootDir: isRemote ? tempDir : rootDir, // Use temp dir as root for remote files
               workerId,
               verbose,
+              isRemote,
             },
           })
           activeWorkers.add(worker)
@@ -336,6 +398,18 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       })
     }
   } finally {
+    // Clean up temporary directory if it was created
+    if (tempDir) {
+      try {
+        await cleanupTempDirectory(tempDir)
+        if (!isControllerClosed) {
+          sendMessage("log", { message: "Cleaned up temporary files" })
+        }
+      } catch (error) {
+        console.error("Error cleaning up temporary directory:", error)
+      }
+    }
+
     isControllerClosed = true
   }
 }
