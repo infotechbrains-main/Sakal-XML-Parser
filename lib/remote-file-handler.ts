@@ -23,9 +23,41 @@ export async function isRemotePath(path: string): Promise<boolean> {
   return path.startsWith("http://") || path.startsWith("https://")
 }
 
-export async function fetchDirectoryListing(url: string): Promise<{ files: RemoteFile[]; directories: string[] }> {
+// Helper function to check if a URL is within the allowed base path
+function isWithinBasePath(baseUrl: string, targetUrl: string): boolean {
+  try {
+    const base = new URL(baseUrl)
+    const target = new URL(targetUrl)
+
+    // Must be same origin (protocol + host + port)
+    if (base.origin !== target.origin) {
+      return false
+    }
+
+    // Target path must start with base path
+    const basePath = base.pathname.endsWith("/") ? base.pathname : base.pathname + "/"
+    const targetPath = target.pathname.endsWith("/") ? target.pathname : target.pathname + "/"
+
+    return targetPath.startsWith(basePath)
+  } catch (error) {
+    console.error("Error checking path bounds:", error)
+    return false
+  }
+}
+
+export async function fetchDirectoryListing(
+  url: string,
+  baseUrl: string,
+): Promise<{ files: RemoteFile[]; directories: string[] }> {
   try {
     console.log(`Fetching directory listing from: ${url}`)
+
+    // Ensure we're not going outside the base path
+    if (!isWithinBasePath(baseUrl, url)) {
+      console.log(`Skipping ${url} - outside base path ${baseUrl}`)
+      return { files: [], directories: [] }
+    }
+
     const response = await fetch(url)
 
     if (!response.ok) {
@@ -47,14 +79,12 @@ export async function fetchDirectoryListing(url: string): Promise<{ files: Remot
       /href="([^"]*\.xml)"/gi,
     ]
 
-    // Directory patterns
+    // Directory patterns - only look for subdirectories, not parent or external
     const directoryPatterns = [
-      // Apache/Nginx directory links (ending with /)
-      /<a\s+(?:[^>]*?\s+)?href="([^"]*\/)"[^>]*>([^<]*)<\/a>/gi,
-      /<a\s+href="([^"]*\/)"[^>]*>([^<]*)<\/a>/gi,
-      /<A\s+HREF="([^"]*\/)"[^>]*>([^<]*)<\/A>/gi,
-      // Generic directory pattern
-      /href="([^"]*\/)"/gi,
+      // Apache/Nginx directory links (ending with /) - exclude parent directory
+      /<a\s+(?:[^>]*?\s+)?href="([^"./][^"]*\/)"[^>]*>([^<]*)<\/a>/gi,
+      /<a\s+href="([^"./][^"]*\/)"[^>]*>([^<]*)<\/a>/gi,
+      /<A\s+HREF="([^"./][^"]*\/)"[^>]*>([^<]*)<\/A>/gi,
     ]
 
     const files: RemoteFile[] = []
@@ -67,13 +97,20 @@ export async function fetchDirectoryListing(url: string): Promise<{ files: Remot
         const fileName = match[1]
 
         // Skip parent directory links and current directory
-        if (fileName === "../" || fileName === "./" || fileName === "..") continue
+        if (fileName === "../" || fileName === "./" || fileName === ".." || fileName.startsWith("../")) {
+          continue
+        }
 
         // Skip if already found
         if (files.some((f) => f.name === path.basename(fileName))) continue
 
-        // Handle relative URLs
+        // Handle relative URLs and ensure they're within base path
         const fileUrl = new URL(fileName, url).toString()
+
+        if (!isWithinBasePath(baseUrl, fileUrl)) {
+          console.log(`Skipping file ${fileName} - outside base path`)
+          continue
+        }
 
         files.push({
           name: path.basename(fileName),
@@ -89,17 +126,26 @@ export async function fetchDirectoryListing(url: string): Promise<{ files: Remot
       while ((match = pattern.exec(html)) !== null) {
         const dirName = match[1]
 
-        // Skip parent directory links and current directory
-        if (dirName === "../" || dirName === "./" || dirName === "..") continue
+        // Skip parent directory links, current directory, and any path starting with ../
+        if (dirName === "../" || dirName === "./" || dirName === ".." || dirName.startsWith("../")) {
+          continue
+        }
 
         // Skip if already found
         if (directories.includes(dirName)) continue
+
+        // Check if the directory URL would be within base path
+        const dirUrl = new URL(dirName, url).toString()
+        if (!isWithinBasePath(baseUrl, dirUrl)) {
+          console.log(`Skipping directory ${dirName} - outside base path`)
+          continue
+        }
 
         directories.push(dirName)
       }
     }
 
-    console.log(`Found ${files.length} XML files and ${directories.length} directories`)
+    console.log(`Found ${files.length} XML files and ${directories.length} directories in bounds`)
 
     return { files, directories }
   } catch (error) {
@@ -148,6 +194,7 @@ export async function cleanupTempDirectory(tempDir: string): Promise<void> {
 }
 
 export async function scanRemoteDirectoryRecursive(
+  currentUrl: string,
   baseUrl: string,
   maxDepth = 5,
   currentDepth = 0,
@@ -156,41 +203,60 @@ export async function scanRemoteDirectoryRecursive(
   const allXmlFiles: RemoteFile[] = []
 
   if (currentDepth >= maxDepth) {
-    onProgress?.(`Maximum depth ${maxDepth} reached for ${baseUrl}`)
+    onProgress?.(`Maximum depth ${maxDepth} reached for ${currentUrl}`)
+    return allXmlFiles
+  }
+
+  // Ensure we're not going outside the base path
+  if (!isWithinBasePath(baseUrl, currentUrl)) {
+    onProgress?.(`Skipping ${currentUrl} - outside base path ${baseUrl}`)
     return allXmlFiles
   }
 
   try {
     // Ensure URL ends with a slash
-    if (!baseUrl.endsWith("/")) {
-      baseUrl += "/"
+    if (!currentUrl.endsWith("/")) {
+      currentUrl += "/"
     }
 
-    onProgress?.(`Scanning directory: ${baseUrl} (depth: ${currentDepth})`)
+    onProgress?.(`Scanning directory: ${currentUrl} (depth: ${currentDepth})`)
 
-    // Get directory listing
-    const { files, directories } = await fetchDirectoryListing(baseUrl)
+    // Get directory listing with base path restriction
+    const { files, directories } = await fetchDirectoryListing(currentUrl, baseUrl)
 
     // Add XML files from current directory
     for (const file of files) {
       if (file.name.toLowerCase().endsWith(".xml")) {
         allXmlFiles.push(file)
-        onProgress?.(`Found XML file: ${file.name} in ${baseUrl}`)
+        onProgress?.(`Found XML file: ${file.name} in ${currentUrl}`)
       }
     }
 
     onProgress?.(`Found ${files.length} XML files in current directory`)
 
-    // If no XML files found in current directory, scan subdirectories
-    if (files.length === 0 && directories.length > 0) {
-      onProgress?.(`No XML files in current directory, scanning ${directories.length} subdirectories...`)
+    // Scan subdirectories (only if they're within base path)
+    if (directories.length > 0) {
+      onProgress?.(`Scanning ${directories.length} subdirectories...`)
 
       for (const dir of directories) {
         try {
-          const subDirUrl = new URL(dir, baseUrl).toString()
+          const subDirUrl = new URL(dir, currentUrl).toString()
+
+          // Double-check that subdirectory is within base path
+          if (!isWithinBasePath(baseUrl, subDirUrl)) {
+            onProgress?.(`Skipping subdirectory ${dir} - outside base path`)
+            continue
+          }
+
           onProgress?.(`Scanning subdirectory: ${dir}`)
 
-          const subDirFiles = await scanRemoteDirectoryRecursive(subDirUrl, maxDepth, currentDepth + 1, onProgress)
+          const subDirFiles = await scanRemoteDirectoryRecursive(
+            subDirUrl,
+            baseUrl,
+            maxDepth,
+            currentDepth + 1,
+            onProgress,
+          )
 
           allXmlFiles.push(...subDirFiles)
 
@@ -204,14 +270,12 @@ export async function scanRemoteDirectoryRecursive(
           continue // Skip this directory and continue with others
         }
       }
-    } else if (files.length > 0) {
-      onProgress?.(`Found XML files in current directory, skipping subdirectory scan`)
     }
 
     return allXmlFiles
   } catch (error) {
     onProgress?.(
-      `Error scanning remote directory ${baseUrl}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      `Error scanning remote directory ${currentUrl}: ${error instanceof Error ? error.message : "Unknown error"}`,
     )
     throw error
   }
@@ -221,7 +285,8 @@ export async function scanRemoteDirectory(
   baseUrl: string,
   onProgress?: (message: string) => void,
 ): Promise<RemoteFile[]> {
-  return await scanRemoteDirectoryRecursive(baseUrl, 5, 0, onProgress)
+  onProgress?.(`Starting scan within base path: ${baseUrl}`)
+  return await scanRemoteDirectoryRecursive(baseUrl, baseUrl, 5, 0, onProgress)
 }
 
 // Alternative method to try direct file access if directory listing fails
@@ -236,6 +301,12 @@ export async function tryDirectFileAccess(baseUrl: string, commonXmlNames: strin
   for (const pattern of patternsToTry) {
     try {
       const fileUrl = new URL(pattern, baseUrl).toString()
+
+      // Ensure the direct file access is within base path
+      if (!isWithinBasePath(baseUrl, fileUrl)) {
+        continue
+      }
+
       const response = await fetch(fileUrl, { method: "HEAD" })
 
       if (response.ok) {
