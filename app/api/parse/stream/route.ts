@@ -238,6 +238,9 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     let remoteFiles: RemoteFile[] = []
     const isRemote = await isRemotePath(rootDir)
 
+    // Create a mapping from local file paths to original remote URLs
+    const localToRemoteMapping = new Map<string, string>()
+
     if (isRemote) {
       sendMessage("log", { message: `Detected remote path: ${rootDir}` })
       sendMessage("log", { message: "Scanning remote directory for XML files recursively..." })
@@ -290,11 +293,19 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
           try {
             const localPath = await downloadFile(file.url, tempDir)
             remoteFiles[i].localPath = localPath
+
+            // Create mapping from local path to original remote URL
+            localToRemoteMapping.set(localPath, file.url)
+
             downloadedCount++
 
             sendMessage("log", {
               message: `Downloaded ${downloadedCount}/${remoteFiles.length}: ${file.name}`,
             })
+
+            if (verbose) {
+              console.log(`Mapping: ${localPath} -> ${file.url}`)
+            }
           } catch (error) {
             sendMessage("log", {
               message: `Error downloading ${file.name}: ${error instanceof Error ? error.message : "Unknown error"}`,
@@ -311,6 +322,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
         xmlFiles = remoteFiles.filter((file) => file.localPath).map((file) => file.localPath!)
 
         sendMessage("log", { message: `Successfully downloaded ${xmlFiles.length} XML files` })
+        sendMessage("log", { message: `Created ${localToRemoteMapping.size} local-to-remote mappings` })
 
         if (xmlFiles.length === 0) {
           sendMessage("error", { message: "Failed to download any XML files" })
@@ -412,6 +424,14 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
           const currentFile = xmlFiles[fileIndex++]
           const workerId = workersLaunched++
 
+          // Get the original remote URL for this file
+          const originalRemoteXmlUrl = localToRemoteMapping.get(currentFile) || null
+
+          if (verbose && isRemote) {
+            console.log(`Worker ${workerId} processing: ${currentFile}`)
+            console.log(`Original remote URL: ${originalRemoteXmlUrl}`)
+          }
+
           const worker = new Worker(workerScriptPath, {
             workerData: {
               xmlFilePath: currentFile,
@@ -420,6 +440,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
               workerId,
               verbose,
               isRemote,
+              originalRemoteXmlUrl, // Pass the original remote URL
             },
           })
           activeWorkers.add(worker)
