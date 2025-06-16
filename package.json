@@ -33,6 +33,7 @@
     "react-dom": "^19",
     "stream": "latest",
     "tailwind-merge": "^2.5.5",
+    "worker_threads": "latest",
     "xml2js": "latest"
   },
   "devDependencies": {

@@ -10,6 +10,7 @@ import {
   downloadFile,
   createTempDirectory,
   cleanupTempDirectory,
+  tryDirectFileAccess,
   type RemoteFile,
 } from "@/lib/remote-file-handler"
 
@@ -116,14 +117,33 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
 
     if (isRemote) {
       sendMessage("log", { message: `Detected remote path: ${rootDir}` })
-      sendMessage("log", { message: "Scanning remote directory for XML files..." })
+      sendMessage("log", { message: "Scanning remote directory for XML files recursively..." })
 
       try {
-        remoteFiles = await scanRemoteDirectory(rootDir)
-        sendMessage("log", { message: `Found ${remoteFiles.length} XML files in remote directory` })
+        // Enhanced remote scanning with progress callback
+        remoteFiles = await scanRemoteDirectory(rootDir, (message: string) => {
+          sendMessage("log", { message })
+        })
+
+        sendMessage("log", { message: `Found ${remoteFiles.length} XML files in remote directory tree` })
+
+        // If no files found with directory listing, try direct file access
+        if (remoteFiles.length === 0) {
+          sendMessage("log", { message: "No XML files found via directory listing, trying direct file access..." })
+
+          try {
+            const directFiles = await tryDirectFileAccess(rootDir)
+            remoteFiles.push(...directFiles)
+            sendMessage("log", { message: `Found ${directFiles.length} XML files via direct access` })
+          } catch (error) {
+            sendMessage("log", {
+              message: `Direct file access failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+            })
+          }
+        }
 
         if (remoteFiles.length === 0) {
-          sendMessage("error", { message: "No XML files found in the remote directory" })
+          sendMessage("error", { message: "No XML files found in the remote directory or its subdirectories" })
           return
         }
 
@@ -133,14 +153,17 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
 
         // Download files
         sendMessage("log", { message: "Downloading XML files to temporary directory..." })
+        let downloadedCount = 0
+
         for (let i = 0; i < remoteFiles.length; i++) {
           const file = remoteFiles[i]
           try {
             const localPath = await downloadFile(file.url, tempDir)
             remoteFiles[i].localPath = localPath
+            downloadedCount++
 
             sendMessage("log", {
-              message: `Downloaded ${i + 1}/${remoteFiles.length}: ${file.name}`,
+              message: `Downloaded ${downloadedCount}/${remoteFiles.length}: ${file.name}`,
             })
           } catch (error) {
             sendMessage("log", {
@@ -150,9 +173,14 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
         }
 
         // Get local paths of downloaded files
-        xmlFiles = remoteFiles.filter((file) => file.localPath).map((file) => file.localPath!) // Non-null assertion as we filtered out nulls
+        xmlFiles = remoteFiles.filter((file) => file.localPath).map((file) => file.localPath!)
 
         sendMessage("log", { message: `Successfully downloaded ${xmlFiles.length} XML files` })
+
+        if (xmlFiles.length === 0) {
+          sendMessage("error", { message: "Failed to download any XML files" })
+          return
+        }
       } catch (error) {
         sendMessage("error", {
           message: `Error accessing remote directory: ${error instanceof Error ? error.message : "Unknown error"}`,
