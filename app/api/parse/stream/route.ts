@@ -14,6 +14,10 @@ import {
   type RemoteFile,
 } from "@/lib/remote-file-handler"
 
+// Global state for graceful shutdown
+let isShuttingDown = false
+let currentProcessingState: any = null
+
 // Manual directory traversal function
 async function findXmlFilesManually(rootDir: string): Promise<string[]> {
   const xmlFiles: string[] = []
@@ -34,6 +38,38 @@ async function findXmlFilesManually(rootDir: string): Promise<string[]> {
   }
   await traverse(rootDir)
   return xmlFiles
+}
+
+// Save partial results to CSV
+async function savePartialResults(records: any[], outputPath: string, isPartial = false) {
+  if (records.length === 0) return
+
+  try {
+    const suffix = isPartial ? "_partial" : ""
+    const finalPath = outputPath.replace(".csv", `${suffix}.csv`)
+
+    const csvWriterInstance = createObjectCsvWriter({
+      path: finalPath,
+      header: CSV_HEADERS,
+    })
+
+    await csvWriterInstance.writeRecords(records)
+    console.log(`Saved ${records.length} records to ${path.basename(finalPath)}`)
+    return finalPath
+  } catch (error) {
+    console.error("Error saving partial results:", error)
+  }
+}
+
+// Save processing state for resume capability
+async function saveProcessingState(state: any) {
+  try {
+    const statePath = path.join(process.cwd(), "processing_state.json")
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2))
+    console.log("Processing state saved")
+  } catch (error) {
+    console.error("Error saving processing state:", error)
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -76,6 +112,8 @@ export async function POST(request: NextRequest) {
     },
     cancel() {
       isControllerClosed = true
+      isShuttingDown = true
+      console.log("Stream cancelled - initiating graceful shutdown")
     },
   })
 
@@ -94,6 +132,16 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
   const { rootDir, outputFile, numWorkers, verbose, filterConfig } = config
   let isControllerClosed = false
   let tempDir: string | null = null
+  const allRecords: any[] = []
+  let processedCount = 0
+  let successCount = 0
+  let errorCount = 0
+  let filteredCount = 0
+  let movedCount = 0
+  const errors: string[] = []
+  const activeWorkers = new Set<Worker>()
+  let lastSaveTime = Date.now()
+  const SAVE_INTERVAL = 30000 // Save every 30 seconds
 
   const sendMessage = (type: string, data: any) => {
     if (isControllerClosed) {
@@ -107,6 +155,81 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       isControllerClosed = true
     }
   }
+
+  // Graceful shutdown handler
+  const gracefulShutdown = async (reason: string) => {
+    console.log(`Initiating graceful shutdown: ${reason}`)
+    isShuttingDown = true
+    isControllerClosed = true
+
+    sendMessage("log", { message: `Shutting down gracefully: ${reason}` })
+    sendMessage("log", { message: "Saving current progress..." })
+
+    // Terminate all workers
+    activeWorkers.forEach((worker) => {
+      worker.terminate().catch((err) => console.error("Error terminating worker:", err))
+    })
+    activeWorkers.clear()
+
+    // Save current results
+    const outputPath = path.join(process.cwd(), outputFile)
+    if (allRecords.length > 0) {
+      const savedPath = await savePartialResults(allRecords, outputPath, true)
+      sendMessage("log", { message: `Partial results saved to ${path.basename(savedPath || outputPath)}` })
+    }
+
+    // Save processing state
+    const state = {
+      rootDir,
+      outputFile,
+      processedCount,
+      successCount,
+      errorCount,
+      filteredCount,
+      movedCount,
+      errors,
+      timestamp: new Date().toISOString(),
+      reason,
+      recordsCount: allRecords.length,
+    }
+
+    currentProcessingState = state
+    await saveProcessingState(state)
+
+    // Clean up temp directory
+    if (tempDir) {
+      try {
+        await cleanupTempDirectory(tempDir)
+        sendMessage("log", { message: "Cleaned up temporary files" })
+      } catch (error) {
+        console.error("Error cleaning up temporary directory:", error)
+      }
+    }
+
+    // Send final shutdown message
+    sendMessage("shutdown", {
+      stats: {
+        totalFiles: processedCount,
+        processedFiles: processedCount,
+        successfulFiles: successCount,
+        errorFiles: errorCount,
+        recordsWritten: allRecords.length,
+        filteredFiles: filteredCount,
+        movedFiles: movedCount,
+      },
+      outputFile: path.basename(outputPath),
+      errors: errors.slice(0, 10),
+      reason,
+    })
+  }
+
+  // Handle process signals for graceful shutdown
+  process.on("SIGINT", () => gracefulShutdown("SIGINT received"))
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM received"))
+  process.on("uncaughtException", (error) => {
+    console.error("Uncaught Exception:", error)
+    gracefulShutdown(`Uncaught exception: ${error.message}`)
+  })
 
   try {
     sendMessage("log", { message: "Checking if path is remote or local..." })
@@ -122,8 +245,15 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       try {
         // Enhanced remote scanning with progress callback
         remoteFiles = await scanRemoteDirectory(rootDir, (message: string) => {
-          sendMessage("log", { message })
+          if (!isShuttingDown) {
+            sendMessage("log", { message })
+          }
         })
+
+        if (isShuttingDown) {
+          await gracefulShutdown("User requested shutdown during scanning")
+          return
+        }
 
         sendMessage("log", { message: `Found ${remoteFiles.length} XML files in remote directory tree` })
 
@@ -151,11 +281,11 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
         tempDir = await createTempDirectory()
         sendMessage("log", { message: `Created temporary directory: ${tempDir}` })
 
-        // Download files
+        // Download files with interruption handling
         sendMessage("log", { message: "Downloading XML files to temporary directory..." })
         let downloadedCount = 0
 
-        for (let i = 0; i < remoteFiles.length; i++) {
+        for (let i = 0; i < remoteFiles.length && !isShuttingDown; i++) {
           const file = remoteFiles[i]
           try {
             const localPath = await downloadFile(file.url, tempDir)
@@ -170,6 +300,11 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
               message: `Error downloading ${file.name}: ${error instanceof Error ? error.message : "Unknown error"}`,
             })
           }
+        }
+
+        if (isShuttingDown) {
+          await gracefulShutdown("User requested shutdown during download")
+          return
         }
 
         // Get local paths of downloaded files
@@ -228,15 +363,6 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       }
     }
 
-    const allRecords: any[] = []
-    let processedCount = 0
-    let successCount = 0
-    let errorCount = 0
-    let filteredCount = 0
-    let movedCount = 0
-    const errors: string[] = []
-    const activeWorkers = new Set<Worker>()
-
     const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
 
     try {
@@ -270,14 +396,19 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       }
 
       const checkCompletion = () => {
-        if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
+        if ((fileIndex >= xmlFiles.length && activeWorkers.size === 0) || isShuttingDown) {
           cleanup()
           resolveAllFiles()
         }
       }
 
       const launchWorkerIfNeeded = () => {
-        while (activeWorkers.size < numWorkers && fileIndex < xmlFiles.length && !isControllerClosed) {
+        while (
+          activeWorkers.size < numWorkers &&
+          fileIndex < xmlFiles.length &&
+          !isControllerClosed &&
+          !isShuttingDown
+        ) {
           const currentFile = xmlFiles[fileIndex++]
           const workerId = workersLaunched++
 
@@ -285,7 +416,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             workerData: {
               xmlFilePath: currentFile,
               filterConfig,
-              originalRootDir: isRemote ? tempDir : rootDir, // Use temp dir as root for remote files
+              originalRootDir: isRemote ? tempDir : rootDir,
               workerId,
               verbose,
               isRemote,
@@ -293,7 +424,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
           })
           activeWorkers.add(worker)
 
-          worker.on("message", (result: any) => {
+          worker.on("message", async (result: any) => {
             processedCount++
 
             if (result.record) {
@@ -310,6 +441,16 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
               errorCount++
               errors.push(`Error in ${path.basename(currentFile)}: ${result.error}`)
               sendMessage("log", { message: `Error processing ${path.basename(currentFile)}: ${result.error}` })
+            }
+
+            // Auto-save every 30 seconds or every 50 files
+            const now = Date.now()
+            if (now - lastSaveTime > SAVE_INTERVAL || allRecords.length % 50 === 0) {
+              if (allRecords.length > 0) {
+                await savePartialResults(allRecords, outputPath, true)
+                sendMessage("log", { message: `Auto-saved ${allRecords.length} records` })
+                lastSaveTime = now
+              }
             }
 
             // Send progress update every 10 files or significant milestones
@@ -336,7 +477,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             activeWorkers.delete(worker)
             worker.terminate().catch((err) => console.error(`Error terminating worker ${workerId}:`, err))
 
-            if (fileIndex < xmlFiles.length && !isControllerClosed) {
+            if (fileIndex < xmlFiles.length && !isControllerClosed && !isShuttingDown) {
               launchWorkerIfNeeded()
             } else {
               checkCompletion()
@@ -349,7 +490,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             sendMessage("log", { message: `Worker error for ${path.basename(currentFile)}: ${err.message}` })
             activeWorkers.delete(worker)
 
-            if (fileIndex < xmlFiles.length && !isControllerClosed) {
+            if (fileIndex < xmlFiles.length && !isControllerClosed && !isShuttingDown) {
               launchWorkerIfNeeded()
             } else {
               checkCompletion()
@@ -366,12 +507,12 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
         }
       }
 
-      // Handle controller being closed early
+      // Handle controller being closed early or shutdown
       const checkInterval = setInterval(() => {
-        if (isControllerClosed) {
+        if (isControllerClosed || isShuttingDown) {
           clearInterval(checkInterval)
           cleanup()
-          rejectAllFiles(new Error("Stream was closed"))
+          rejectAllFiles(new Error("Stream was closed or shutdown requested"))
         }
       }, 1000)
 
@@ -383,21 +524,21 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       }
     })
 
-    // Write CSV file
+    // Final save of all results
     if (allRecords.length > 0 && !isControllerClosed) {
-      sendMessage("log", { message: "Writing CSV file..." })
+      sendMessage("log", { message: "Writing final CSV file..." })
       const csvWriterInstance = createObjectCsvWriter({
         path: outputPath,
         header: CSV_HEADERS,
       })
       await csvWriterInstance.writeRecords(allRecords)
-      sendMessage("log", { message: `CSV file written: ${path.basename(outputPath)}` })
+      sendMessage("log", { message: `Final CSV file written: ${path.basename(outputPath)}` })
     } else if (allRecords.length === 0) {
       sendMessage("log", { message: "No records to write to CSV" })
     }
 
     // Send final results
-    if (!isControllerClosed) {
+    if (!isControllerClosed && !isShuttingDown) {
       sendMessage("complete", {
         stats: {
           totalFiles: xmlFiles.length,
@@ -420,14 +561,15 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       sendMessage("log", { message: `Errors: ${errorCount}` })
     }
   } catch (error) {
-    if (!isControllerClosed) {
+    if (!isControllerClosed && !isShuttingDown) {
       sendMessage("error", {
         message: `Processing failed: ${error instanceof Error ? error.message : "Unknown error"}`,
       })
+      await gracefulShutdown(`Error: ${error instanceof Error ? error.message : "Unknown error"}`)
     }
   } finally {
     // Clean up temporary directory if it was created
-    if (tempDir) {
+    if (tempDir && !isShuttingDown) {
       try {
         await cleanupTempDirectory(tempDir)
         if (!isControllerClosed) {
