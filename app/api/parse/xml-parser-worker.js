@@ -200,6 +200,31 @@ function passesFilter(record, filterConfig) {
     }
   }
 
+  // File type filter - check first to avoid unnecessary processing
+  if (filterConfig.allowedFileTypes && filterConfig.allowedFileTypes.length > 0) {
+    const imageFileName = record.imageHref || ""
+    if (imageFileName) {
+      const fileExtension = imageFileName.split(".").pop()?.toLowerCase() || ""
+      const isAllowedType = filterConfig.allowedFileTypes.some(
+        (allowedType) => allowedType.toLowerCase() === fileExtension,
+      )
+
+      if (!isAllowedType) {
+        if (workerData.verbose) {
+          console.log(
+            `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file type .${fileExtension} not in allowed types [${filterConfig.allowedFileTypes.map((t) => `.${t}`).join(", ")}]`,
+          )
+        }
+        return false
+      }
+    } else {
+      if (workerData.verbose) {
+        console.log(`[Worker ${workerData.workerId}] Image filtered out: no image filename found`)
+      }
+      return false
+    }
+  }
+
   // Image dimension filters
   const imageWidth = Number.parseInt(record.imageWidth) || 0
   const imageHeight = Number.parseInt(record.imageHeight) || 0

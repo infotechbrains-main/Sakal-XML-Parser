@@ -29,6 +29,9 @@ import {
   HardDrive,
   Newspaper,
   Square,
+  RotateCcw,
+  Database,
+  Pause,
 } from "lucide-react"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 
@@ -39,6 +42,15 @@ export default function Home() {
   const [batchSize, setBatchSize] = useState(100)
   const [verbose, setVerbose] = useState(true)
 
+  // Chunked processing settings
+  const [enableChunkedProcessing, setEnableChunkedProcessing] = useState(true)
+  const [chunkSize, setChunkSize] = useState(1000)
+  const [organizeByCity, setOrganizeByCity] = useState(true)
+
+  // Processing state
+  const [processingState, setProcessingState] = useState<any>(null)
+  const [hasProcessingHistory, setHasProcessingHistory] = useState(false)
+
   // Filter settings
   const [enableFiltering, setEnableFiltering] = useState(false)
   const [minImageSize, setMinImageSize] = useState("512")
@@ -47,6 +59,23 @@ export default function Home() {
   const [minFileSize, setMinFileSize] = useState("")
   const [maxFileSize, setMaxFileSize] = useState("")
   const [fileSizeUnit, setFileSizeUnit] = useState("KB")
+
+  // File type filter
+  const [enableFileTypeFilter, setEnableFileTypeFilter] = useState(false)
+  const [selectedFileTypes, setSelectedFileTypes] = useState<string[]>([])
+  const [customFileTypes, setCustomFileTypes] = useState("")
+
+  // Common image file types
+  const COMMON_FILE_TYPES = [
+    { value: "jpg", label: "JPG" },
+    { value: "jpeg", label: "JPEG" },
+    { value: "png", label: "PNG" },
+    { value: "tif", label: "TIF" },
+    { value: "tiff", label: "TIFF" },
+    { value: "bmp", label: "BMP" },
+    { value: "gif", label: "GIF" },
+    { value: "webp", label: "WebP" },
+  ]
 
   const [moveFilteredImages, setMoveFilteredImages] = useState(false)
   const [moveDestinationPath, setMoveDestinationPath] = useState("")
@@ -65,6 +94,9 @@ export default function Home() {
   const [logs, setLogs] = useState<string[]>([])
   const [errors, setErrors] = useState<string[]>([])
   const [progress, setProgress] = useState(0)
+  const [chunkProgress, setChunkProgress] = useState(0)
+  const [currentChunk, setCurrentChunk] = useState(0)
+  const [totalChunks, setTotalChunks] = useState(0)
   const [stats, setStats] = useState({
     totalFiles: 0,
     processedFiles: 0,
@@ -74,11 +106,14 @@ export default function Home() {
     movedFiles: 0,
     startTime: 0,
     endTime: 0,
+    chunksCompleted: 0,
+    citiesProcessed: 0,
   })
   const [activeTab, setActiveTab] = useState("config")
   const [isConnected, setIsConnected] = useState(false)
   const [downloadUrl, setDownloadUrl] = useState("")
   const [isProcessing, setIsProcessing] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
 
   // SSE connection ref
   const eventSourceRef = useRef<EventSource | null>(null)
@@ -101,6 +136,7 @@ export default function Home() {
   useEffect(() => {
     setIsConnected(true)
     setLogs(["XML Parser initialized successfully", "Ready to process files", "Waiting for configuration..."])
+    checkProcessingHistory()
   }, [])
 
   useEffect(() => {
@@ -127,9 +163,81 @@ export default function Home() {
     }
   }, [])
 
+  const checkProcessingHistory = async () => {
+    try {
+      const response = await fetch("/api/processing-state")
+
+      if (!response.ok) {
+        console.warn("Processing state API returned non-OK status:", response.status)
+        setHasProcessingHistory(false)
+        setProcessingState(null)
+        return
+      }
+
+      const contentType = response.headers.get("content-type")
+      if (!contentType || !contentType.includes("application/json")) {
+        console.warn("Processing state API returned non-JSON response:", contentType)
+        setHasProcessingHistory(false)
+        setProcessingState(null)
+        return
+      }
+
+      const data = await response.json()
+
+      if (data.error) {
+        console.warn("Processing state API returned error:", data.error)
+        setHasProcessingHistory(false)
+        setProcessingState(null)
+        return
+      }
+
+      if (data.hasState && data.state) {
+        setHasProcessingHistory(true)
+        setProcessingState(data.state)
+        addLog(
+          `Found previous processing state: ${data.state.chunksCompleted || 0}/${data.state.totalChunks || 0} chunks completed`,
+        )
+      } else {
+        setHasProcessingHistory(false)
+        setProcessingState(null)
+      }
+    } catch (error) {
+      console.warn("Error checking processing history (non-critical):", error)
+      setHasProcessingHistory(false)
+      setProcessingState(null)
+      // Don't show error to user - this is not critical functionality
+    }
+  }
+
+  const resetProcessingHistory = async () => {
+    try {
+      const response = await fetch("/api/processing-state", { method: "DELETE" })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
+
+      const data = await response.json()
+
+      if (data.success !== false) {
+        setHasProcessingHistory(false)
+        setProcessingState(null)
+        setCurrentChunk(0)
+        setTotalChunks(0)
+        setChunkProgress(0)
+        addLog("Processing history reset successfully")
+      } else {
+        throw new Error(data.error || "Failed to reset processing history")
+      }
+    } catch (error) {
+      console.error("Error resetting processing history:", error)
+      addLog(`Error resetting processing history: ${error instanceof Error ? error.message : "Unknown error"}`)
+    }
+  }
+
   const addLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString()
-    setLogs((prev) => [...prev, `[${timestamp}]${message}`])
+    setLogs((prev) => [...prev, `[${timestamp}] ${message}`])
   }
 
   const getFilterConfig = () => {
@@ -140,6 +248,7 @@ export default function Home() {
       moveImages: moveFilteredImages,
       moveDestinationPath: moveFilteredImages ? moveDestinationPath : undefined,
       moveFolderStructureOption: moveFilteredImages ? moveFolderStructure : undefined,
+      organizeByCity: organizeByCity,
     }
 
     if (minImageSize === "custom") {
@@ -158,6 +267,19 @@ export default function Home() {
     if (maxFileSize) {
       const multiplier = fileSizeUnit === "MB" ? 1024 * 1024 : 1024
       config.maxFileSize = Number.parseInt(maxFileSize) * multiplier
+    }
+
+    // File type filter
+    if (enableFileTypeFilter) {
+      const allFileTypes = [...selectedFileTypes]
+      if (customFileTypes.trim()) {
+        const customTypes = customFileTypes
+          .split(",")
+          .map((type) => type.trim().toLowerCase().replace(/^\./, ""))
+          .filter((type) => type.length > 0)
+        allFileTypes.push(...customTypes)
+      }
+      config.allowedFileTypes = allFileTypes.length > 0 ? allFileTypes : undefined
     }
 
     const addMetaFilter = (field: string, filterState: { value: string; operator: string }) => {
@@ -191,6 +313,7 @@ export default function Home() {
     setLogs([])
     setErrors([])
     setProgress(0)
+    setChunkProgress(0)
     setStats({
       totalFiles: 0,
       processedFiles: 0,
@@ -200,9 +323,12 @@ export default function Home() {
       movedFiles: 0,
       startTime: Date.now(),
       endTime: 0,
+      chunksCompleted: 0,
+      citiesProcessed: 0,
     })
     setStatus("running")
     setIsProcessing(true)
+    setIsPaused(false)
     setActiveTab("logs")
     setDownloadUrl("")
 
@@ -218,7 +344,8 @@ export default function Home() {
       abortControllerRef.current = new AbortController()
 
       // Start SSE processing
-      const response = await fetch("/api/parse/stream", {
+      const endpoint = enableChunkedProcessing ? "/api/parse/chunked" : "/api/parse/stream"
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -227,12 +354,66 @@ export default function Home() {
           numWorkers: workers,
           verbose,
           filterConfig: currentFilterConfig,
+          chunkSize: enableChunkedProcessing ? chunkSize : undefined,
+          organizeByCity,
+          resumeFromState: hasProcessingHistory ? processingState : null,
         }),
         signal: abortControllerRef.current.signal,
       })
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`)
+      }
+
+      // If using chunked processing but it's not implemented yet, fall back to regular processing
+      if (enableChunkedProcessing && response.headers.get("content-type")?.includes("application/json")) {
+        const result = await response.json()
+        if (result.message && result.message.includes("not yet fully implemented")) {
+          addLog("Chunked processing not yet implemented, falling back to regular processing...")
+          // Fall back to regular stream processing
+          const fallbackResponse = await fetch("/api/parse/stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              rootDir,
+              outputFile,
+              numWorkers: workers,
+              verbose,
+              filterConfig: currentFilterConfig,
+            }),
+            signal: abortControllerRef.current.signal,
+          })
+
+          if (!fallbackResponse.ok) {
+            throw new Error(`HTTP error! status: ${fallbackResponse.status}`)
+          }
+
+          // Process the fallback response
+          const reader = fallbackResponse.body?.getReader()
+          const decoder = new TextDecoder()
+
+          if (reader) {
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+
+              const chunk = decoder.decode(value)
+              const lines = chunk.split("\n")
+
+              for (const line of lines) {
+                if (line.startsWith("data: ")) {
+                  try {
+                    const data = JSON.parse(line.slice(6))
+                    handleSSEMessage(data)
+                  } catch (e) {
+                    console.error("Error parsing SSE data:", e)
+                  }
+                }
+              }
+            }
+          }
+          return
+        }
       }
 
       // Create EventSource-like functionality with fetch
@@ -269,6 +450,7 @@ export default function Home() {
       }
     } finally {
       setIsProcessing(false)
+      setIsPaused(false)
     }
   }
 
@@ -276,6 +458,26 @@ export default function Home() {
     switch (data.type) {
       case "log":
         addLog(data.message)
+        break
+      case "chunk_start":
+        setCurrentChunk(data.chunkNumber)
+        setTotalChunks(data.totalChunks)
+        setChunkProgress(0)
+        addLog(`Starting chunk ${data.chunkNumber}/${data.totalChunks} (${data.chunkSize} files)`)
+        break
+      case "chunk_progress":
+        setChunkProgress(data.percentage)
+        break
+      case "chunk_complete":
+        setStats((prev) => ({
+          ...prev,
+          chunksCompleted: data.chunkNumber,
+          citiesProcessed: data.citiesProcessed || prev.citiesProcessed,
+        }))
+        addLog(`Chunk ${data.chunkNumber} completed. CSV saved: ${data.csvFile}`)
+        if (data.citiesSaved) {
+          addLog(`Images organized by cities: ${data.citiesSaved.join(", ")}`)
+        }
         break
       case "progress":
         setProgress(data.percentage)
@@ -295,16 +497,35 @@ export default function Home() {
         setStatus("error")
         setIsProcessing(false)
         break
+      case "paused":
+        setIsPaused(true)
+        setStatus("paused")
+        addLog("Processing paused. State saved.")
+        break
       case "complete":
         setStats((prev) => ({ ...prev, ...data.stats, endTime: Date.now() }))
         setProgress(100)
+        setChunkProgress(100)
         setStatus("completed")
         setDownloadUrl(`/api/download?file=${encodeURIComponent(data.outputFile)}`)
         setIsProcessing(false)
+        setHasProcessingHistory(false)
         if (data.errors && data.errors.length > 0) {
           setErrors(data.errors)
         }
+        addLog(`All ${data.stats.chunksCompleted} chunks completed successfully!`)
         break
+    }
+  }
+
+  const handlePauseProcessing = async () => {
+    try {
+      const response = await fetch("/api/parse/pause", { method: "POST" })
+      if (response.ok) {
+        addLog("Pause request sent...")
+      }
+    } catch (error) {
+      addLog(`Error pausing: ${error instanceof Error ? error.message : "Unknown error"}`)
     }
   }
 
@@ -316,6 +537,7 @@ export default function Home() {
       eventSourceRef.current.close()
     }
     setIsProcessing(false)
+    setIsPaused(false)
     setStatus("idle")
     addLog("Processing stopped by user")
   }
@@ -415,6 +637,13 @@ export default function Home() {
             Running
           </Badge>
         )
+      case "paused":
+        return (
+          <Badge variant="secondary" className="bg-yellow-600">
+            <Pause className="h-3 w-3 mr-1" />
+            Paused
+          </Badge>
+        )
       case "completed":
         return (
           <Badge variant="default" className="bg-green-600">
@@ -475,6 +704,12 @@ export default function Home() {
                   Filtering Enabled
                 </Badge>
               )}
+              {enableChunkedProcessing && (
+                <Badge variant="outline">
+                  <Database className="h-3 w-3 mr-1" />
+                  Chunked Processing
+                </Badge>
+              )}
             </div>
           </div>
         </CardHeader>
@@ -521,6 +756,73 @@ export default function Home() {
                     />
                     <p className="text-sm text-muted-foreground">Name of the CSV file that will be generated</p>
                   </div>
+
+                  {/* Chunked Processing Settings */}
+                  <Card className="p-4 border-2 border-blue-200">
+                    <CardHeader className="p-0 pb-3">
+                      <CardTitle className="text-base flex items-center gap-2">
+                        <Database className="h-4 w-4" /> Chunked Processing (Recommended for Large Datasets)
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="p-0 space-y-4">
+                      <div className="flex items-center space-x-2">
+                        <Switch
+                          id="enableChunkedProcessing"
+                          checked={enableChunkedProcessing}
+                          onCheckedChange={setEnableChunkedProcessing}
+                        />
+                        <Label htmlFor="enableChunkedProcessing">Enable chunked processing</Label>
+                      </div>
+
+                      {enableChunkedProcessing && (
+                        <>
+                          <div className="space-y-2">
+                            <div className="flex justify-between items-center">
+                              <Label htmlFor="chunkSize">Chunk Size (files per chunk)</Label>
+                              <Badge variant="outline">{chunkSize.toLocaleString()}</Badge>
+                            </div>
+                            <Slider
+                              id="chunkSize"
+                              min={100}
+                              max={10000}
+                              step={100}
+                              value={[chunkSize]}
+                              onValueChange={(value) => setChunkSize(value[0])}
+                            />
+                            <p className="text-sm text-muted-foreground">
+                              Process files in chunks. Smaller chunks = more frequent saves, larger chunks = faster
+                              processing
+                            </p>
+                          </div>
+
+                          <div className="flex items-center space-x-2">
+                            <Switch id="organizeByCity" checked={organizeByCity} onCheckedChange={setOrganizeByCity} />
+                            <Label htmlFor="organizeByCity">Organize moved images by city</Label>
+                          </div>
+
+                          {hasProcessingHistory && (
+                            <Alert className="bg-blue-50 border-blue-200">
+                              <Database className="h-4 w-4" />
+                              <AlertTitle>Previous Processing Found</AlertTitle>
+                              <AlertDescription className="space-y-2">
+                                <div>
+                                  Found previous processing state: {processingState?.chunksCompleted || 0}/
+                                  {processingState?.totalChunks || 0} chunks completed
+                                </div>
+                                <div className="flex gap-2">
+                                  <Button size="sm" variant="outline" onClick={resetProcessingHistory}>
+                                    <RotateCcw className="h-3 w-3 mr-1" />
+                                    Reset & Start Fresh
+                                  </Button>
+                                </div>
+                              </AlertDescription>
+                            </Alert>
+                          )}
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div className="space-y-2">
                       <div className="flex justify-between items-center">
@@ -581,10 +883,16 @@ export default function Home() {
                         </Button>
                       )
                     ) : isProcessing ? (
-                      <Button onClick={handleStopProcessing} className="w-full" size="lg" variant="destructive">
-                        <Square className="h-4 w-4 mr-2" />
-                        Stop Processing
-                      </Button>
+                      <div className="flex gap-2">
+                        <Button onClick={handlePauseProcessing} className="flex-1" size="lg" variant="secondary">
+                          <Pause className="h-4 w-4 mr-2" />
+                          Pause Processing
+                        </Button>
+                        <Button onClick={handleStopProcessing} className="flex-1" size="lg" variant="destructive">
+                          <Square className="h-4 w-4 mr-2" />
+                          Stop Processing
+                        </Button>
+                      </div>
                     ) : (
                       <Button
                         onClick={handleStartParsing}
@@ -593,7 +901,7 @@ export default function Home() {
                         size="lg"
                       >
                         <Play className="h-4 w-4 mr-2" />
-                        Start One-Time Processing
+                        {hasProcessingHistory ? "Resume Processing" : "Start Processing"}
                       </Button>
                     )}
                   </div>
@@ -707,6 +1015,95 @@ export default function Home() {
                               </Select>
                             </div>
                           </div>
+                        </CardContent>
+                      </Card>
+
+                      <Card className="p-4">
+                        <CardHeader className="p-0 pb-3">
+                          <CardTitle className="text-base flex items-center gap-2">
+                            <ImageIcon className="h-4 w-4" /> File Type Filter
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent className="p-0 space-y-4">
+                          <div className="flex items-center space-x-2">
+                            <Switch
+                              id="enableFileTypeFilter"
+                              checked={enableFileTypeFilter}
+                              onCheckedChange={setEnableFileTypeFilter}
+                            />
+                            <Label htmlFor="enableFileTypeFilter">Filter by image file type</Label>
+                          </div>
+
+                          {enableFileTypeFilter && (
+                            <>
+                              <div className="space-y-3">
+                                <Label className="text-sm font-medium">Select file types to include:</Label>
+                                <div className="grid grid-cols-2 gap-2">
+                                  {COMMON_FILE_TYPES.map((fileType) => (
+                                    <div key={fileType.value} className="flex items-center space-x-2">
+                                      <input
+                                        type="checkbox"
+                                        id={`filetype-${fileType.value}`}
+                                        checked={selectedFileTypes.includes(fileType.value)}
+                                        onChange={(e) => {
+                                          if (e.target.checked) {
+                                            setSelectedFileTypes((prev) => [...prev, fileType.value])
+                                          } else {
+                                            setSelectedFileTypes((prev) =>
+                                              prev.filter((type) => type !== fileType.value),
+                                            )
+                                          }
+                                        }}
+                                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                      />
+                                      <Label
+                                        htmlFor={`filetype-${fileType.value}`}
+                                        className="text-sm font-normal cursor-pointer"
+                                      >
+                                        .{fileType.label}
+                                      </Label>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+
+                              <div className="space-y-2">
+                                <Label htmlFor="customFileTypes" className="text-sm font-medium">
+                                  Custom file types (comma-separated):
+                                </Label>
+                                <Input
+                                  id="customFileTypes"
+                                  value={customFileTypes}
+                                  onChange={(e) => setCustomFileTypes(e.target.value)}
+                                  placeholder="e.g., raw, cr2, nef"
+                                  className="text-sm"
+                                />
+                                <p className="text-xs text-muted-foreground">
+                                  Add custom extensions without dots, separated by commas
+                                </p>
+                              </div>
+
+                              <div className="flex items-center justify-between">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => setSelectedFileTypes(COMMON_FILE_TYPES.map((ft) => ft.value))}
+                                >
+                                  Select All Common
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => {
+                                    setSelectedFileTypes([])
+                                    setCustomFileTypes("")
+                                  }}
+                                >
+                                  Clear All
+                                </Button>
+                              </div>
+                            </>
+                          )}
                         </CardContent>
                       </Card>
 
@@ -945,6 +1342,17 @@ export default function Home() {
                               {maxFileSize && `${maxFileSize}${fileSizeUnit} max`}
                             </div>
                           )}
+                          {enableFileTypeFilter && (selectedFileTypes.length > 0 || customFileTypes.trim()) && (
+                            <div>
+                              File types:{" "}
+                              {[
+                                ...selectedFileTypes.map((type) => `.${type.toUpperCase()}`),
+                                ...(customFileTypes.trim()
+                                  ? customFileTypes.split(",").map((type) => `.${type.trim().toUpperCase()}`)
+                                  : []),
+                              ].join(", ")}
+                            </div>
+                          )}
                           {Object.entries({
                             CreditLine: creditLineFilter,
                             Copyright: copyrightFilter,
@@ -981,6 +1389,7 @@ export default function Home() {
                               <div>
                                 Structure: {moveFolderStructure === "replicate" ? "Replicate source" : "Single folder"}
                               </div>
+                              {organizeByCity && <div>Organization: By city folders</div>}
                             </>
                           )}
                         </AlertDescription>
@@ -1005,10 +1414,16 @@ export default function Home() {
                         </Button>
                       )
                     ) : isProcessing ? (
-                      <Button onClick={handleStopProcessing} className="w-full" size="lg" variant="destructive">
-                        <Square className="h-4 w-4 mr-2" />
-                        Stop Processing
-                      </Button>
+                      <div className="flex gap-2">
+                        <Button onClick={handlePauseProcessing} className="flex-1" size="lg" variant="secondary">
+                          <Pause className="h-4 w-4 mr-2" />
+                          Pause Processing
+                        </Button>
+                        <Button onClick={handleStopProcessing} className="flex-1" size="lg" variant="destructive">
+                          <Square className="h-4 w-4 mr-2" />
+                          Stop Processing
+                        </Button>
+                      </div>
                     ) : (
                       <Button
                         onClick={handleStartParsing}
@@ -1072,15 +1487,28 @@ export default function Home() {
                   </div>
                 </CardContent>
                 <CardFooter className="border-t pt-4">
-                  <div className="w-full">
-                    <div className="flex justify-between text-sm mb-2">
-                      <span>Overall Progress</span>
-                      <span>{Math.round(progress)}%</span>
-                    </div>
-                    <Progress value={progress} className="h-3" />
-                    <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                      <span>{stats.processedFiles.toLocaleString()} processed</span>
-                      <span>{stats.totalFiles.toLocaleString()} total</span>
+                  <div className="w-full space-y-4">
+                    {enableChunkedProcessing && totalChunks > 0 && (
+                      <div>
+                        <div className="flex justify-between text-sm mb-2">
+                          <span>Current Chunk Progress</span>
+                          <span>
+                            Chunk {currentChunk}/{totalChunks} ({Math.round(chunkProgress)}%)
+                          </span>
+                        </div>
+                        <Progress value={chunkProgress} className="h-2" />
+                      </div>
+                    )}
+                    <div>
+                      <div className="flex justify-between text-sm mb-2">
+                        <span>Overall Progress</span>
+                        <span>{Math.round(progress)}%</span>
+                      </div>
+                      <Progress value={progress} className="h-3" />
+                      <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                        <span>{stats.processedFiles.toLocaleString()} processed</span>
+                        <span>{stats.totalFiles.toLocaleString()} total</span>
+                      </div>
                     </div>
                   </div>
                 </CardFooter>
@@ -1100,15 +1528,22 @@ export default function Home() {
                       <AlertTitle>No processing started yet</AlertTitle>
                       <AlertDescription>Configure and start parsing to see results.</AlertDescription>
                     </Alert>
-                  ) : status === "running" ? (
+                  ) : status === "running" || status === "paused" ? (
                     <Alert>
                       <Play className="h-4 w-4" />
                       <AlertTitle>Processing in progress</AlertTitle>
-                      <AlertDescription>Results will be available when complete.</AlertDescription>
+                      <AlertDescription>
+                        {enableChunkedProcessing && (
+                          <div>
+                            Chunk {currentChunk}/{totalChunks} - {stats.chunksCompleted} chunks completed
+                          </div>
+                        )}
+                        Results will be available when complete.
+                      </AlertDescription>
                     </Alert>
                   ) : (
                     <>
-                      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+                      <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
                         <Card>
                           <CardHeader className="p-4">
                             <CardTitle className="text-sm text-muted-foreground">Total Files</CardTitle>
@@ -1149,6 +1584,14 @@ export default function Home() {
                           </CardHeader>
                           <CardContent className="p-4 pt-0">
                             <p className="text-3xl font-bold text-purple-600">{stats.movedFiles.toLocaleString()}</p>
+                          </CardContent>
+                        </Card>
+                        <Card>
+                          <CardHeader className="p-4">
+                            <CardTitle className="text-sm text-muted-foreground">Chunks</CardTitle>
+                          </CardHeader>
+                          <CardContent className="p-4 pt-0">
+                            <p className="text-3xl font-bold text-orange-600">{stats.chunksCompleted}</p>
                           </CardContent>
                         </Card>
                       </div>
@@ -1193,6 +1636,7 @@ export default function Home() {
                           <AlertDescription>
                             CSV generated. {enableFiltering && `${stats.filteredFiles} images matched filters.`}{" "}
                             {moveFilteredImages && stats.movedFiles > 0 && `${stats.movedFiles} images moved.`}
+                            {enableChunkedProcessing && ` Processed in ${stats.chunksCompleted} chunks.`}
                           </AlertDescription>
                         </Alert>
                       )}
@@ -1242,6 +1686,20 @@ export default function Home() {
                   <span className="text-muted-foreground">Connection:</span>
                   <span className="font-medium">{isConnected ? "Connected" : "Disconnected"}</span>
                 </div>
+                {enableChunkedProcessing && (
+                  <>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Current Chunk:</span>
+                      <span className="font-medium">
+                        {currentChunk}/{totalChunks}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Chunks Done:</span>
+                      <span className="font-medium text-orange-600">{stats.chunksCompleted}</span>
+                    </div>
+                  </>
+                )}
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">Total Files:</span>
                   <span className="font-medium">{stats.totalFiles.toLocaleString()}</span>
