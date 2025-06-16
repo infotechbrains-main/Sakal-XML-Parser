@@ -61,37 +61,40 @@ export async function fetchDirectoryListing(
     const response = await fetch(url)
 
     if (!response.ok) {
-      throw new Error(`Failed to fetch directory listing: ${response.status} ${response.statusText}`)
+      console.log(`Failed to fetch directory listing: ${response.status} ${response.statusText}`)
+      return { files: [], directories: [] }
     }
 
     const html = await response.text()
     console.log(`HTML response length: ${html.length}`)
 
-    // Multiple regex patterns to handle different server directory listing formats
-    const patterns = [
-      // Apache style: <a href="filename.xml">filename.xml</a>
+    // Enhanced patterns to catch more directory listing formats
+    const filePatterns = [
+      // Standard Apache/Nginx patterns for XML files
       /<a\s+(?:[^>]*?\s+)?href="([^"]*\.xml)"[^>]*>([^<]*)<\/a>/gi,
-      // Nginx style: <a href="filename.xml">filename.xml</a>
       /<a\s+href="([^"]*\.xml)"[^>]*>([^<]*)<\/a>/gi,
-      // IIS style: <A HREF="filename.xml">filename.xml</A>
       /<A\s+HREF="([^"]*\.xml)"[^>]*>([^<]*)<\/A>/gi,
-      // Generic pattern for any link ending with .xml
-      /href="([^"]*\.xml)"/gi,
+      // More flexible pattern
+      /href=["']([^"']*\.xml)["']/gi,
+      // Pattern without quotes
+      /href=([^\s>]*\.xml)/gi,
     ]
 
-    // Directory patterns - only look for subdirectories, not parent or external
+    // Enhanced directory patterns - look for any folder-like links
     const directoryPatterns = [
-      // Apache/Nginx directory links (ending with /) - exclude parent directory
-      /<a\s+(?:[^>]*?\s+)?href="([^"./][^"]*\/)"[^>]*>([^<]*)<\/a>/gi,
-      /<a\s+href="([^"./][^"]*\/)"[^>]*>([^<]*)<\/a>/gi,
-      /<A\s+HREF="([^"./][^"]*\/)"[^>]*>([^<]*)<\/A>/gi,
+      // Standard directory patterns (ending with /)
+      /<a\s+(?:[^>]*?\s+)?href="([^"#?]*\/)"[^>]*>([^<]*)<\/a>/gi,
+      /<a\s+href="([^"#?]*\/)"[^>]*>([^<]*)<\/a>/gi,
+      /<A\s+HREF="([^"#?]*\/)"[^>]*>([^<]*)<\/A>/gi,
+      // Directory patterns without trailing slash but with directory indicators
+      /<a\s+(?:[^>]*?\s+)?href="([^"#?./][^"#?]*)"[^>]*>\s*([^<]*)\s*<\/a>/gi,
     ]
 
     const files: RemoteFile[] = []
     const directories: string[] = []
 
-    // Try each pattern for XML files
-    for (const pattern of patterns) {
+    // Extract XML files
+    for (const pattern of filePatterns) {
       let match
       while ((match = pattern.exec(html)) !== null) {
         const fileName = match[1]
@@ -120,15 +123,30 @@ export async function fetchDirectoryListing(
       }
     }
 
-    // Try each pattern for directories
+    // Extract directories
     for (const pattern of directoryPatterns) {
       let match
       while ((match = pattern.exec(html)) !== null) {
-        const dirName = match[1]
+        let dirName = match[1]
+        const linkText = match[2] || ""
 
         // Skip parent directory links, current directory, and any path starting with ../
-        if (dirName === "../" || dirName === "./" || dirName === ".." || dirName.startsWith("../")) {
+        if (
+          dirName === "../" ||
+          dirName === "./" ||
+          dirName === ".." ||
+          dirName.startsWith("../") ||
+          linkText.includes("Parent Directory") ||
+          linkText.includes("..") ||
+          dirName.includes("?") ||
+          dirName.includes("#")
+        ) {
           continue
+        }
+
+        // Normalize directory name
+        if (!dirName.endsWith("/")) {
+          dirName += "/"
         }
 
         // Skip if already found
@@ -146,11 +164,17 @@ export async function fetchDirectoryListing(
     }
 
     console.log(`Found ${files.length} XML files and ${directories.length} directories in bounds`)
+    if (files.length > 0) {
+      console.log(`XML files found: ${files.map((f) => f.name).join(", ")}`)
+    }
+    if (directories.length > 0) {
+      console.log(`Directories found: ${directories.join(", ")}`)
+    }
 
     return { files, directories }
   } catch (error) {
     console.error(`Error fetching directory listing from ${url}:`, error)
-    throw error
+    return { files: [], directories: [] }
   }
 }
 
@@ -193,89 +217,125 @@ export async function cleanupTempDirectory(tempDir: string): Promise<void> {
   }
 }
 
-export async function scanRemoteDirectoryRecursive(
-  currentUrl: string,
+// Scan a specific folder completely (deep scan)
+export async function scanFolderCompletely(
+  folderUrl: string,
   baseUrl: string,
-  maxDepth = 5,
+  maxDepth = 10,
   currentDepth = 0,
   onProgress?: (message: string) => void,
 ): Promise<RemoteFile[]> {
   const allXmlFiles: RemoteFile[] = []
 
   if (currentDepth >= maxDepth) {
-    onProgress?.(`Maximum depth ${maxDepth} reached for ${currentUrl}`)
+    onProgress?.(`Maximum depth ${maxDepth} reached for ${folderUrl}`)
     return allXmlFiles
   }
 
   // Ensure we're not going outside the base path
-  if (!isWithinBasePath(baseUrl, currentUrl)) {
-    onProgress?.(`Skipping ${currentUrl} - outside base path ${baseUrl}`)
+  if (!isWithinBasePath(baseUrl, folderUrl)) {
+    onProgress?.(`Skipping ${folderUrl} - outside base path ${baseUrl}`)
     return allXmlFiles
   }
 
   try {
     // Ensure URL ends with a slash
-    if (!currentUrl.endsWith("/")) {
-      currentUrl += "/"
+    if (!folderUrl.endsWith("/")) {
+      folderUrl += "/"
     }
 
-    onProgress?.(`Scanning directory: ${currentUrl} (depth: ${currentDepth})`)
+    onProgress?.(`Deep scanning folder: ${folderUrl} (depth: ${currentDepth})`)
 
-    // Get directory listing with base path restriction
-    const { files, directories } = await fetchDirectoryListing(currentUrl, baseUrl)
+    // Get directory listing
+    const { files, directories } = await fetchDirectoryListing(folderUrl, baseUrl)
 
-    // Add XML files from current directory
+    // Add all XML files from current directory
     for (const file of files) {
       if (file.name.toLowerCase().endsWith(".xml")) {
         allXmlFiles.push(file)
-        onProgress?.(`Found XML file: ${file.name} in ${currentUrl}`)
+        onProgress?.(`Found XML file: ${file.name} in ${folderUrl}`)
       }
     }
 
-    onProgress?.(`Found ${files.length} XML files in current directory`)
+    // Recursively scan all subdirectories
+    for (const dir of directories) {
+      try {
+        const subDirUrl = new URL(dir, folderUrl).toString()
 
-    // Scan subdirectories (only if they're within base path)
-    if (directories.length > 0) {
-      onProgress?.(`Scanning ${directories.length} subdirectories...`)
-
-      for (const dir of directories) {
-        try {
-          const subDirUrl = new URL(dir, currentUrl).toString()
-
-          // Double-check that subdirectory is within base path
-          if (!isWithinBasePath(baseUrl, subDirUrl)) {
-            onProgress?.(`Skipping subdirectory ${dir} - outside base path`)
-            continue
-          }
-
-          onProgress?.(`Scanning subdirectory: ${dir}`)
-
-          const subDirFiles = await scanRemoteDirectoryRecursive(
-            subDirUrl,
-            baseUrl,
-            maxDepth,
-            currentDepth + 1,
-            onProgress,
-          )
-
-          allXmlFiles.push(...subDirFiles)
-
-          if (subDirFiles.length > 0) {
-            onProgress?.(`Found ${subDirFiles.length} XML files in subdirectory: ${dir}`)
-          }
-        } catch (error) {
-          onProgress?.(
-            `Error scanning subdirectory ${dir}: ${error instanceof Error ? error.message : "Unknown error"}`,
-          )
-          continue // Skip this directory and continue with others
+        if (!isWithinBasePath(baseUrl, subDirUrl)) {
+          onProgress?.(`Skipping subdirectory ${dir} - outside base path`)
+          continue
         }
+
+        onProgress?.(`Scanning subdirectory: ${dir}`)
+
+        const subDirFiles = await scanFolderCompletely(subDirUrl, baseUrl, maxDepth, currentDepth + 1, onProgress)
+
+        allXmlFiles.push(...subDirFiles)
+
+        if (subDirFiles.length > 0) {
+          onProgress?.(`Found ${subDirFiles.length} XML files in subdirectory: ${dir}`)
+        }
+      } catch (error) {
+        onProgress?.(`Error scanning subdirectory ${dir}: ${error instanceof Error ? error.message : "Unknown error"}`)
+        continue
+      }
+    }
+
+    return allXmlFiles
+  } catch (error) {
+    onProgress?.(`Error scanning folder ${folderUrl}: ${error instanceof Error ? error.message : "Unknown error"}`)
+    return allXmlFiles
+  }
+}
+
+// Scan top-level folders one by one (shallow scan of each top-level folder)
+export async function scanTopLevelFolders(
+  baseUrl: string,
+  onProgress?: (message: string) => void,
+): Promise<RemoteFile[]> {
+  const allXmlFiles: RemoteFile[] = []
+
+  try {
+    onProgress?.(`Scanning top-level folders in: ${baseUrl}`)
+
+    // Get top-level directory listing
+    const { files, directories } = await fetchDirectoryListing(baseUrl, baseUrl)
+
+    // Add XML files from root directory
+    for (const file of files) {
+      if (file.name.toLowerCase().endsWith(".xml")) {
+        allXmlFiles.push(file)
+        onProgress?.(`Found XML file in root: ${file.name}`)
+      }
+    }
+
+    // Scan each top-level folder completely
+    for (const dir of directories) {
+      try {
+        const topLevelFolderUrl = new URL(dir, baseUrl).toString()
+        onProgress?.(`Scanning top-level folder: ${dir}`)
+
+        const folderFiles = await scanFolderCompletely(topLevelFolderUrl, baseUrl, 10, 0, onProgress)
+
+        if (folderFiles.length > 0) {
+          allXmlFiles.push(...folderFiles)
+          onProgress?.(`Found ${folderFiles.length} XML files in folder: ${dir}`)
+        } else {
+          onProgress?.(`No XML files found in folder: ${dir}, moving to next folder`)
+        }
+      } catch (error) {
+        onProgress?.(
+          `Error scanning top-level folder ${dir}: ${error instanceof Error ? error.message : "Unknown error"}`,
+        )
+        continue
       }
     }
 
     return allXmlFiles
   } catch (error) {
     onProgress?.(
-      `Error scanning remote directory ${currentUrl}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      `Error scanning top-level folders in ${baseUrl}: ${error instanceof Error ? error.message : "Unknown error"}`,
     )
     throw error
   }
@@ -285,8 +345,31 @@ export async function scanRemoteDirectory(
   baseUrl: string,
   onProgress?: (message: string) => void,
 ): Promise<RemoteFile[]> {
-  onProgress?.(`Starting scan within base path: ${baseUrl}`)
-  return await scanRemoteDirectoryRecursive(baseUrl, baseUrl, 5, 0, onProgress)
+  onProgress?.(`Starting scan of: ${baseUrl}`)
+
+  try {
+    // Determine if this is a specific folder or root level scan
+    const url = new URL(baseUrl)
+    const pathParts = url.pathname.split("/").filter((part) => part.length > 0)
+
+    // If the path ends with a specific folder name (not just the app root)
+    // Example: /photoapp/charitra vs /photoapp/ or /photoapp
+    const isSpecificFolder = pathParts.length > 1 && !baseUrl.endsWith("/photoapp/") && !baseUrl.endsWith("/photoapp")
+
+    if (isSpecificFolder) {
+      onProgress?.(`Detected specific folder scan: ${baseUrl}`)
+      return await scanFolderCompletely(baseUrl, baseUrl, 10, 0, onProgress)
+    } else {
+      onProgress?.(`Detected root level scan: ${baseUrl}`)
+      return await scanTopLevelFolders(baseUrl, onProgress)
+    }
+  } catch (error) {
+    onProgress?.(
+      `Error determining scan type for ${baseUrl}: ${error instanceof Error ? error.message : "Unknown error"}`,
+    )
+    // Fallback to complete folder scan
+    return await scanFolderCompletely(baseUrl, baseUrl, 10, 0, onProgress)
+  }
 }
 
 // Alternative method to try direct file access if directory listing fails
@@ -294,7 +377,7 @@ export async function tryDirectFileAccess(baseUrl: string, commonXmlNames: strin
   const files: RemoteFile[] = []
 
   // Common XML file patterns to try
-  const defaultPatterns = ["*.xml", "data.xml", "metadata.xml", "index.xml", "config.xml"]
+  const defaultPatterns = ["data.xml", "metadata.xml", "index.xml", "config.xml"]
 
   const patternsToTry = [...commonXmlNames, ...defaultPatterns]
 
