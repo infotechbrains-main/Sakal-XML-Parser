@@ -220,8 +220,14 @@ function passesFilter(record, filterConfig) {
     return false
   }
 
-  // File size filters
-  const fileSizeBytes = record.actualFileSize || Number.parseInt(record.imageSize) || 0
+  // File size filters - handle comma-separated numbers
+  let fileSizeBytes = record.actualFileSize || 0
+  if (!fileSizeBytes && record.imageSize) {
+    // Handle comma-separated numbers like "7,871,228"
+    const cleanSize = String(record.imageSize).replace(/,/g, "")
+    fileSizeBytes = Number.parseInt(cleanSize) || 0
+  }
+
   const sizeSource = record.actualFileSize ? "filesystem" : "XML"
   const verbose = workerData.verbose
   const workerId = workerData.workerId
@@ -313,6 +319,7 @@ async function moveImageUniversal(
   verbose,
   workerId,
   imageFileName,
+  originalRemoteStructure = null,
 ) {
   try {
     if (!imagePath || !userDefinedDestAbsPath) {
@@ -363,7 +370,16 @@ async function moveImageUniversal(
       // For folder structure replication
       let relativePathFromRoot = ""
 
-      if (isRemotePath(imagePath)) {
+      if (originalRemoteStructure) {
+        // Use the original remote structure for path calculation
+        // originalRemoteStructure: { city: "charitra", year: "2006", month: "11" }
+        relativePathFromRoot = path.join(
+          originalRemoteStructure.city,
+          originalRemoteStructure.year,
+          originalRemoteStructure.month,
+          "media",
+        )
+      } else if (isRemotePath(imagePath)) {
         // For remote files, extract relative path from URL
         const imageUrl = new URL(imagePath)
         const rootUrl = new URL(originalRootDirForScan)
@@ -414,35 +430,127 @@ async function moveImageUniversal(
   }
 }
 
+// Construct image path based on original remote URL and folder structure
+function constructRemoteImagePath(originalRemoteXmlUrl, imageHref, verbose, workerId) {
+  if (!imageHref || !originalRemoteXmlUrl) return ""
+
+  try {
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Constructing remote image path:`)
+      console.log(`  - Original XML URL: ${originalRemoteXmlUrl}`)
+      console.log(`  - Image filename: ${imageHref}`)
+    }
+
+    // Parse the original remote XML URL
+    const xmlUrl = new URL(originalRemoteXmlUrl)
+
+    // Extract path components
+    // Expected: /photoapp/charitra/2006/11/processed/file.xml
+    // Want: /photoapp/charitra/2006/11/media/image.jpg
+    const pathParts = xmlUrl.pathname.split("/").filter((part) => part.length > 0)
+
+    if (verbose) {
+      console.log(`  - Path parts: ${JSON.stringify(pathParts)}`)
+    }
+
+    // Find the 'processed' folder and replace with 'media'
+    const processedIndex = pathParts.findIndex((part) => part.toLowerCase() === "processed")
+    if (processedIndex !== -1) {
+      pathParts[processedIndex] = "media"
+      // Remove the XML filename (last part)
+      pathParts.pop()
+    } else {
+      // If no 'processed' folder found, assume the structure and build media path
+      // Remove the last part (XML filename) and add 'media'
+      pathParts.pop()
+      pathParts.push("media")
+    }
+
+    // Construct the image URL
+    const imagePath = "/" + pathParts.join("/") + "/" + imageHref
+    const imageUrl = `${xmlUrl.protocol}//${xmlUrl.host}${imagePath}`
+
+    if (verbose) {
+      console.log(`  - Constructed image URL: ${imageUrl}`)
+    }
+
+    return imageUrl
+  } catch (error) {
+    if (verbose) {
+      console.error(`[Worker ${workerId}] Error constructing remote image path:`, error.message)
+    }
+    return ""
+  }
+}
+
 // Construct image path based on XML path (works for both local and remote)
-function constructImagePath(xmlFilePath, imageHref, isRemote) {
+function constructImagePath(xmlFilePath, imageHref, isRemote, originalRemoteXmlUrl, verbose, workerId) {
   if (!imageHref) return ""
 
-  if (isRemote) {
-    // For remote files: convert processed path to media path
-    // XML: http://172.16.0.104/photoapp/charitra/2006/06/processed/file.xml
-    // IMG: http://172.16.0.104/photoapp/charitra/2006/06/media/image.jpg
-    try {
-      const xmlUrl = new URL(xmlFilePath.replace(/\\/g, "/"))
-      const basePath = xmlUrl.pathname.replace("/processed/", "/media/")
-      return `${xmlUrl.protocol}//${xmlUrl.host}${basePath}/${imageHref}`
-    } catch (error) {
-      console.error("Error constructing remote image path:", error)
-      return ""
-    }
-  } else {
+  if (isRemote && originalRemoteXmlUrl) {
+    // For remote files: use the original remote URL to construct image path
+    return constructRemoteImagePath(originalRemoteXmlUrl, imageHref, verbose, workerId)
+  } else if (!isRemote) {
     // For local files: use existing logic
     const expectedImageDir = path.join(path.dirname(path.dirname(xmlFilePath)), "media")
     return path.join(expectedImageDir, imageHref)
   }
+
+  return ""
+}
+
+// Extract folder structure from remote URL
+function extractRemoteStructure(remoteXmlUrl, verbose, workerId) {
+  try {
+    const url = new URL(remoteXmlUrl)
+    const pathParts = url.pathname.split("/").filter((part) => part.length > 0)
+
+    // Expected structure: /photoapp/charitra/2006/11/processed/file.xml
+    // Extract: city, year, month
+    let city = "",
+      year = "",
+      month = ""
+
+    // Look for year pattern (4 digits)
+    const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
+    if (yearIndex !== -1 && yearIndex > 0) {
+      city = pathParts[yearIndex - 1]
+      year = pathParts[yearIndex]
+      if (yearIndex + 1 < pathParts.length && /^\d{1,2}$/.test(pathParts[yearIndex + 1])) {
+        month = pathParts[yearIndex + 1]
+      }
+    }
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Extracted remote structure: city=${city}, year=${year}, month=${month}`)
+    }
+
+    return { city, year, month }
+  } catch (error) {
+    if (verbose) {
+      console.error(`[Worker ${workerId}] Error extracting remote structure:`, error.message)
+    }
+    return { city: "", year: "", month: "" }
+  }
 }
 
 // Process a single XML file
-async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote) {
+async function processXmlFileInWorker(
+  xmlFilePath,
+  filterConfig,
+  originalRootDir,
+  workerId,
+  verbose,
+  isRemote,
+  originalRemoteXmlUrl,
+) {
   try {
     if (verbose) {
       console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
       console.log(`[Worker ${workerId}] Mode: ${isRemote ? "Remote" : "Local"}`)
+      if (originalRemoteXmlUrl) {
+        console.log(`[Worker ${workerId}] Original remote URL: ${originalRemoteXmlUrl}`)
+      }
     }
 
     const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
@@ -451,26 +559,36 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       mergeAttrs: true,
     })
 
-    const pathParts = xmlFilePath.split(path.sep)
+    // Extract folder structure from original remote URL or local path
     let city = "",
       year = "",
       month = ""
+    let remoteStructure = null
 
-    const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
-    if (yearIndex !== -1) {
-      year = pathParts[yearIndex]
-      if (yearIndex > 0) city = pathParts[yearIndex - 1]
-      if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
-        month = pathParts[yearIndex + 1]
+    if (isRemote && originalRemoteXmlUrl) {
+      remoteStructure = extractRemoteStructure(originalRemoteXmlUrl, verbose, workerId)
+      city = remoteStructure.city
+      year = remoteStructure.year
+      month = remoteStructure.month
+    } else {
+      // For local files, extract from path
+      const pathParts = xmlFilePath.split(path.sep)
+      const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
+      if (yearIndex !== -1) {
+        year = pathParts[yearIndex]
+        if (yearIndex > 0) city = pathParts[yearIndex - 1]
+        if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
+          month = pathParts[yearIndex + 1]
+        }
       }
-    }
 
-    for (let i = 0; i < pathParts.length; i++) {
-      if (pathParts[i].toLowerCase() === "images" && i + 3 < pathParts.length) {
-        city = pathParts[i + 1]
-        year = pathParts[i + 2]
-        month = pathParts[i + 3]
-        break
+      for (let i = 0; i < pathParts.length; i++) {
+        if (pathParts[i].toLowerCase() === "images" && i + 3 < pathParts.length) {
+          city = pathParts[i + 1]
+          year = pathParts[i + 2]
+          month = pathParts[i + 3]
+          break
+        }
       }
     }
 
@@ -625,16 +743,18 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
 
     if (imageHref) {
       // Construct image path (local or remote)
-      imagePath = constructImagePath(xmlFilePath, imageHref, isRemote)
+      imagePath = constructImagePath(xmlFilePath, imageHref, isRemote, originalRemoteXmlUrl, verbose, workerId)
 
       if (verbose) {
         console.log(`[Worker ${workerId}] Constructed image path: ${imagePath}`)
       }
 
       // Check image existence and get size (universal method)
-      const imageInfo = await checkImageUniversal(imagePath, verbose, workerId)
-      imageExists = imageInfo.exists
-      actualFileSize = imageInfo.size
+      if (imagePath) {
+        const imageInfo = await checkImageUniversal(imagePath, verbose, workerId)
+        imageExists = imageInfo.exists
+        actualFileSize = imageInfo.size
+      }
     }
 
     const record = {
@@ -718,6 +838,7 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
           verbose,
           workerId,
           imageHref,
+          remoteStructure,
         )
 
         if (verbose) {
@@ -753,17 +874,28 @@ async function main() {
       throw new Error("No workerData provided")
     }
 
-    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote } = workerData
+    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote, originalRemoteXmlUrl } = workerData
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Starting to process: ${path.basename(xmlFilePath)}`)
       console.log(`[Worker ${workerId}] Processing mode: ${isRemote ? "Remote" : "Local"}`)
+      if (originalRemoteXmlUrl) {
+        console.log(`[Worker ${workerId}] Original remote XML URL: ${originalRemoteXmlUrl}`)
+      }
       if (filterConfig?.enabled) {
         console.log(`[Worker ${workerId}] Filter config:`, JSON.stringify(filterConfig, null, 2))
       }
     }
 
-    const result = await processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote)
+    const result = await processXmlFileInWorker(
+      xmlFilePath,
+      filterConfig,
+      originalRootDir,
+      workerId,
+      verbose,
+      isRemote,
+      originalRemoteXmlUrl,
+    )
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Finished processing: ${path.basename(xmlFilePath)}`)
