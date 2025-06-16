@@ -3,6 +3,11 @@ const fs = require("fs/promises")
 const path = require("path")
 const { parseStringPromise } = require("xml2js")
 
+// Helper function to check if a path is remote
+function isRemotePath(filePath) {
+  return filePath && (filePath.startsWith("http://") || filePath.startsWith("https://"))
+}
+
 // Helper function to find the main news component
 function findMainNewsComponent(newsComponent) {
   if (!newsComponent) return null
@@ -51,7 +56,115 @@ function extractCData(element) {
   return ""
 }
 
-// Check if image passes filter criteria - FIXED FILE SIZE LOGIC
+// Download remote image file
+async function downloadRemoteImage(imageUrl, tempDir, verbose, workerId) {
+  try {
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Downloading remote image: ${imageUrl}`)
+    }
+
+    const response = await fetch(imageUrl)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+
+    const fileName = path.basename(new URL(imageUrl).pathname)
+    const localPath = path.join(tempDir, fileName)
+
+    const arrayBuffer = await response.arrayBuffer()
+    const buffer = Buffer.from(arrayBuffer)
+
+    await fs.writeFile(localPath, buffer)
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Downloaded image to: ${localPath}`)
+    }
+
+    return localPath
+  } catch (error) {
+    if (verbose) {
+      console.error(`[Worker ${workerId}] Error downloading image ${imageUrl}:`, error.message)
+    }
+    throw error
+  }
+}
+
+// Check if local image exists and get its size
+async function checkLocalImage(imagePath, verbose, workerId) {
+  try {
+    await fs.access(imagePath)
+    const stats = await fs.stat(imagePath)
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Local image found: ${imagePath}, size: ${stats.size} bytes`)
+    }
+
+    return {
+      exists: true,
+      size: stats.size,
+      path: imagePath,
+    }
+  } catch (error) {
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Local image not found: ${imagePath}`)
+    }
+    return {
+      exists: false,
+      size: 0,
+      path: imagePath,
+    }
+  }
+}
+
+// Check if remote image exists and get its size
+async function checkRemoteImage(imageUrl, verbose, workerId) {
+  try {
+    const response = await fetch(imageUrl, { method: "HEAD" })
+    if (response.ok) {
+      const contentLength = response.headers.get("content-length")
+      const size = contentLength ? Number.parseInt(contentLength) : 0
+
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Remote image found: ${imageUrl}, size: ${size} bytes`)
+      }
+
+      return {
+        exists: true,
+        size: size,
+        path: imageUrl,
+      }
+    } else {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Remote image not found: ${imageUrl} (${response.status})`)
+      }
+      return {
+        exists: false,
+        size: 0,
+        path: imageUrl,
+      }
+    }
+  } catch (error) {
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Remote image check failed: ${imageUrl} - ${error.message}`)
+    }
+    return {
+      exists: false,
+      size: 0,
+      path: imageUrl,
+    }
+  }
+}
+
+// Universal image checker - handles both local and remote
+async function checkImageUniversal(imagePath, verbose, workerId) {
+  if (isRemotePath(imagePath)) {
+    return await checkRemoteImage(imagePath, verbose, workerId)
+  } else {
+    return await checkLocalImage(imagePath, verbose, workerId)
+  }
+}
+
+// Check if image passes filter criteria
 function passesFilter(record, filterConfig) {
   if (!filterConfig?.enabled) return true
 
@@ -107,7 +220,7 @@ function passesFilter(record, filterConfig) {
     return false
   }
 
-  // FIXED: File size filters - convert bytes to the correct unit and add detailed logging
+  // File size filters
   const fileSizeBytes = record.actualFileSize || Number.parseInt(record.imageSize) || 0
   const sizeSource = record.actualFileSize ? "filesystem" : "XML"
   const verbose = workerData.verbose
@@ -191,49 +304,146 @@ function passesFilter(record, filterConfig) {
   return true
 }
 
-// Move image file to filtered folder
-async function moveImageToFilteredFolder(
-  originalImageAbsPath,
+// Universal image mover - handles both local and remote images
+async function moveImageUniversal(
+  imagePath,
   userDefinedDestAbsPath,
   folderStructureOption,
   originalRootDirForScan,
   verbose,
   workerId,
+  imageFileName,
 ) {
   try {
-    if (!originalImageAbsPath || !userDefinedDestAbsPath) {
+    if (!imagePath || !userDefinedDestAbsPath) {
       if (verbose) console.log(`[Worker ${workerId}] Missing paths for move operation.`)
       return false
     }
-    await fs.access(originalImageAbsPath)
 
-    const fileName = path.basename(originalImageAbsPath)
+    let localImagePath = ""
+    const fileName = imageFileName || path.basename(imagePath)
+
+    // Handle remote images - download first
+    if (isRemotePath(imagePath)) {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Preparing to move remote image: ${imagePath}`)
+      }
+
+      // Create temp directory for remote image download
+      const tempImageDir = path.join(originalRootDirForScan, "temp_images")
+      await fs.mkdir(tempImageDir, { recursive: true })
+
+      // Download the remote image
+      localImagePath = await downloadRemoteImage(imagePath, tempImageDir, verbose, workerId)
+
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Downloaded remote image for moving: ${localImagePath}`)
+      }
+    } else {
+      // Handle local images - use directly
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Preparing to move local image: ${imagePath}`)
+      }
+
+      // Check if local image exists
+      try {
+        await fs.access(imagePath)
+        localImagePath = imagePath
+      } catch (error) {
+        if (verbose) console.log(`[Worker ${workerId}] Local image file does not exist: ${imagePath}`)
+        return false
+      }
+    }
+
+    // Determine destination path
     let finalDestPath
     let finalDestDir
 
     if (folderStructureOption === "replicate") {
-      const relativePathFromRoot = path.relative(originalRootDirForScan, path.dirname(originalImageAbsPath))
+      // For folder structure replication
+      let relativePathFromRoot = ""
+
+      if (isRemotePath(imagePath)) {
+        // For remote files, extract relative path from URL
+        const imageUrl = new URL(imagePath)
+        const rootUrl = new URL(originalRootDirForScan)
+        relativePathFromRoot = path.dirname(imageUrl.pathname.replace(rootUrl.pathname, ""))
+      } else {
+        // For local files, use standard path relative calculation
+        relativePathFromRoot = path.relative(originalRootDirForScan, path.dirname(imagePath))
+      }
+
       finalDestDir = path.join(userDefinedDestAbsPath, relativePathFromRoot)
       finalDestPath = path.join(finalDestDir, fileName)
     } else {
+      // Flat structure - all images in one folder
       finalDestDir = userDefinedDestAbsPath
       finalDestPath = path.join(finalDestDir, fileName)
     }
 
+    // Create destination directory
     await fs.mkdir(finalDestDir, { recursive: true })
-    await fs.copyFile(originalImageAbsPath, finalDestPath)
-    if (verbose) console.log(`[Worker ${workerId}] Moved image: ${originalImageAbsPath} -> ${finalDestPath}`)
+
+    // Copy the image to destination
+    await fs.copyFile(localImagePath, finalDestPath)
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Successfully moved image: ${imagePath} -> ${finalDestPath}`)
+    }
+
+    // Clean up temporary file if it was a remote download
+    if (isRemotePath(imagePath) && localImagePath !== imagePath) {
+      try {
+        await fs.unlink(localImagePath)
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Cleaned up temporary file: ${localImagePath}`)
+        }
+      } catch (cleanupError) {
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Warning: Could not clean up temp file: ${cleanupError.message}`)
+        }
+      }
+    }
+
     return true
   } catch (error) {
-    if (verbose) console.error(`[Worker ${workerId}] Error moving image ${originalImageAbsPath}:`, error.message)
+    if (verbose) {
+      console.error(`[Worker ${workerId}] Error moving image ${imagePath}:`, error.message)
+    }
     return false
   }
 }
 
+// Construct image path based on XML path (works for both local and remote)
+function constructImagePath(xmlFilePath, imageHref, isRemote) {
+  if (!imageHref) return ""
+
+  if (isRemote) {
+    // For remote files: convert processed path to media path
+    // XML: http://172.16.0.104/photoapp/charitra/2006/06/processed/file.xml
+    // IMG: http://172.16.0.104/photoapp/charitra/2006/06/media/image.jpg
+    try {
+      const xmlUrl = new URL(xmlFilePath.replace(/\\/g, "/"))
+      const basePath = xmlUrl.pathname.replace("/processed/", "/media/")
+      return `${xmlUrl.protocol}//${xmlUrl.host}${basePath}/${imageHref}`
+    } catch (error) {
+      console.error("Error constructing remote image path:", error)
+      return ""
+    }
+  } else {
+    // For local files: use existing logic
+    const expectedImageDir = path.join(path.dirname(path.dirname(xmlFilePath)), "media")
+    return path.join(expectedImageDir, imageHref)
+  }
+}
+
 // Process a single XML file
-async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose) {
+async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote) {
   try {
-    if (verbose) console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
+      console.log(`[Worker ${workerId}] Mode: ${isRemote ? "Remote" : "Local"}`)
+    }
 
     const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
     const result = await parseStringPromise(xmlContent, {
@@ -408,38 +618,23 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       }
     }
 
-    const expectedImageDir = path.join(path.dirname(path.dirname(xmlFilePath)), "media")
-    const imagePath = imageHref ? path.join(expectedImageDir, imageHref) : ""
+    // Universal image handling - works for both local and remote
+    let imagePath = ""
     let imageExists = false
-    if (imagePath) {
-      try {
-        await fs.access(imagePath)
-        imageExists = true
-      } catch {
-        /* Image doesn't exist */
-      }
-    }
-
     let actualFileSize = 0
-    if (imageExists && imagePath) {
-      try {
-        const stats = await fs.stat(imagePath)
-        actualFileSize = stats.size
-        if (verbose) {
-          console.log(
-            `[Worker ${workerId}] Actual file size from filesystem: ${actualFileSize} bytes (${Math.round((actualFileSize / 1024 / 1024) * 100) / 100}MB)`,
-          )
-          if (imageSize && Number.parseInt(imageSize) !== actualFileSize) {
-            console.log(
-              `[Worker ${workerId}] WARNING: XML size (${imageSize}) differs from actual file size (${actualFileSize})`,
-            )
-          }
-        }
-      } catch (err) {
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Could not get actual file size: ${err.message}`)
-        }
+
+    if (imageHref) {
+      // Construct image path (local or remote)
+      imagePath = constructImagePath(xmlFilePath, imageHref, isRemote)
+
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Constructed image path: ${imagePath}`)
       }
+
+      // Check image existence and get size (universal method)
+      const imageInfo = await checkImageUniversal(imagePath, verbose, workerId)
+      imageExists = imageInfo.exists
+      actualFileSize = imageInfo.size
     }
 
     const record = {
@@ -475,7 +670,7 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       actualFileSize,
       imageHref,
       xmlPath: xmlFilePath,
-      imagePath,
+      imagePath: imagePath,
       imageExists: imageExists ? "Yes" : "No",
       creationDate,
       revisionDate,
@@ -486,13 +681,11 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       console.log(`[Worker ${workerId}] Extracted image metadata for ${path.basename(xmlFilePath)}:`)
       console.log(`  - Image file: ${imageHref}`)
       console.log(`  - Raw size from XML: "${imageSize}"`)
+      console.log(`  - Actual file size: ${actualFileSize} bytes`)
       console.log(`  - Dimensions: ${imageWidth}x${imageHeight}`)
       console.log(`  - Image exists: ${imageExists}`)
-      if (imageSize) {
-        const sizeBytes = Number.parseInt(imageSize) || 0
-        console.log(`  - Size in bytes: ${sizeBytes}`)
-        console.log(`  - Size in MB: ${Math.round((sizeBytes / 1024 / 1024) * 100) / 100}MB`)
-      }
+      console.log(`  - Image path: ${imagePath}`)
+      console.log(`  - Path type: ${isRemotePath(imagePath) ? "Remote" : "Local"}`)
     }
 
     const passed = passesFilter(record, filterConfig)
@@ -505,6 +698,7 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       return { record: null, passedFilter: false, imageMoved: false, workerId }
     }
 
+    // Universal image moving - handles both local and remote
     if (
       filterConfig?.enabled &&
       passed &&
@@ -512,16 +706,28 @@ async function processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir
       filterConfig?.moveDestinationPath &&
       filterConfig?.moveFolderStructureOption &&
       imageExists &&
+      imageHref &&
       imagePath
     ) {
-      moved = await moveImageToFilteredFolder(
-        imagePath,
-        filterConfig.moveDestinationPath,
-        filterConfig.moveFolderStructureOption,
-        originalRootDir,
-        verbose,
-        workerId,
-      )
+      try {
+        moved = await moveImageUniversal(
+          imagePath,
+          filterConfig.moveDestinationPath,
+          filterConfig.moveFolderStructureOption,
+          originalRootDir,
+          verbose,
+          workerId,
+          imageHref,
+        )
+
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Image move result: ${moved ? "SUCCESS" : "FAILED"}`)
+        }
+      } catch (error) {
+        if (verbose) {
+          console.error(`[Worker ${workerId}] Error during image move:`, error.message)
+        }
+      }
     }
 
     if (verbose) {
@@ -547,16 +753,17 @@ async function main() {
       throw new Error("No workerData provided")
     }
 
-    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose } = workerData
+    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote } = workerData
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Starting to process: ${path.basename(xmlFilePath)}`)
+      console.log(`[Worker ${workerId}] Processing mode: ${isRemote ? "Remote" : "Local"}`)
       if (filterConfig?.enabled) {
         console.log(`[Worker ${workerId}] Filter config:`, JSON.stringify(filterConfig, null, 2))
       }
     }
 
-    const result = await processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose)
+    const result = await processXmlFileInWorker(xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote)
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Finished processing: ${path.basename(xmlFilePath)}`)
