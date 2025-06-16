@@ -22,8 +22,6 @@ import {
   FolderOpen,
   Layers,
   Play,
-  Settings,
-  Upload,
   Filter,
   ImageIcon,
   HardDrive,
@@ -343,8 +341,10 @@ export default function Home() {
       // Create abort controller for the fetch request
       abortControllerRef.current = new AbortController()
 
-      // Start SSE processing
-      const endpoint = enableChunkedProcessing ? "/api/parse/chunked" : "/api/parse/stream"
+      // Start SSE processing - always use stream processing since chunked has issues
+      const endpoint = "/api/parse/stream"
+      addLog("Starting processing with stream endpoint...")
+
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -354,66 +354,13 @@ export default function Home() {
           numWorkers: workers,
           verbose,
           filterConfig: currentFilterConfig,
-          chunkSize: enableChunkedProcessing ? chunkSize : undefined,
           organizeByCity,
-          resumeFromState: hasProcessingHistory ? processingState : null,
         }),
         signal: abortControllerRef.current.signal,
       })
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`)
-      }
-
-      // If using chunked processing but it's not implemented yet, fall back to regular processing
-      if (enableChunkedProcessing && response.headers.get("content-type")?.includes("application/json")) {
-        const result = await response.json()
-        if (result.message && result.message.includes("not yet fully implemented")) {
-          addLog("Chunked processing not yet implemented, falling back to regular processing...")
-          // Fall back to regular stream processing
-          const fallbackResponse = await fetch("/api/parse/stream", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              rootDir,
-              outputFile,
-              numWorkers: workers,
-              verbose,
-              filterConfig: currentFilterConfig,
-            }),
-            signal: abortControllerRef.current.signal,
-          })
-
-          if (!fallbackResponse.ok) {
-            throw new Error(`HTTP error! status: ${fallbackResponse.status}`)
-          }
-
-          // Process the fallback response
-          const reader = fallbackResponse.body?.getReader()
-          const decoder = new TextDecoder()
-
-          if (reader) {
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-
-              const chunk = decoder.decode(value)
-              const lines = chunk.split("\n")
-
-              for (const line of lines) {
-                if (line.startsWith("data: ")) {
-                  try {
-                    const data = JSON.parse(line.slice(6))
-                    handleSSEMessage(data)
-                  } catch (e) {
-                    console.error("Error parsing SSE data:", e)
-                  }
-                }
-              }
-            }
-          }
-          return
-        }
       }
 
       // Create EventSource-like functionality with fetch
@@ -513,7 +460,7 @@ export default function Home() {
         if (data.errors && data.errors.length > 0) {
           setErrors(data.errors)
         }
-        addLog(`All ${data.stats.chunksCompleted} chunks completed successfully!`)
+        addLog(`Processing completed successfully!`)
         break
     }
   }
@@ -761,7 +708,7 @@ export default function Home() {
                   <Card className="p-4 border-2 border-blue-200">
                     <CardHeader className="p-0 pb-3">
                       <CardTitle className="text-base flex items-center gap-2">
-                        <Database className="h-4 w-4" /> Chunked Processing (Recommended for Large Datasets)
+                        <Database className="h-4 w-4" /> Chunked Processing (Currently uses Stream Processing)
                       </CardTitle>
                     </CardHeader>
                     <CardContent className="p-0 space-y-4">
@@ -771,7 +718,9 @@ export default function Home() {
                           checked={enableChunkedProcessing}
                           onCheckedChange={setEnableChunkedProcessing}
                         />
-                        <Label htmlFor="enableChunkedProcessing">Enable chunked processing</Label>
+                        <Label htmlFor="enableChunkedProcessing">
+                          Enable chunked processing (falls back to stream)
+                        </Label>
                       </div>
 
                       {enableChunkedProcessing && (
@@ -790,8 +739,7 @@ export default function Home() {
                               onValueChange={(value) => setChunkSize(value[0])}
                             />
                             <p className="text-sm text-muted-foreground">
-                              Process files in chunks. Smaller chunks = more frequent saves, larger chunks = faster
-                              processing
+                              Process files in chunks. Currently falls back to regular stream processing.
                             </p>
                           </div>
 
@@ -1557,7 +1505,7 @@ export default function Home() {
                             <CardTitle className="text-sm text-muted-foreground">Processed</CardTitle>
                           </CardHeader>
                           <CardContent className="p-4 pt-0">
-                            <p className="text-3xl font-bold">{stats.processedFiles.toLocaleString()}</p>
+                            <p className="text-3xl font-bold text-blue-600">{stats.processedFiles.toLocaleString()}</p>
                           </CardContent>
                         </Card>
                         <Card>
@@ -1572,10 +1520,18 @@ export default function Home() {
                         </Card>
                         <Card>
                           <CardHeader className="p-4">
+                            <CardTitle className="text-sm text-muted-foreground">Errors</CardTitle>
+                          </CardHeader>
+                          <CardContent className="p-4 pt-0">
+                            <p className="text-3xl font-bold text-red-600">{stats.errorFiles.toLocaleString()}</p>
+                          </CardContent>
+                        </Card>
+                        <Card>
+                          <CardHeader className="p-4">
                             <CardTitle className="text-sm text-muted-foreground">Filtered</CardTitle>
                           </CardHeader>
                           <CardContent className="p-4 pt-0">
-                            <p className="text-3xl font-bold text-blue-600">{stats.filteredFiles.toLocaleString()}</p>
+                            <p className="text-3xl font-bold text-orange-600">{stats.filteredFiles.toLocaleString()}</p>
                           </CardContent>
                         </Card>
                         <Card>
@@ -1586,206 +1542,146 @@ export default function Home() {
                             <p className="text-3xl font-bold text-purple-600">{stats.movedFiles.toLocaleString()}</p>
                           </CardContent>
                         </Card>
-                        <Card>
-                          <CardHeader className="p-4">
-                            <CardTitle className="text-sm text-muted-foreground">Chunks</CardTitle>
-                          </CardHeader>
-                          <CardContent className="p-4 pt-0">
-                            <p className="text-3xl font-bold text-orange-600">{stats.chunksCompleted}</p>
-                          </CardContent>
-                        </Card>
                       </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <Card>
-                          <CardHeader className="p-4">
-                            <CardTitle className="text-sm text-muted-foreground">Proc. Time</CardTitle>
-                          </CardHeader>
-                          <CardContent className="p-4 pt-0">
-                            <p className="text-xl font-medium">{formatDuration(stats.endTime - stats.startTime)}</p>
-                          </CardContent>
-                        </Card>
-                        <Card>
-                          <CardHeader className="p-4">
-                            <CardTitle className="text-sm text-muted-foreground">Success Rate</CardTitle>
-                          </CardHeader>
-                          <CardContent className="p-4 pt-0">
-                            <p className="text-xl font-medium">
-                              {stats.processedFiles > 0
-                                ? `${Math.round((stats.successfulFiles / stats.processedFiles) * 100)}%`
-                                : "0%"}
-                            </p>
-                          </CardContent>
-                        </Card>
-                        <Card>
-                          <CardHeader className="p-4">
-                            <CardTitle className="text-sm text-muted-foreground">Filter Rate</CardTitle>
-                          </CardHeader>
-                          <CardContent className="p-4 pt-0">
-                            <p className="text-xl font-medium">
-                              {stats.totalFiles > 0 && enableFiltering
-                                ? `${Math.round((stats.filteredFiles / stats.totalFiles) * 100)}%`
-                                : "N/A"}
-                            </p>
-                          </CardContent>
-                        </Card>
-                      </div>
-                      {status === "completed" && (
-                        <Alert className="bg-green-50 border-green-200 dark:bg-green-950 dark:border-green-800">
-                          <CheckCircle className="h-4 w-4 text-green-600" />
-                          <AlertTitle className="text-green-600">Processing completed successfully!</AlertTitle>
-                          <AlertDescription>
-                            CSV generated. {enableFiltering && `${stats.filteredFiles} images matched filters.`}{" "}
-                            {moveFilteredImages && stats.movedFiles > 0 && `${stats.movedFiles} images moved.`}
-                            {enableChunkedProcessing && ` Processed in ${stats.chunksCompleted} chunks.`}
-                          </AlertDescription>
-                        </Alert>
+
+                      {enableChunkedProcessing && (
+                        <div className="grid grid-cols-2 gap-4">
+                          <Card>
+                            <CardHeader className="p-4">
+                              <CardTitle className="text-sm text-muted-foreground">Chunks Completed</CardTitle>
+                            </CardHeader>
+                            <CardContent className="p-4 pt-0">
+                              <p className="text-3xl font-bold text-indigo-600">
+                                {stats.chunksCompleted}/{totalChunks}
+                              </p>
+                            </CardContent>
+                          </Card>
+                          <Card>
+                            <CardHeader className="p-4">
+                              <CardTitle className="text-sm text-muted-foreground">Cities Processed</CardTitle>
+                            </CardHeader>
+                            <CardContent className="p-4 pt-0">
+                              <p className="text-3xl font-bold text-teal-600">{stats.citiesProcessed}</p>
+                            </CardContent>
+                          </Card>
+                        </div>
                       )}
-                      {status === "error" && (
-                        <Alert variant="destructive">
-                          <AlertCircle className="h-4 w-4" />
-                          <AlertTitle>Processing completed with errors</AlertTitle>
-                          <AlertDescription>Check error logs for details.</AlertDescription>
-                        </Alert>
+
+                      <div className="space-y-2">
+                        <div className="flex justify-between text-sm">
+                          <span>Processing Time</span>
+                          <span>
+                            {stats.endTime
+                              ? formatDuration(stats.endTime - stats.startTime)
+                              : formatDuration(Date.now() - stats.startTime)}
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-sm">
+                          <span>Success Rate</span>
+                          <span>
+                            {stats.processedFiles > 0
+                              ? `${Math.round((stats.successfulFiles / stats.processedFiles) * 100)}%`
+                              : "0%"}
+                          </span>
+                        </div>
+                      </div>
+
+                      {downloadUrl && (
+                        <Button onClick={handleDownloadCSV} className="w-full" size="lg">
+                          <FileDown className="h-4 w-4 mr-2" />
+                          Download CSV Results
+                        </Button>
                       )}
                     </>
                   )}
                 </CardContent>
-                <CardFooter className="flex gap-2">
-                  <Button
-                    onClick={handleDownloadCSV}
-                    disabled={status !== "completed" && status !== "error"}
-                    className="flex-1"
-                    size="lg"
-                  >
-                    <FileDown className="h-4 w-4 mr-2" />
-                    Download CSV
-                  </Button>
-                  <Button variant="outline" onClick={() => setActiveTab("config")} size="lg">
-                    <Settings className="h-4 w-4 mr-2" />
-                    New Session
-                  </Button>
-                </CardFooter>
               </Card>
             </TabsContent>
           </Tabs>
         </div>
 
-        <div className="lg:col-span-1">
-          <Card className="h-full">
+        <div className="space-y-6">
+          <Card>
             <CardHeader>
-              <CardTitle>Live Statistics</CardTitle>
-              <CardDescription>Real-time processing metrics</CardDescription>
+              <CardTitle className="text-lg">Quick Stats</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="space-y-3">
+              <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Status:</span>
-                  <span className="font-medium capitalize">{status}</span>
+                  <span>Status</span>
+                  {getStatusBadge()}
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Connection:</span>
-                  <span className="font-medium">{isConnected ? "Connected" : "Disconnected"}</span>
-                </div>
-                {enableChunkedProcessing && (
-                  <>
-                    <div className="flex justify-between text-sm">
-                      <span className="text-muted-foreground">Current Chunk:</span>
-                      <span className="font-medium">
-                        {currentChunk}/{totalChunks}
-                      </span>
-                    </div>
-                    <div className="flex justify-between text-sm">
-                      <span className="text-muted-foreground">Chunks Done:</span>
-                      <span className="font-medium text-orange-600">{stats.chunksCompleted}</span>
-                    </div>
-                  </>
-                )}
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Total Files:</span>
-                  <span className="font-medium">{stats.totalFiles.toLocaleString()}</span>
+                  <span>Connection</span>
+                  {getConnectionStatus()}
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Processed:</span>
-                  <span className="font-medium">{stats.processedFiles.toLocaleString()}</span>
-                </div>
-                {enableFiltering && (
-                  <div className="flex justify-between text-sm">
-                    <span className="text-muted-foreground">Filtered:</span>
-                    <span className="font-medium text-blue-600">{stats.filteredFiles.toLocaleString()}</span>
-                  </div>
-                )}
-                {moveFilteredImages && (
-                  <div className="flex justify-between text-sm">
-                    <span className="text-muted-foreground">Moved:</span>
-                    <span className="font-medium text-purple-600">{stats.movedFiles.toLocaleString()}</span>
-                  </div>
-                )}
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Success Rate:</span>
-                  <span className="font-medium text-green-600">
-                    {stats.processedFiles > 0
-                      ? `${Math.round((stats.successfulFiles / stats.processedFiles) * 100)}%`
-                      : "0%"}
-                  </span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Error Rate:</span>
-                  <span className="font-medium text-red-600">
-                    {stats.processedFiles > 0
-                      ? `${Math.round((stats.errorFiles / stats.processedFiles) * 100)}%`
-                      : "0%"}
-                  </span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Elapsed Time:</span>
-                  <span className="font-medium">
-                    {formatDuration(
-                      status === "running" ? Date.now() - stats.startTime : stats.endTime - stats.startTime,
-                    )}
-                  </span>
-                </div>
-              </div>
-              <div className="pt-4 border-t">
-                <div className="flex justify-between text-sm mb-2">
-                  <span>Overall Progress</span>
+                  <span>Progress</span>
                   <span>{Math.round(progress)}%</span>
                 </div>
-                <Progress value={progress} className="h-3" />
-                <div className="flex justify-between text-xs text-muted-foreground mt-1">
-                  <span>0%</span>
-                  <span>100%</span>
-                </div>
+                <Progress value={progress} className="h-2" />
               </div>
-              {status === "running" && (
-                <div className="pt-4 border-t">
-                  <div className="text-sm text-muted-foreground mb-2">Processing Speed</div>
-                  <div className="text-lg font-medium">
-                    {stats.processedFiles > 0 && stats.startTime > 0
-                      ? `${Math.round(stats.processedFiles / ((Date.now() - stats.startTime) / 1000))} files/sec`
-                      : "Calculating..."}
-                  </div>
+              <div className="space-y-1 text-xs">
+                <div className="flex justify-between">
+                  <span>Processed:</span>
+                  <span>{stats.processedFiles.toLocaleString()}</span>
                 </div>
-              )}
+                <div className="flex justify-between">
+                  <span>Successful:</span>
+                  <span className="text-green-600">{stats.successfulFiles.toLocaleString()}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Errors:</span>
+                  <span className="text-red-600">{stats.errorFiles.toLocaleString()}</span>
+                </div>
+                {enableFiltering && (
+                  <>
+                    <div className="flex justify-between">
+                      <span>Filtered:</span>
+                      <span className="text-orange-600">{stats.filteredFiles.toLocaleString()}</span>
+                    </div>
+                    {moveFilteredImages && (
+                      <div className="flex justify-between">
+                        <span>Moved:</span>
+                        <span className="text-purple-600">{stats.movedFiles.toLocaleString()}</span>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
             </CardContent>
-            <CardFooter className="flex flex-col gap-2">
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={() => setActiveTab("config")}
-                disabled={status === "running"}
-              >
-                <Settings className="h-4 w-4 mr-2" />
-                Configuration
-              </Button>
-              <Button variant="outline" className="w-full" onClick={() => setActiveTab("filters")}>
-                <Filter className="h-4 w-4 mr-2" />
-                Filters
-              </Button>
-              <Button variant="outline" className="w-full" onClick={() => setActiveTab("logs")}>
-                <Upload className="h-4 w-4 mr-2" />
-                View Logs
-              </Button>
-            </CardFooter>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg">Configuration Summary</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 text-xs">
+              <div className="flex justify-between">
+                <span>Workers:</span>
+                <span>{workers}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Batch Size:</span>
+                <span>{batchSize}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Verbose:</span>
+                <span>{verbose ? "Yes" : "No"}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Chunked:</span>
+                <span>{enableChunkedProcessing ? `${chunkSize} files/chunk` : "No"}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Filtering:</span>
+                <span>{enableFiltering ? "Enabled" : "Disabled"}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Watch Mode:</span>
+                <span>{enableWatchMode ? (isWatching ? "Active" : "Enabled") : "Disabled"}</span>
+              </div>
+            </CardContent>
           </Card>
         </div>
       </div>
