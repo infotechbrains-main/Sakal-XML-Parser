@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server"
 import fs from "fs/promises"
 import path from "path"
 import { Worker } from "worker_threads"
+import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
 
 // Global state for chunked processing
 let shouldPause = false
@@ -114,6 +115,44 @@ async function organizeImagesByCity(records: any[], baseDestinationPath: string,
   }
 
   return Array.from(citiesProcessed)
+}
+
+async function scanForXMLFiles(rootDir: string): Promise<string[]> {
+  // Check if this is a remote path
+  if (await isRemotePath(rootDir)) {
+    console.log(`Scanning remote directory: ${rootDir}`)
+
+    const remoteFiles = await scanRemoteDirectory(rootDir, (message) => {
+      console.log(`Remote scan: ${message}`)
+    })
+
+    // Return the URLs of the remote XML files
+    return remoteFiles.map((file) => file.url)
+  }
+
+  // Local file system scanning (existing code)
+  const xmlFiles: string[] = []
+
+  async function scanDirectory(dir: string) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true })
+
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+
+        if (entry.isDirectory()) {
+          await scanDirectory(fullPath)
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
+          xmlFiles.push(fullPath)
+        }
+      }
+    } catch (error) {
+      console.error(`Error scanning directory ${dir}:`, error)
+    }
+  }
+
+  await scanDirectory(rootDir)
+  return xmlFiles
 }
 
 export async function POST(request: NextRequest) {
@@ -313,31 +352,6 @@ export async function POST(request: NextRequest) {
       details: error instanceof Error ? error.message : "Unknown error",
     }
   }
-}
-
-async function scanForXMLFiles(rootDir: string): Promise<string[]> {
-  const xmlFiles: string[] = []
-
-  async function scanDirectory(dir: string) {
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true })
-
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name)
-
-        if (entry.isDirectory()) {
-          await scanDirectory(fullPath)
-        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
-          xmlFiles.push(fullPath)
-        }
-      }
-    } catch (error) {
-      console.error(`Error scanning directory ${dir}:`, error)
-    }
-  }
-
-  await scanDirectory(rootDir)
-  return xmlFiles
 }
 
 async function processChunk(
