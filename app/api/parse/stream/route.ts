@@ -4,6 +4,7 @@ import path from "path"
 import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
 import { CSV_HEADERS } from "../route"
+import { ProcessingHistory, type ProcessingSession } from "@/lib/processing-history"
 import {
   isRemotePath,
   scanRemoteDirectory,
@@ -156,6 +157,46 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     }
   }
 
+  // Create or resume session
+  let currentSession: ProcessingSession
+  const existingSession = await ProcessingHistory.getCurrentSession()
+
+  if (existingSession && existingSession.config.rootDir === rootDir) {
+    // Resume existing session
+    currentSession = existingSession
+    sendMessage("log", { message: `Resuming session: ${currentSession.id}` })
+    sendMessage("log", { message: `Previously processed: ${currentSession.progress.processedFiles} files` })
+  } else {
+    // Create new session
+    currentSession = {
+      id: ProcessingHistory.generateSessionId(),
+      startTime: new Date().toISOString(),
+      status: "running",
+      config: {
+        rootDir,
+        outputFile,
+        numWorkers,
+        processingMode: "stream",
+        filterConfig,
+      },
+      progress: {
+        totalFiles: 0,
+        processedFiles: 0,
+        successCount: 0,
+        errorCount: 0,
+        filteredCount: 0,
+        movedCount: 0,
+        currentFileIndex: 0,
+        processedFilesList: [],
+        remainingFiles: [],
+      },
+    }
+    await ProcessingHistory.addSession(currentSession)
+    sendMessage("log", { message: `Started new session: ${currentSession.id}` })
+  }
+
+  await ProcessingHistory.saveCurrentSession(currentSession)
+
   // Graceful shutdown handler
   const gracefulShutdown = async (reason: string) => {
     console.log(`Initiating graceful shutdown: ${reason}`)
@@ -194,7 +235,16 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     }
 
     currentProcessingState = state
-    await saveProcessingState(state)
+
+    currentSession.status = "interrupted"
+    currentSession.endTime = new Date().toISOString()
+    currentSession.resumeData = {
+      lastProcessedFile: allRecords[allRecords.length - 1]?.xmlPath || "",
+      partialResults: allRecords,
+    }
+
+    await ProcessingHistory.updateSession(currentSession.id, currentSession)
+    await ProcessingHistory.saveCurrentSession(currentSession)
 
     // Clean up temp directory
     if (tempDir) {
@@ -347,6 +397,18 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
 
     const outputPath = path.join(process.cwd(), outputFile)
 
+    // Filter out already processed files if resuming
+    let filesToProcess = xmlFiles
+    if (existingSession && existingSession.progress.processedFilesList.length > 0) {
+      filesToProcess = xmlFiles.filter((file) => !existingSession.progress.processedFilesList.includes(file))
+      sendMessage("log", {
+        message: `Resuming: ${filesToProcess.length} files remaining out of ${xmlFiles.length} total`,
+      })
+    }
+
+    currentSession.progress.totalFiles = xmlFiles.length
+    currentSession.progress.remainingFiles = filesToProcess
+
     // Send filter configuration info
     if (filterConfig?.enabled) {
       sendMessage("log", { message: "Filtering enabled with the following criteria:" })
@@ -427,7 +489,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
           // Get the original remote URL for this file
           const originalRemoteXmlUrl = localToRemoteMapping.get(currentFile) || null
 
-          if (verbose && isRemote) {
+          if (verbose && originalRemoteXmlUrl) {
             console.log(`Worker ${workerId} processing: ${currentFile}`)
             console.log(`Original remote URL: ${originalRemoteXmlUrl}`)
           }
@@ -436,10 +498,10 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             workerData: {
               xmlFilePath: currentFile,
               filterConfig,
-              originalRootDir: isRemote ? tempDir : rootDir,
+              originalRootDir: rootDir,
               workerId,
               verbose,
-              isRemote,
+              isRemote: false,
               originalRemoteXmlUrl, // Pass the original remote URL
             },
           })
@@ -447,21 +509,36 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
 
           worker.on("message", async (result: any) => {
             processedCount++
+            currentSession.progress.processedFiles++
+            currentSession.progress.processedFilesList.push(currentFile)
 
             if (result.record) {
               allRecords.push(result.record)
               successCount++
+              currentSession.progress.successCount++
             }
             if (result.passedFilter && result.record) {
               filteredCount++
+              currentSession.progress.filteredCount++
             }
             if (result.imageMoved) {
               movedCount++
+              currentSession.progress.movedCount++
             }
             if (result.error) {
               errorCount++
-              errors.push(`Error in ${path.basename(currentFile)}: ${result.error}`)
+              currentSession.progress.errorCount++
+              errors.push(`Error in ${path.basename(currentFile)} (Worker ${result.workerId}): ${result.error}`)
               sendMessage("log", { message: `Error processing ${path.basename(currentFile)}: ${result.error}` })
+            }
+
+            // Save session progress every 10 files
+            if (processedCount % 10 === 0) {
+              await ProcessingHistory.saveCurrentSession(currentSession)
+              await ProcessingHistory.updateSession(currentSession.id, {
+                progress: currentSession.progress,
+                status: "running",
+              })
             }
 
             // Auto-save every 30 seconds or every 50 files
@@ -557,6 +634,26 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     } else if (allRecords.length === 0) {
       sendMessage("log", { message: "No records to write to CSV" })
     }
+
+    // Mark session as completed
+    currentSession.status = "completed"
+    currentSession.endTime = new Date().toISOString()
+    currentSession.results = {
+      outputPath: outputPath,
+      stats: {
+        totalFiles: xmlFiles.length,
+        processedFiles: processedCount,
+        successfulFiles: successCount,
+        errorFiles: errorCount,
+        recordsWritten: allRecords.length,
+        filteredFiles: filteredCount,
+        movedFiles: movedCount,
+      },
+      errors: errors.slice(0, 10),
+    }
+
+    await ProcessingHistory.updateSession(currentSession.id, currentSession)
+    await ProcessingHistory.clearCurrentSession()
 
     // Send final results
     if (!isControllerClosed && !isShuttingDown) {

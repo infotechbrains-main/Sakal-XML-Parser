@@ -3,11 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
     "build": "next build",
-    "start": "next start",
+    "clean": "rm -rf node_modules pnpm-lock.yaml && pnpm store prune",
+    "dev": "next dev",
     "lint": "next lint",
-    "clean": "rm -rf node_modules pnpm-lock.yaml && pnpm store prune"
+    "start": "next start"
   },
   "dependencies": {
     "@radix-ui/react-label": "latest",
