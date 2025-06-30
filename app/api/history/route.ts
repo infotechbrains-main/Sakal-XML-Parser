@@ -1,41 +1,41 @@
 import { NextResponse } from "next/server"
 import { PersistentHistory } from "@/lib/persistent-history"
 
+const history = new PersistentHistory()
+
 export async function GET() {
   try {
-    const history = await PersistentHistory.loadHistory()
-    const storageInfo = await PersistentHistory.getStorageInfo()
+    const sessions = await history.getAllSessions()
+    const storageInfo = await history.getStorageInfo()
 
     return NextResponse.json({
       success: true,
-      history,
-      storageInfo,
-      message: `Loaded ${history.length} sessions from persistent storage`,
+      history: sessions,
+      storage: storageInfo,
     })
   } catch (error) {
-    console.error("Error in history GET:", error)
+    console.error("History GET error:", error)
     return NextResponse.json({
-      success: true,
+      success: false,
+      error: error.message,
       history: [],
-      storageInfo: null,
-      message: "Failed to load history, using fallback",
+      storage: null,
     })
   }
 }
 
 export async function DELETE() {
   try {
-    const success = await PersistentHistory.clearHistory()
-
+    await history.clearAllHistory()
     return NextResponse.json({
-      success,
-      message: success ? "History cleared successfully" : "Failed to clear history",
+      success: true,
+      message: "History cleared successfully",
     })
   } catch (error) {
-    console.error("Error in history DELETE:", error)
+    console.error("History DELETE error:", error)
     return NextResponse.json({
       success: false,
-      message: "Error clearing history",
+      error: error.message,
     })
   }
 }

@@ -5,67 +5,61 @@ export interface ProcessingSession {
   id: string
   startTime: string
   endTime?: string
-  status: "running" | "paused" | "completed" | "failed" | "interrupted"
+  status: "running" | "completed" | "failed" | "paused" | "interrupted"
   config: {
     rootDir: string
     outputFile: string
     numWorkers: number
+    verbose: boolean
+    filterConfig: any
     processingMode: string
-    filterConfig?: any
-    chunkSize?: number
   }
   progress: {
     totalFiles: number
     processedFiles: number
     successCount: number
     errorCount: number
-    filteredCount: number
-    movedCount: number
-    currentFileIndex: number
-    processedFilesList: string[]
-    remainingFiles: string[]
+    processedFilesList?: string[]
   }
   results?: {
     outputPath: string
-    stats: any
-    errors: string[]
+    downloadUrl?: string
   }
-  resumeData?: {
-    lastProcessedFile: string
-    partialResults: any[]
-    chunkIndex?: number
-  }
+  errors?: string[]
 }
 
 export class PersistentHistory {
-  private static readonly DATA_DIR = path.join(process.cwd(), "data")
-  private static readonly HISTORY_FILE = path.join(this.DATA_DIR, "processing_history.json")
-  private static readonly CURRENT_SESSION_FILE = path.join(this.DATA_DIR, "current_session.json")
+  private historyFile: string
+  private currentSessionFile: string
+  private dataDir: string
 
-  // Ensure data directory exists
-  private static async ensureDataDir(): Promise<void> {
+  constructor() {
+    this.dataDir = path.join(process.cwd(), "data")
+    this.historyFile = path.join(this.dataDir, "processing_history.json")
+    this.currentSessionFile = path.join(this.dataDir, "current_session.json")
+  }
+
+  private async ensureDataDirectory(): Promise<void> {
     try {
-      await fs.mkdir(this.DATA_DIR, { recursive: true })
-    } catch (error) {
-      console.error("Failed to create data directory:", error)
+      await fs.access(this.dataDir)
+    } catch {
+      await fs.mkdir(this.dataDir, { recursive: true })
     }
   }
 
-  // Safe file read with fallback
-  private static async safeReadFile(filePath: string, fallback: any = null): Promise<any> {
+  private async safeReadFile(filePath: string): Promise<any> {
     try {
-      const data = await fs.readFile(filePath, "utf-8")
-      return JSON.parse(data)
+      const content = await fs.readFile(filePath, "utf-8")
+      return JSON.parse(content)
     } catch (error) {
-      console.log(`File not found or corrupted: ${path.basename(filePath)}, using fallback`)
-      return fallback
+      console.log(`File not found or corrupted: ${filePath}, returning default`)
+      return null
     }
   }
 
-  // Safe file write with backup
-  private static async safeWriteFile(filePath: string, data: any): Promise<boolean> {
+  private async safeWriteFile(filePath: string, data: any): Promise<void> {
     try {
-      await this.ensureDataDir()
+      await this.ensureDataDirectory()
 
       // Create backup if file exists
       try {
@@ -77,138 +71,151 @@ export class PersistentHistory {
       }
 
       await fs.writeFile(filePath, JSON.stringify(data, null, 2))
-      return true
     } catch (error) {
-      console.error(`Failed to write file ${path.basename(filePath)}:`, error)
-      return false
+      console.error(`Error writing file ${filePath}:`, error)
+      throw error
     }
   }
 
-  // Load processing history
-  static async loadHistory(): Promise<ProcessingSession[]> {
-    const history = await this.safeReadFile(this.HISTORY_FILE, [])
-    return Array.isArray(history) ? history : []
-  }
-
-  // Save processing history
-  static async saveHistory(sessions: ProcessingSession[]): Promise<boolean> {
-    return await this.safeWriteFile(this.HISTORY_FILE, sessions)
-  }
-
-  // Add new session to history
-  static async addSession(session: ProcessingSession): Promise<boolean> {
+  async getAllSessions(): Promise<ProcessingSession[]> {
     try {
-      const history = await this.loadHistory()
-      history.unshift(session) // Add to beginning
+      const data = await this.safeReadFile(this.historyFile)
+      return data?.sessions || []
+    } catch (error) {
+      console.error("Error reading history:", error)
+      return []
+    }
+  }
+
+  async createSession(config: any): Promise<ProcessingSession> {
+    const session: ProcessingSession = {
+      id: `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      startTime: new Date().toISOString(),
+      status: "running",
+      config,
+      progress: {
+        totalFiles: 0,
+        processedFiles: 0,
+        successCount: 0,
+        errorCount: 0,
+        processedFilesList: [],
+      },
+    }
+
+    try {
+      // Save as current session
+      await this.safeWriteFile(this.currentSessionFile, session)
+
+      // Add to history
+      const sessions = await this.getAllSessions()
+      sessions.unshift(session)
 
       // Keep only last 100 sessions
-      if (history.length > 100) {
-        history.splice(100)
-      }
+      const limitedSessions = sessions.slice(0, 100)
+      await this.safeWriteFile(this.historyFile, { sessions: limitedSessions })
 
-      return await this.saveHistory(history)
+      return session
     } catch (error) {
-      console.error("Failed to add session:", error)
-      return false
+      console.error("Error creating session:", error)
+      throw error
     }
   }
 
-  // Update existing session
-  static async updateSession(sessionId: string, updates: Partial<ProcessingSession>): Promise<boolean> {
+  async updateSession(sessionId: string, updates: Partial<ProcessingSession>): Promise<void> {
     try {
-      const history = await this.loadHistory()
-      const sessionIndex = history.findIndex((s) => s.id === sessionId)
+      // Update current session if it matches
+      const currentSession = await this.safeReadFile(this.currentSessionFile)
+      if (currentSession?.id === sessionId) {
+        const updatedSession = { ...currentSession, ...updates }
+        await this.safeWriteFile(this.currentSessionFile, updatedSession)
+      }
+
+      // Update in history
+      const sessions = await this.getAllSessions()
+      const sessionIndex = sessions.findIndex((s) => s.id === sessionId)
 
       if (sessionIndex !== -1) {
-        history[sessionIndex] = { ...history[sessionIndex], ...updates }
-        return await this.saveHistory(history)
+        sessions[sessionIndex] = { ...sessions[sessionIndex], ...updates }
+        await this.safeWriteFile(this.historyFile, { sessions })
       }
-      return false
     } catch (error) {
-      console.error("Failed to update session:", error)
-      return false
+      console.error("Error updating session:", error)
     }
   }
 
-  // Get current session
-  static async getCurrentSession(): Promise<ProcessingSession | null> {
-    return await this.safeReadFile(this.CURRENT_SESSION_FILE, null)
+  async completeSession(sessionId: string, results: any): Promise<void> {
+    const updates: Partial<ProcessingSession> = {
+      status: "completed",
+      endTime: new Date().toISOString(),
+      results,
+    }
+
+    await this.updateSession(sessionId, updates)
+    await this.clearCurrentSession()
   }
 
-  // Save current session
-  static async saveCurrentSession(session: ProcessingSession): Promise<boolean> {
-    return await this.safeWriteFile(this.CURRENT_SESSION_FILE, session)
+  async failSession(sessionId: string, error: string): Promise<void> {
+    const updates: Partial<ProcessingSession> = {
+      status: "failed",
+      endTime: new Date().toISOString(),
+      errors: [error],
+    }
+
+    await this.updateSession(sessionId, updates)
+    await this.clearCurrentSession()
   }
 
-  // Clear current session
-  static async clearCurrentSession(): Promise<boolean> {
+  async getCurrentSession(): Promise<ProcessingSession | null> {
+    return await this.safeReadFile(this.currentSessionFile)
+  }
+
+  async clearCurrentSession(): Promise<void> {
     try {
-      await fs.unlink(this.CURRENT_SESSION_FILE)
-      return true
+      await fs.unlink(this.currentSessionFile)
     } catch {
-      return true // File doesn't exist, that's fine
+      // File doesn't exist, that's fine
     }
   }
 
-  // Delete session from history
-  static async deleteSession(sessionId: string): Promise<boolean> {
+  async deleteSession(sessionId: string): Promise<void> {
     try {
-      const history = await this.loadHistory()
-      const filteredHistory = history.filter((s) => s.id !== sessionId)
-      return await this.saveHistory(filteredHistory)
+      const sessions = await this.getAllSessions()
+      const filteredSessions = sessions.filter((s) => s.id !== sessionId)
+      await this.safeWriteFile(this.historyFile, { sessions: filteredSessions })
     } catch (error) {
-      console.error("Failed to delete session:", error)
-      return false
+      console.error("Error deleting session:", error)
+      throw error
     }
   }
 
-  // Clear all history
-  static async clearHistory(): Promise<boolean> {
-    return await this.saveHistory([])
-  }
-
-  // Generate unique session ID
-  static generateSessionId(): string {
-    return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-  }
-
-  // Get storage info
-  static async getStorageInfo(): Promise<{
-    historyExists: boolean
-    currentSessionExists: boolean
-    historySize: number
-    dataDir: string
-  }> {
+  async clearAllHistory(): Promise<void> {
     try {
-      await this.ensureDataDir()
+      await this.safeWriteFile(this.historyFile, { sessions: [] })
+      await this.clearCurrentSession()
+    } catch (error) {
+      console.error("Error clearing history:", error)
+      throw error
+    }
+  }
 
-      const historyExists = await fs
-        .access(this.HISTORY_FILE)
-        .then(() => true)
-        .catch(() => false)
-      const currentSessionExists = await fs
-        .access(this.CURRENT_SESSION_FILE)
-        .then(() => true)
-        .catch(() => false)
-
-      let historySize = 0
-      if (historyExists) {
-        const history = await this.loadHistory()
-        historySize = history.length
-      }
+  async getStorageInfo(): Promise<any> {
+    try {
+      const sessions = await this.getAllSessions()
+      const currentSession = await this.getCurrentSession()
 
       return {
-        historyExists,
-        currentSessionExists,
-        historySize,
-        dataDir: this.DATA_DIR,
+        totalSessions: sessions.length,
+        hasCurrentSession: !!currentSession,
+        dataDirectory: this.dataDir,
+        lastUpdated: sessions[0]?.startTime || null,
       }
     } catch (error) {
       return {
-        historyExists: false,
-        currentSessionExists: false,
-        historySize: 0,
-        dataDir: this.DATA_DIR,
+        totalSessions: 0,
+        hasCurrentSession: false,
+        dataDirectory: this.dataDir,
+        lastUpdated: null,
+        error: error.message,
       }
     }
   }

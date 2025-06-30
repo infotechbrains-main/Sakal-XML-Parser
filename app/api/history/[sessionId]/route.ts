@@ -1,36 +1,37 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { PersistentHistory } from "@/lib/persistent-history"
 
+const history = new PersistentHistory()
+
 export async function DELETE(request: NextRequest, { params }: { params: { sessionId: string } }) {
   try {
-    const success = await PersistentHistory.deleteSession(params.sessionId)
+    const sessionId = params.sessionId
+    await history.deleteSession(sessionId)
 
     return NextResponse.json({
-      success,
-      message: success ? "Session deleted successfully" : "Failed to delete session",
+      success: true,
+      message: "Session deleted successfully",
     })
   } catch (error) {
-    console.error("Error deleting session:", error)
+    console.error("Session DELETE error:", error)
     return NextResponse.json({
       success: false,
-      message: "Error deleting session",
+      error: error.message,
     })
   }
 }
 
 export async function GET(request: NextRequest, { params }: { params: { sessionId: string } }) {
   try {
-    const history = await PersistentHistory.loadHistory()
-    const session = history.find((s) => s.id === params.sessionId)
+    const sessionId = params.sessionId
+    const sessions = await history.getAllSessions()
+    const session = sessions.find((s) => s.id === sessionId)
 
     if (!session) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Session not found",
-        },
-        { status: 404 },
-      )
+      return NextResponse.json({
+        success: false,
+        error: "Session not found",
+      })
     }
 
     return NextResponse.json({
@@ -38,13 +39,10 @@ export async function GET(request: NextRequest, { params }: { params: { sessionI
       session,
     })
   } catch (error) {
-    console.error("Error loading session:", error)
-    return NextResponse.json(
-      {
-        success: false,
-        error: "Failed to load session",
-      },
-      { status: 500 },
-    )
+    console.error("Session GET error:", error)
+    return NextResponse.json({
+      success: false,
+      error: error.message,
+    })
   }
 }

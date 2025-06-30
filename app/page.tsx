@@ -726,9 +726,44 @@ export default function Home() {
 
                       <div className="space-y-3">
                         <Label>Image Dimensions</Label>
+
+                        {/* Dimension Presets */}
+                        <div className="space-y-2">
+                          <Label className="text-sm font-medium">Quick Presets</Label>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                            {[
+                              { label: "200×200", width: 200, height: 200 },
+                              { label: "500×500", width: 500, height: 500 },
+                              { label: "1024×1024", width: 1024, height: 1024 },
+                              { label: "1280×1280", width: 1280, height: 1280 },
+                              { label: "1920×1080", width: 1920, height: 1080 },
+                              { label: "2048×2048", width: 2048, height: 2048 },
+                              { label: "4K (3840×2160)", width: 3840, height: 2160 },
+                              { label: "Clear", width: null, height: null },
+                            ].map((preset) => (
+                              <Button
+                                key={preset.label}
+                                size="sm"
+                                variant="outline"
+                                onClick={() => {
+                                  setFilterConfig((prev) => ({
+                                    ...prev,
+                                    minWidth: preset.width,
+                                    minHeight: preset.height,
+                                  }))
+                                }}
+                                className="text-xs"
+                              >
+                                {preset.label}
+                              </Button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Manual Input */}
                         <div className="grid grid-cols-2 gap-4">
                           <div className="space-y-2">
-                            <Label htmlFor="minWidth">Min Width</Label>
+                            <Label htmlFor="minWidth">Min Width (px)</Label>
                             <Input
                               id="minWidth"
                               type="number"
@@ -739,11 +774,11 @@ export default function Home() {
                                   minWidth: e.target.value ? Number.parseInt(e.target.value) : undefined,
                                 }))
                               }
-                              placeholder="pixels"
+                              placeholder="e.g. 1024"
                             />
                           </div>
                           <div className="space-y-2">
-                            <Label htmlFor="minHeight">Min Height</Label>
+                            <Label htmlFor="minHeight">Min Height (px)</Label>
                             <Input
                               id="minHeight"
                               type="number"
@@ -754,13 +789,14 @@ export default function Home() {
                                   minHeight: e.target.value ? Number.parseInt(e.target.value) : undefined,
                                 }))
                               }
-                              placeholder="pixels"
+                              placeholder="e.g. 1024"
                             />
                           </div>
                         </div>
+
                         <div className="grid grid-cols-2 gap-4">
                           <div className="space-y-2">
-                            <Label htmlFor="maxWidth">Max Width</Label>
+                            <Label htmlFor="maxWidth">Max Width (px)</Label>
                             <Input
                               id="maxWidth"
                               type="number"
@@ -771,11 +807,11 @@ export default function Home() {
                                   maxWidth: e.target.value ? Number.parseInt(e.target.value) : undefined,
                                 }))
                               }
-                              placeholder="pixels"
+                              placeholder="e.g. 4096"
                             />
                           </div>
                           <div className="space-y-2">
-                            <Label htmlFor="maxHeight">Max Height</Label>
+                            <Label htmlFor="maxHeight">Max Height (px)</Label>
                             <Input
                               id="maxHeight"
                               type="number"
@@ -786,10 +822,26 @@ export default function Home() {
                                   maxHeight: e.target.value ? Number.parseInt(e.target.value) : undefined,
                                 }))
                               }
-                              placeholder="pixels"
+                              placeholder="e.g. 4096"
                             />
                           </div>
                         </div>
+
+                        {/* Current Selection Display */}
+                        {(filterConfig.minWidth || filterConfig.minHeight) && (
+                          <div className="p-3 bg-muted rounded-lg">
+                            <div className="text-sm font-medium">Current Filter:</div>
+                            <div className="text-sm text-muted-foreground">
+                              Min: {filterConfig.minWidth || 0} × {filterConfig.minHeight || 0} pixels
+                              {(filterConfig.maxWidth || filterConfig.maxHeight) && (
+                                <span>
+                                  {" "}
+                                  | Max: {filterConfig.maxWidth || "∞"} × {filterConfig.maxHeight || "∞"} pixels
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="space-y-4">
@@ -1394,7 +1446,7 @@ export default function Home() {
                                   </Button>
                                 )}
                                 {session.results?.outputPath && (
-                                  <Button size="sm" variant="outline" asChild className="text-xs">
+                                  <Button size="sm" variant="outline" asChild className="text-xs bg-transparent">
                                     <a href={`/api/download?file=${encodeURIComponent(session.results.outputPath)}`}>
                                       Download
                                     </a>
@@ -1567,7 +1619,11 @@ export default function Home() {
 
               {isRunning && (
                 <>
-                  <Button onClick={isPaused ? resumeProcessing : pauseProcessing} variant="outline" className="w-full">
+                  <Button
+                    onClick={isPaused ? resumeProcessing : pauseProcessing}
+                    variant="outline"
+                    className="w-full bg-transparent"
+                  >
                     {isPaused ? "Resume" : "Pause"}
                   </Button>
                   <Button onClick={stopProcessing} variant="destructive" className="w-full">

@@ -355,6 +355,14 @@ async function moveImageUniversal(
     let localImagePath = ""
     const fileName = imageFileName || path.basename(imagePath)
 
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Starting image move operation:`)
+      console.log(`  - Source: ${imagePath}`)
+      console.log(`  - Destination base: ${userDefinedDestAbsPath}`)
+      console.log(`  - Folder structure: ${folderStructureOption}`)
+      console.log(`  - Image filename: ${fileName}`)
+    }
+
     // Handle remote images - download first
     if (isRemotePath(imagePath)) {
       if (verbose) {
@@ -381,6 +389,9 @@ async function moveImageUniversal(
       try {
         await fs.access(imagePath)
         localImagePath = imagePath
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Local image verified: ${localImagePath}`)
+        }
       } catch (error) {
         if (verbose) console.log(`[Worker ${workerId}] Local image file does not exist: ${imagePath}`)
         return false
@@ -397,21 +408,28 @@ async function moveImageUniversal(
 
       if (originalRemoteStructure) {
         // Use the original remote structure for path calculation
-        // originalRemoteStructure: { city: "charitra", year: "2006", month: "11" }
         relativePathFromRoot = path.join(
-          originalRemoteStructure.city,
-          originalRemoteStructure.year,
-          originalRemoteStructure.month,
+          originalRemoteStructure.city || "unknown",
+          originalRemoteStructure.year || "unknown",
+          originalRemoteStructure.month || "unknown",
           "media",
         )
       } else if (isRemotePath(imagePath)) {
         // For remote files, extract relative path from URL
-        const imageUrl = new URL(imagePath)
-        const rootUrl = new URL(originalRootDirForScan)
-        relativePathFromRoot = path.dirname(imageUrl.pathname.replace(rootUrl.pathname, ""))
+        try {
+          const imageUrl = new URL(imagePath)
+          const rootUrl = new URL(originalRootDirForScan)
+          relativePathFromRoot = path.dirname(imageUrl.pathname.replace(rootUrl.pathname, ""))
+        } catch (error) {
+          relativePathFromRoot = "remote_images"
+        }
       } else {
         // For local files, use standard path relative calculation
-        relativePathFromRoot = path.relative(originalRootDirForScan, path.dirname(imagePath))
+        try {
+          relativePathFromRoot = path.relative(originalRootDirForScan, path.dirname(imagePath))
+        } catch (error) {
+          relativePathFromRoot = "local_images"
+        }
       }
 
       finalDestDir = path.join(userDefinedDestAbsPath, relativePathFromRoot)
@@ -422,8 +440,31 @@ async function moveImageUniversal(
       finalDestPath = path.join(finalDestDir, fileName)
     }
 
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Destination paths:`)
+      console.log(`  - Final directory: ${finalDestDir}`)
+      console.log(`  - Final file path: ${finalDestPath}`)
+    }
+
     // Create destination directory
     await fs.mkdir(finalDestDir, { recursive: true })
+
+    // Check if destination file already exists
+    try {
+      await fs.access(finalDestPath)
+      // File exists, create unique name
+      const ext = path.extname(fileName)
+      const baseName = path.basename(fileName, ext)
+      const timestamp = Date.now()
+      const uniqueFileName = `${baseName}_${timestamp}${ext}`
+      finalDestPath = path.join(finalDestDir, uniqueFileName)
+
+      if (verbose) {
+        console.log(`[Worker ${workerId}] File exists, using unique name: ${uniqueFileName}`)
+      }
+    } catch {
+      // File doesn't exist, use original path
+    }
 
     // Copy the image to destination
     await fs.copyFile(localImagePath, finalDestPath)
@@ -450,6 +491,7 @@ async function moveImageUniversal(
   } catch (error) {
     if (verbose) {
       console.error(`[Worker ${workerId}] Error moving image ${imagePath}:`, error.message)
+      console.error(`[Worker ${workerId}] Stack trace:`, error.stack)
     }
     return false
   }
