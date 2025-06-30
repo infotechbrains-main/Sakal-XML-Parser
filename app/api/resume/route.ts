@@ -1,58 +1,94 @@
-import { NextResponse } from "next/server"
-import fs from "fs/promises"
-import path from "path"
+import { type NextRequest, NextResponse } from "next/server"
+import { PersistentHistory } from "@/lib/persistent-history"
+
+const history = new PersistentHistory()
 
 export async function GET() {
   try {
-    const statePath = path.join(process.cwd(), "processing_state.json")
+    const currentSession = await history.getCurrentSession()
+    const canResume = currentSession && (currentSession.status === "interrupted" || currentSession.status === "paused")
 
-    try {
-      const stateContent = await fs.readFile(statePath, "utf-8")
-      const state = JSON.parse(stateContent)
+    return NextResponse.json({
+      success: true,
+      canResume,
+      session: canResume ? currentSession : null,
+    })
+  } catch (error) {
+    console.error("Resume GET error:", error)
+    return NextResponse.json({
+      success: false,
+      canResume: false,
+      session: null,
+      error: error.message,
+    })
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json()
+    const { sessionId } = body
+
+    if (sessionId) {
+      // Resume specific session
+      const sessions = await history.getAllSessions()
+      const session = sessions.find((s) => s.id === sessionId)
+
+      if (!session) {
+        return NextResponse.json({
+          success: false,
+          error: "Session not found",
+        })
+      }
+
+      // Mark as current session for resume
+      await history.updateSession(sessionId, { status: "running" })
 
       return NextResponse.json({
-        hasState: true,
-        state,
-        message: "Previous processing state found",
+        success: true,
+        session,
+        message: "Session prepared for resume",
       })
-    } catch (error) {
+    } else {
+      // Resume current session
+      const currentSession = await history.getCurrentSession()
+
+      if (!currentSession) {
+        return NextResponse.json({
+          success: false,
+          error: "No session to resume",
+        })
+      }
+
+      await history.updateSession(currentSession.id, { status: "running" })
+
       return NextResponse.json({
-        hasState: false,
-        message: "No previous processing state found",
+        success: true,
+        session: currentSession,
+        message: "Session resumed",
       })
     }
   } catch (error) {
-    return NextResponse.json(
-      {
-        error: "Failed to check processing state",
-        details: error instanceof Error ? error.message : "Unknown error",
-      },
-      { status: 500 },
-    )
+    console.error("Resume POST error:", error)
+    return NextResponse.json({
+      success: false,
+      error: error.message,
+    })
   }
 }
 
 export async function DELETE() {
   try {
-    const statePath = path.join(process.cwd(), "processing_state.json")
-
-    try {
-      await fs.unlink(statePath)
-      return NextResponse.json({
-        message: "Processing state cleared successfully",
-      })
-    } catch (error) {
-      return NextResponse.json({
-        message: "No processing state to clear",
-      })
-    }
+    await history.clearCurrentSession()
+    return NextResponse.json({
+      success: true,
+      message: "Current session cleared",
+    })
   } catch (error) {
-    return NextResponse.json(
-      {
-        error: "Failed to clear processing state",
-        details: error instanceof Error ? error.message : "Unknown error",
-      },
-      { status: 500 },
-    )
+    console.error("Resume DELETE error:", error)
+    return NextResponse.json({
+      success: false,
+      error: error.message,
+    })
   }
 }
