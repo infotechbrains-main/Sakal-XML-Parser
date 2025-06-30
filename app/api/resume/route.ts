@@ -10,7 +10,7 @@ export async function GET() {
 
     return NextResponse.json({
       success: true,
-      canResume,
+      canResume: !!canResume,
       session: canResume ? currentSession : null,
     })
   } catch (error) {
@@ -18,7 +18,6 @@ export async function GET() {
     return NextResponse.json({
       success: false,
       canResume: false,
-      session: null,
       error: error.message,
     })
   }
@@ -41,8 +40,8 @@ export async function POST(request: NextRequest) {
         })
       }
 
-      // Mark as current session for resume
-      await history.updateSession(sessionId, { status: "running" })
+      // Set as current session
+      await history.setCurrentSession(session)
 
       return NextResponse.json({
         success: true,
@@ -60,12 +59,10 @@ export async function POST(request: NextRequest) {
         })
       }
 
-      await history.updateSession(currentSession.id, { status: "running" })
-
       return NextResponse.json({
         success: true,
         session: currentSession,
-        message: "Session resumed",
+        message: "Current session ready for resume",
       })
     }
   } catch (error) {
@@ -79,7 +76,8 @@ export async function POST(request: NextRequest) {
 
 export async function DELETE() {
   try {
-    await history.clearCurrentSession()
+    await history.setCurrentSession(null)
+
     return NextResponse.json({
       success: true,
       message: "Current session cleared",

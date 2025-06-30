@@ -19,17 +19,17 @@ export async function GET() {
       success: false,
       error: error.message,
       history: [],
-      storage: null,
     })
   }
 }
 
 export async function DELETE() {
   try {
-    await history.clearAllHistory()
+    const success = await history.clearHistory()
+
     return NextResponse.json({
-      success: true,
-      message: "History cleared successfully",
+      success,
+      message: success ? "History cleared successfully" : "Failed to clear history",
     })
   } catch (error) {
     console.error("History DELETE error:", error)
