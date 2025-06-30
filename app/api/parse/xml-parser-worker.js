@@ -56,6 +56,117 @@ function extractCData(element) {
   return ""
 }
 
+// Helper function to list directory contents for debugging
+async function listDirectoryContents(dirPath, verbose, workerId) {
+  try {
+    const files = await fs.readdir(dirPath)
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Directory contents of ${dirPath}:`)
+      files.forEach((file, index) => {
+        console.log(`[Worker ${workerId}]   ${index + 1}. "${file}"`)
+      })
+    }
+    return files
+  } catch (error) {
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Cannot read directory ${dirPath}: ${error.message}`)
+    }
+    return []
+  }
+}
+
+// Helper function to find image with fuzzy matching
+async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerId) {
+  try {
+    const files = await fs.readdir(dirPath)
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Looking for "${targetFileName}" in directory with ${files.length} files`)
+    }
+
+    // First try exact match (case sensitive)
+    const exactMatch = files.find((file) => file === targetFileName)
+    if (exactMatch) {
+      const fullPath = path.join(dirPath, exactMatch)
+      const stats = await fs.stat(fullPath)
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Found exact match: "${exactMatch}"`)
+      }
+      return {
+        exists: true,
+        size: stats.size,
+        path: fullPath,
+        matchType: "exact",
+      }
+    }
+
+    // Try case insensitive match
+    const caseInsensitiveMatch = files.find((file) => file.toLowerCase() === targetFileName.toLowerCase())
+    if (caseInsensitiveMatch) {
+      const fullPath = path.join(dirPath, caseInsensitiveMatch)
+      const stats = await fs.stat(fullPath)
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Found case-insensitive match: "${caseInsensitiveMatch}"`)
+      }
+      return {
+        exists: true,
+        size: stats.size,
+        path: fullPath,
+        matchType: "case-insensitive",
+      }
+    }
+
+    // Try partial match (contains the base name)
+    const baseName = path.basename(targetFileName, path.extname(targetFileName))
+    const partialMatch = files.find((file) => {
+      const fileBaseName = path.basename(file, path.extname(file))
+      return fileBaseName.includes(baseName) || baseName.includes(fileBaseName)
+    })
+
+    if (partialMatch) {
+      const fullPath = path.join(dirPath, partialMatch)
+      const stats = await fs.stat(fullPath)
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Found partial match: "${partialMatch}" for "${targetFileName}"`)
+      }
+      return {
+        exists: true,
+        size: stats.size,
+        path: fullPath,
+        matchType: "partial",
+      }
+    }
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] No match found for "${targetFileName}" in ${dirPath}`)
+      console.log(`[Worker ${workerId}] Available files:`)
+      files.slice(0, 10).forEach((file, index) => {
+        console.log(`[Worker ${workerId}]   ${index + 1}. "${file}"`)
+      })
+      if (files.length > 10) {
+        console.log(`[Worker ${workerId}]   ... and ${files.length - 10} more files`)
+      }
+    }
+
+    return {
+      exists: false,
+      size: 0,
+      path: path.join(dirPath, targetFileName),
+      matchType: "none",
+    }
+  } catch (error) {
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Error searching in directory ${dirPath}: ${error.message}`)
+    }
+    return {
+      exists: false,
+      size: 0,
+      path: path.join(dirPath, targetFileName),
+      matchType: "error",
+    }
+  }
+}
+
 // Download remote image file
 async function downloadRemoteImage(imageUrl, tempDir, verbose, workerId) {
   try {
@@ -89,12 +200,15 @@ async function downloadRemoteImage(imageUrl, tempDir, verbose, workerId) {
   }
 }
 
-// Check if local image exists and get its size - IMPROVED VERSION
+// Check if local image exists and get its size - ENHANCED VERSION WITH FUZZY MATCHING
 async function checkLocalImage(imagePath, verbose, workerId) {
   try {
     if (verbose) {
       console.log(`[Worker ${workerId}] Checking local image: ${imagePath}`)
     }
+
+    const fileName = path.basename(imagePath)
+    const dirPath = path.dirname(imagePath)
 
     // First try the exact path
     try {
@@ -116,79 +230,37 @@ async function checkLocalImage(imagePath, verbose, workerId) {
       }
     }
 
-    // Try alternative paths - sometimes the structure might be different
-    const fileName = path.basename(imagePath)
-    const parentDir = path.dirname(imagePath)
-
-    // Try parent directory
-    const parentPath = path.join(path.dirname(parentDir), fileName)
-    try {
-      await fs.access(parentPath)
-      const stats = await fs.stat(parentPath)
-
-      if (verbose) {
-        console.log(
-          `[Worker ${workerId}] Local image found in parent directory: ${parentPath}, size: ${stats.size} bytes`,
-        )
-      }
-
-      return {
-        exists: true,
-        size: stats.size,
-        path: parentPath,
-      }
-    } catch (parentError) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Image not found in parent directory: ${parentPath}`)
-      }
+    // Try fuzzy matching in the expected directory
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Trying fuzzy match in directory: ${dirPath}`)
     }
 
-    // Try looking in the same directory as the XML file
-    const xmlDir = path.dirname(workerData.xmlFilePath || "")
-    const xmlDirImagePath = path.join(xmlDir, fileName)
-    try {
-      await fs.access(xmlDirImagePath)
-      const stats = await fs.stat(xmlDirImagePath)
-
-      if (verbose) {
-        console.log(
-          `[Worker ${workerId}] Local image found in XML directory: ${xmlDirImagePath}, size: ${stats.size} bytes`,
-        )
-      }
-
-      return {
-        exists: true,
-        size: stats.size,
-        path: xmlDirImagePath,
-      }
-    } catch (xmlDirError) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Image not found in XML directory: ${xmlDirImagePath}`)
-      }
+    const fuzzyResult = await findImageWithFuzzyMatch(dirPath, fileName, verbose, workerId)
+    if (fuzzyResult.exists) {
+      return fuzzyResult
     }
 
-    // Try looking for images directory at the same level as processed
-    const processedDir = path.dirname(workerData.xmlFilePath || "")
-    const imagesDir = path.join(path.dirname(processedDir), "images")
-    const imagesDirPath = path.join(imagesDir, fileName)
-    try {
-      await fs.access(imagesDirPath)
-      const stats = await fs.stat(imagesDirPath)
+    // Try alternative directories with fuzzy matching
+    const alternativeDirs = [
+      path.join(path.dirname(dirPath), "media"),
+      path.join(path.dirname(dirPath), "images"),
+      path.dirname(dirPath),
+      path.dirname(workerData.xmlFilePath || ""),
+    ]
+
+    for (const altDir of alternativeDirs) {
+      if (altDir === dirPath) continue // Skip if same as already tried
 
       if (verbose) {
-        console.log(
-          `[Worker ${workerId}] Local image found in images directory: ${imagesDirPath}, size: ${stats.size} bytes`,
-        )
+        console.log(`[Worker ${workerId}] Trying alternative directory: ${altDir}`)
       }
 
-      return {
-        exists: true,
-        size: stats.size,
-        path: imagesDirPath,
-      }
-    } catch (imagesDirError) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Image not found in images directory: ${imagesDirPath}`)
+      const altResult = await findImageWithFuzzyMatch(altDir, fileName, verbose, workerId)
+      if (altResult.exists) {
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Found image in alternative directory: ${altResult.path}`)
+        }
+        return altResult
       }
     }
 
@@ -933,6 +1005,16 @@ async function processXmlFileInWorker(
         imageExists = imageInfo.exists
         actualFileSize = imageInfo.size
         actualImagePath = imageInfo.path // This is the actual found path
+
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Image check result:`)
+          console.log(`  - Exists: ${imageExists}`)
+          console.log(`  - Size: ${actualFileSize} bytes`)
+          console.log(`  - Found at: ${actualImagePath}`)
+          if (imageInfo.matchType) {
+            console.log(`  - Match type: ${imageInfo.matchType}`)
+          }
+        }
       }
     }
 
