@@ -10,6 +10,7 @@
     "start": "next start"
   },
   "dependencies": {
+    "@radix-ui/react-checkbox": "^1.3.2",
     "@radix-ui/react-label": "latest",
     "@radix-ui/react-progress": "latest",
     "@radix-ui/react-radio-group": "latest",
@@ -34,7 +35,6 @@
     "sonner": "latest",
     "stream": "latest",
     "tailwind-merge": "^2.5.5",
-    "worker_threads": "latest",
     "xml2js": "latest"
   },
   "devDependencies": {
