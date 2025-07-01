@@ -2,6 +2,7 @@ const { parentPort, workerData } = require("worker_threads")
 const fs = require("fs/promises")
 const path = require("path")
 const { parseStringPromise } = require("xml2js")
+const fetch = require("node-fetch") // Ensure fetch is imported
 
 // Helper function to check if a path is remote
 function isRemotePath(filePath) {
@@ -63,6 +64,73 @@ function isImageFile(fileName) {
   return imageExtensions.includes(ext)
 }
 
+// Helper function to extract base identifier from filename
+function extractBaseIdentifier(fileName) {
+  // Remove extension
+  const baseName = path.basename(fileName, path.extname(fileName))
+
+  // Extract date and main ID parts
+  // Pattern: 2025-05-16_PNE25V14121_MED_3_Org or 2025-05-16_ABD25J42405_MED_7_Org_pr
+  const parts = baseName.split("_")
+
+  if (parts.length >= 4) {
+    const date = parts[0] // 2025-05-16
+    const id = parts[1] // PNE25V14121 or ABD25J42405
+    const med = parts[2] // MED
+    const num = parts[3] // 3 or 7
+
+    return {
+      date,
+      id,
+      med,
+      num,
+      fullBase: `${date}_${id}_${med}_${num}`,
+      dateId: `${date}_${id}`,
+      medNum: `${med}_${num}`,
+    }
+  }
+
+  return {
+    date: "",
+    id: "",
+    med: "",
+    num: "",
+    fullBase: baseName,
+    dateId: "",
+    medNum: "",
+  }
+}
+
+// Helper function to check if two filenames are related
+function areFilenamesRelated(xmlFileName, imageFileName) {
+  const xmlBase = extractBaseIdentifier(xmlFileName)
+  const imgBase = extractBaseIdentifier(imageFileName)
+
+  // Check if they share the same date
+  if (xmlBase.date && imgBase.date && xmlBase.date === imgBase.date) {
+    // Check if they have similar structure
+    if (xmlBase.med === imgBase.med) {
+      return {
+        related: true,
+        confidence: "high",
+        reason: `Same date (${xmlBase.date}) and media type (${xmlBase.med})`,
+      }
+    }
+
+    return {
+      related: true,
+      confidence: "medium",
+      reason: `Same date (${xmlBase.date})`,
+    }
+  }
+
+  return {
+    related: false,
+    confidence: "none",
+    reason: "No matching patterns found",
+  }
+}
+
 // Helper function to list directory contents for debugging
 async function listDirectoryContents(dirPath, verbose, workerId) {
   try {
@@ -82,8 +150,8 @@ async function listDirectoryContents(dirPath, verbose, workerId) {
   }
 }
 
-// Helper function to find image with fuzzy matching - IMPROVED TO ONLY MATCH IMAGES
-async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerId) {
+// Helper function to find image with enhanced matching logic
+async function findImageWithEnhancedMatch(dirPath, targetFileName, verbose, workerId) {
   try {
     const files = await fs.readdir(dirPath)
 
@@ -98,7 +166,7 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
       console.log(`[Worker ${workerId}] Found ${imageFiles.length} image files out of ${files.length} total files`)
     }
 
-    // First try exact match (case sensitive) - only among image files
+    // First try exact match (case sensitive)
     const exactMatch = imageFiles.find((file) => file === targetFileName)
     if (exactMatch) {
       const fullPath = path.join(dirPath, exactMatch)
@@ -111,10 +179,11 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
         size: stats.size,
         path: fullPath,
         matchType: "exact",
+        fileName: exactMatch,
       }
     }
 
-    // Try case insensitive match - only among image files
+    // Try case insensitive match
     const caseInsensitiveMatch = imageFiles.find((file) => file.toLowerCase() === targetFileName.toLowerCase())
     if (caseInsensitiveMatch) {
       const fullPath = path.join(dirPath, caseInsensitiveMatch)
@@ -127,14 +196,65 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
         size: stats.size,
         path: fullPath,
         matchType: "case-insensitive",
+        fileName: caseInsensitiveMatch,
       }
     }
 
-    // Try partial match (contains the base name) - only among image files
+    // Try enhanced pattern matching based on filename structure
+    const xmlBaseName = path.basename(targetFileName, path.extname(targetFileName))
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Trying enhanced pattern matching for: "${xmlBaseName}"`)
+    }
+
+    // Look for related files
+    const relatedFiles = imageFiles
+      .map((file) => {
+        const relation = areFilenamesRelated(targetFileName, file)
+        return {
+          file,
+          ...relation,
+        }
+      })
+      .filter((item) => item.related)
+
+    if (verbose && relatedFiles.length > 0) {
+      console.log(`[Worker ${workerId}] Found ${relatedFiles.length} potentially related files:`)
+      relatedFiles.forEach((item, index) => {
+        console.log(`[Worker ${workerId}]   ${index + 1}. "${item.file}" (${item.confidence}: ${item.reason})`)
+      })
+    }
+
+    // Pick the best match (highest confidence first)
+    const bestMatch = relatedFiles.sort((a, b) => {
+      const confidenceOrder = { high: 3, medium: 2, low: 1, none: 0 }
+      return confidenceOrder[b.confidence] - confidenceOrder[a.confidence]
+    })[0]
+
+    if (bestMatch) {
+      const fullPath = path.join(dirPath, bestMatch.file)
+      const stats = await fs.stat(fullPath)
+      if (verbose) {
+        console.log(
+          `[Worker ${workerId}] Found enhanced match: "${bestMatch.file}" (${bestMatch.confidence}: ${bestMatch.reason})`,
+        )
+      }
+      return {
+        exists: true,
+        size: stats.size,
+        path: fullPath,
+        matchType: "enhanced-pattern",
+        fileName: bestMatch.file,
+        confidence: bestMatch.confidence,
+        reason: bestMatch.reason,
+      }
+    }
+
+    // Try basic partial match as fallback
     const baseName = path.basename(targetFileName, path.extname(targetFileName))
     const partialMatch = imageFiles.find((file) => {
       const fileBaseName = path.basename(file, path.extname(file))
-      return fileBaseName.includes(baseName) || baseName.includes(fileBaseName)
+      return fileBaseName.includes(baseName.substring(0, 10)) || baseName.includes(fileBaseName.substring(0, 10))
     })
 
     if (partialMatch) {
@@ -148,6 +268,7 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
         size: stats.size,
         path: fullPath,
         matchType: "partial",
+        fileName: partialMatch,
       }
     }
 
@@ -167,6 +288,7 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
       size: 0,
       path: path.join(dirPath, targetFileName),
       matchType: "none",
+      fileName: targetFileName,
     }
   } catch (error) {
     if (verbose) {
@@ -177,6 +299,7 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
       size: 0,
       path: path.join(dirPath, targetFileName),
       matchType: "error",
+      fileName: targetFileName,
     }
   }
 }
@@ -214,7 +337,7 @@ async function downloadRemoteImage(imageUrl, tempDir, verbose, workerId) {
   }
 }
 
-// Check if local image exists and get its size - ENHANCED VERSION WITH FUZZY MATCHING
+// Check if local image exists and get its size - ENHANCED VERSION
 async function checkLocalImage(imagePath, verbose, workerId) {
   try {
     if (verbose) {
@@ -237,6 +360,8 @@ async function checkLocalImage(imagePath, verbose, workerId) {
         exists: true,
         size: stats.size,
         path: imagePath,
+        matchType: "exact",
+        fileName: fileName,
       }
     } catch (exactPathError) {
       if (verbose) {
@@ -244,17 +369,17 @@ async function checkLocalImage(imagePath, verbose, workerId) {
       }
     }
 
-    // Try fuzzy matching in the expected directory
+    // Try enhanced matching in the expected directory
     if (verbose) {
-      console.log(`[Worker ${workerId}] Trying fuzzy match in directory: ${dirPath}`)
+      console.log(`[Worker ${workerId}] Trying enhanced match in directory: ${dirPath}`)
     }
 
-    const fuzzyResult = await findImageWithFuzzyMatch(dirPath, fileName, verbose, workerId)
-    if (fuzzyResult.exists) {
-      return fuzzyResult
+    const enhancedResult = await findImageWithEnhancedMatch(dirPath, fileName, verbose, workerId)
+    if (enhancedResult.exists) {
+      return enhancedResult
     }
 
-    // Try alternative directories with fuzzy matching
+    // Try alternative directories with enhanced matching
     const alternativeDirs = [
       path.join(path.dirname(dirPath), "media"),
       path.join(path.dirname(dirPath), "images"),
@@ -269,7 +394,7 @@ async function checkLocalImage(imagePath, verbose, workerId) {
         console.log(`[Worker ${workerId}] Trying alternative directory: ${altDir}`)
       }
 
-      const altResult = await findImageWithFuzzyMatch(altDir, fileName, verbose, workerId)
+      const altResult = await findImageWithEnhancedMatch(altDir, fileName, verbose, workerId)
       if (altResult.exists) {
         if (verbose) {
           console.log(`[Worker ${workerId}] Found image in alternative directory: ${altResult.path}`)
@@ -286,6 +411,8 @@ async function checkLocalImage(imagePath, verbose, workerId) {
       exists: false,
       size: 0,
       path: imagePath,
+      matchType: "none",
+      fileName: fileName,
     }
   } catch (error) {
     if (verbose) {
@@ -295,6 +422,8 @@ async function checkLocalImage(imagePath, verbose, workerId) {
       exists: false,
       size: 0,
       path: imagePath,
+      matchType: "error",
+      fileName: path.basename(imagePath),
     }
   }
 }
@@ -315,6 +444,8 @@ async function checkRemoteImage(imageUrl, verbose, workerId) {
         exists: true,
         size: size,
         path: imageUrl,
+        matchType: "exact",
+        fileName: path.basename(new URL(imageUrl).pathname),
       }
     } else {
       if (verbose) {
@@ -324,6 +455,8 @@ async function checkRemoteImage(imageUrl, verbose, workerId) {
         exists: false,
         size: 0,
         path: imageUrl,
+        matchType: "none",
+        fileName: path.basename(new URL(imageUrl).pathname),
       }
     }
   } catch (error) {
@@ -334,6 +467,8 @@ async function checkRemoteImage(imageUrl, verbose, workerId) {
       exists: false,
       size: 0,
       path: imageUrl,
+      matchType: "error",
+      fileName: "",
     }
   }
 }
@@ -347,12 +482,27 @@ async function checkImageUniversal(imagePath, verbose, workerId) {
   }
 }
 
-// Check if image passes filter criteria
+// Check if image passes filter criteria - ENHANCED WITH BETTER LOGGING
 function passesFilter(record, filterConfig) {
-  if (!filterConfig?.enabled) return true
+  if (!filterConfig?.enabled) {
+    if (workerData.verbose) {
+      console.log(`[Worker ${workerData.workerId}] Filters disabled - image ${record.imageHref} passes by default`)
+    }
+    return true
+  }
 
-  const applyTextFilter = (fieldValue, filter) => {
-    if (!filter || !filter.operator) return true
+  if (workerData.verbose) {
+    console.log(`[Worker ${workerData.workerId}] Checking filters for image: ${record.imageHref}`)
+    console.log(`[Worker ${workerData.workerId}] Filter config enabled: ${filterConfig.enabled}`)
+  }
+
+  const applyTextFilter = (fieldValue, filter, fieldName) => {
+    if (!filter || !filter.operator) {
+      if (workerData.verbose) {
+        console.log(`[Worker ${workerData.workerId}] No ${fieldName} filter configured`)
+      }
+      return true
+    }
 
     const val = String(fieldValue || "")
       .toLowerCase()
@@ -361,26 +511,45 @@ function passesFilter(record, filterConfig) {
       .toLowerCase()
       .trim()
 
+    if (workerData.verbose) {
+      console.log(`[Worker ${workerData.workerId}] ${fieldName} filter: "${val}" ${filter.operator} "${filterVal}"`)
+    }
+
+    let result = true
     switch (filter.operator) {
       case "like":
-        return val.includes(filterVal)
+        result = val.includes(filterVal)
+        break
       case "notLike":
-        return !val.includes(filterVal)
+        result = !val.includes(filterVal)
+        break
       case "equals":
-        return val === filterVal
+        result = val === filterVal
+        break
       case "notEquals":
-        return val !== filterVal
+        result = val !== filterVal
+        break
       case "startsWith":
-        return val.startsWith(filterVal)
+        result = val.startsWith(filterVal)
+        break
       case "endsWith":
-        return val.endsWith(filterVal)
+        result = val.endsWith(filterVal)
+        break
       case "notBlank":
-        return val !== ""
+        result = val !== ""
+        break
       case "isBlank":
-        return val === ""
+        result = val === ""
+        break
       default:
-        return true
+        result = true
     }
+
+    if (workerData.verbose) {
+      console.log(`[Worker ${workerData.workerId}] ${fieldName} filter result: ${result}`)
+    }
+
+    return result
   }
 
   // File type filter - check first to avoid unnecessary processing
@@ -391,6 +560,12 @@ function passesFilter(record, filterConfig) {
       const isAllowedType = filterConfig.allowedFileTypes.some(
         (allowedType) => allowedType.toLowerCase() === fileExtension,
       )
+
+      if (workerData.verbose) {
+        console.log(
+          `[Worker ${workerData.workerId}] File type filter: .${fileExtension} in [${filterConfig.allowedFileTypes.join(", ")}] = ${isAllowedType}`,
+        )
+      }
 
       if (!isAllowedType) {
         if (workerData.verbose) {
@@ -411,6 +586,11 @@ function passesFilter(record, filterConfig) {
   // Image dimension filters
   const imageWidth = Number.parseInt(record.imageWidth) || 0
   const imageHeight = Number.parseInt(record.imageHeight) || 0
+
+  if (workerData.verbose) {
+    console.log(`[Worker ${workerData.workerId}] Image dimensions: ${imageWidth}x${imageHeight}`)
+  }
+
   if (filterConfig.minWidth && imageWidth < filterConfig.minWidth) {
     if (workerData.verbose) {
       console.log(
@@ -478,8 +658,8 @@ function passesFilter(record, filterConfig) {
     }
   }
 
-  // Text filters
-  if (!applyTextFilter(record.creditline, filterConfig.creditLine)) {
+  // Text filters with enhanced logging
+  if (!applyTextFilter(record.creditline, filterConfig.creditLine, "creditLine")) {
     if (workerData.verbose) {
       console.log(
         `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: creditLine filter failed. Value: "${record.creditline}", Filter: ${JSON.stringify(filterConfig.creditLine)}`,
@@ -487,25 +667,25 @@ function passesFilter(record, filterConfig) {
     }
     return false
   }
-  if (!applyTextFilter(record.copyrightLine, filterConfig.copyright)) {
+  if (!applyTextFilter(record.copyrightLine, filterConfig.copyright, "copyright")) {
     if (workerData.verbose) {
       console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: copyright filter failed`)
     }
     return false
   }
-  if (!applyTextFilter(record.usageType, filterConfig.usageType)) {
+  if (!applyTextFilter(record.usageType, filterConfig.usageType, "usageType")) {
     if (workerData.verbose) {
       console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: usageType filter failed`)
     }
     return false
   }
-  if (!applyTextFilter(record.rightsHolder, filterConfig.rightsHolder)) {
+  if (!applyTextFilter(record.rightsHolder, filterConfig.rightsHolder, "rightsHolder")) {
     if (workerData.verbose) {
       console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: rightsHolder filter failed`)
     }
     return false
   }
-  if (!applyTextFilter(record.location, filterConfig.location)) {
+  if (!applyTextFilter(record.location, filterConfig.location, "location")) {
     if (workerData.verbose) {
       console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: location filter failed`)
     }
@@ -518,7 +698,7 @@ function passesFilter(record, filterConfig) {
   return true
 }
 
-// Universal image mover - handles both local and remote images - IMPROVED VERSION
+// Universal image mover - handles both local and remote images
 async function moveImageUniversal(
   imagePath,
   userDefinedDestAbsPath,
@@ -633,11 +813,11 @@ async function moveImageUniversal(
       }
 
       finalDestDir = path.join(userDefinedDestAbsPath, relativePathFromRoot)
-      finalDestPath = path.join(finalDestDir, fileName)
+      finalDestPath = path.join(finalDestDir, path.basename(sourceImagePath))
     } else {
       // Flat structure - all images in one folder
       finalDestDir = userDefinedDestAbsPath
-      finalDestPath = path.join(finalDestDir, fileName)
+      finalDestPath = path.join(finalDestDir, path.basename(sourceImagePath))
     }
 
     if (verbose) {
@@ -653,8 +833,8 @@ async function moveImageUniversal(
     try {
       await fs.access(finalDestPath)
       // File exists, create unique name
-      const ext = path.extname(fileName)
-      const baseName = path.basename(fileName, ext)
+      const ext = path.extname(finalDestPath)
+      const baseName = path.basename(finalDestPath, ext)
       const timestamp = Date.now()
       const uniqueFileName = `${baseName}_${timestamp}${ext}`
       finalDestPath = path.join(finalDestDir, uniqueFileName)
@@ -750,7 +930,7 @@ function constructRemoteImagePath(originalRemoteXmlUrl, imageHref, verbose, work
   }
 }
 
-// Construct image path based on XML path (works for both local and remote) - IMPROVED VERSION
+// Construct image path based on XML path (works for both local and remote)
 function constructImagePath(xmlFilePath, imageHref, isRemote, originalRemoteXmlUrl, verbose, workerId) {
   if (!imageHref) return ""
 
@@ -1020,6 +1200,7 @@ async function processXmlFileInWorker(
     let imageExists = false
     let actualFileSize = 0
     let actualImagePath = ""
+    let matchInfo = {}
 
     if (imageHref) {
       // Construct image path (local or remote)
@@ -1035,14 +1216,22 @@ async function processXmlFileInWorker(
         imageExists = imageInfo.exists
         actualFileSize = imageInfo.size
         actualImagePath = imageInfo.path // This is the actual found path
+        matchInfo = {
+          matchType: imageInfo.matchType,
+          fileName: imageInfo.fileName,
+          confidence: imageInfo.confidence,
+          reason: imageInfo.reason,
+        }
 
         if (verbose) {
           console.log(`[Worker ${workerId}] Image check result:`)
           console.log(`  - Exists: ${imageExists}`)
           console.log(`  - Size: ${actualFileSize} bytes`)
           console.log(`  - Found at: ${actualImagePath}`)
-          if (imageInfo.matchType) {
-            console.log(`  - Match type: ${imageInfo.matchType}`)
+          console.log(`  - Match type: ${imageInfo.matchType}`)
+          if (imageInfo.confidence) {
+            console.log(`  - Confidence: ${imageInfo.confidence}`)
+            console.log(`  - Reason: ${imageInfo.reason}`)
           }
         }
       }
@@ -1121,6 +1310,10 @@ async function processXmlFileInWorker(
       (actualImagePath || imagePath)
     ) {
       try {
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Attempting to move image: ${actualImagePath || imagePath}`)
+        }
+
         moved = await moveImageUniversal(
           actualImagePath || imagePath, // Use the actual found path
           filterConfig.moveDestinationPath,
@@ -1128,7 +1321,7 @@ async function processXmlFileInWorker(
           originalRootDir,
           verbose,
           workerId,
-          imageHref,
+          matchInfo.fileName || imageHref,
           remoteStructure,
         )
 
@@ -1140,6 +1333,13 @@ async function processXmlFileInWorker(
           console.error(`[Worker ${workerId}] Error during image move:`, error.message)
         }
       }
+    } else if (verbose) {
+      console.log(`[Worker ${workerId}] Image move skipped:`)
+      console.log(`  - Filters enabled: ${filterConfig?.enabled}`)
+      console.log(`  - Passed filters: ${passed}`)
+      console.log(`  - Move images enabled: ${filterConfig?.moveImages}`)
+      console.log(`  - Destination path: ${filterConfig?.moveDestinationPath}`)
+      console.log(`  - Image exists: ${imageExists}`)
     }
 
     if (verbose) {
