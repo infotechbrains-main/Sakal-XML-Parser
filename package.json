@@ -27,6 +27,7 @@
     "glob": "^11.0.0",
     "lucide-react": "^0.454.0",
     "next": "15.2.4",
+    "node-fetch": "latest",
     "os": "latest",
     "path": "latest",
     "react": "^19",
