@@ -12,7 +12,6 @@ import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Toaster } from "sonner"
 
@@ -99,6 +98,23 @@ interface ProcessingSession {
   }
 }
 
+interface ProcessingResults {
+  stats: {
+    totalFiles: number
+    processedFiles: number
+    successfulFiles: number
+    errorFiles: number
+    recordsWritten: number
+    filteredFiles: number
+    movedFiles: number
+  }
+  outputFile: string
+  errors: string[]
+  processingTime?: string
+  startTime?: string
+  endTime?: string
+}
+
 export default function Home() {
   // Basic configuration
   const [rootDir, setRootDir] = useState("")
@@ -152,6 +168,9 @@ export default function Home() {
   // Results
   const [downloadURL, setDownloadURL] = useState<string | null>(null)
   const [jobId, setJobId] = useState<string | null>(null)
+  const [processingResults, setProcessingResults] = useState<ProcessingResults | null>(null)
+  const [processingStartTime, setProcessingStartTime] = useState<string | null>(null)
+  const [processingEndTime, setProcessingEndTime] = useState<string | null>(null)
 
   // History - Initialize as empty array
   const [history, setHistory] = useState<ProcessingSession[]>([])
@@ -159,7 +178,11 @@ export default function Home() {
   const [resumeSession, setResumeSession] = useState<ProcessingSession | null>(null)
   const [showResumeDialog, setShowResumeDialog] = useState(false)
 
+  // Tab management
+  const [activeTab, setActiveTab] = useState("basic")
+
   const logsEndRef = useRef<HTMLDivElement>(null)
+  const errorLogsEndRef = useRef<HTMLDivElement>(null)
   const ws = useRef<WebSocket | null>(null)
 
   // Update filterConfig.enabled when filterEnabled changes
@@ -215,6 +238,27 @@ export default function Home() {
     loadHistory()
     checkResumeStatus()
   }, [])
+
+  // Auto-scroll logs to bottom
+  useEffect(() => {
+    if (logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: "smooth" })
+    }
+  }, [messages])
+
+  // Auto-scroll error logs to bottom
+  useEffect(() => {
+    if (errorLogsEndRef.current) {
+      errorLogsEndRef.current.scrollIntoView({ behavior: "smooth" })
+    }
+  }, [errorMessages])
+
+  // Auto-switch tabs based on processing state
+  useEffect(() => {
+    if (isRunning && activeTab !== "logs") {
+      setActiveTab("logs")
+    }
+  }, [isRunning])
 
   const loadHistory = async () => {
     try {
@@ -280,25 +324,6 @@ export default function Home() {
     }
   }
 
-  // Auto-scroll logs
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }, [messages, errorMessages])
-
-  // Poll for job status and watcher status
-  // useEffect(() => {
-  //   const interval = setInterval(() => {
-  //     if (isProcessing && currentJob) {
-  //       checkJobStatus(currentJob.id)
-  //     }
-  //     if (watcherStatus?.isWatching) {
-  //       checkWatcherStatus()
-  //     }
-  //   }, 2000)
-
-  //   return () => clearInterval(interval)
-  // }, [isProcessing, currentJob, watcherStatus?.isWatching])
-
   const addMessage = (type: string, message: any) => {
     const newMessage: Message = {
       type,
@@ -335,6 +360,25 @@ export default function Home() {
       case "chunk_complete":
         addMessage("chunk", `Completed chunk ${data.chunkNumber}/${data.totalChunks}`)
         break
+      case "complete":
+        // Handle processing completion
+        setProcessingEndTime(new Date().toISOString())
+        const processingTime = processingStartTime
+          ? formatDuration(processingStartTime, new Date().toISOString())
+          : "Unknown"
+
+        setProcessingResults({
+          stats: data.stats || stats,
+          outputFile: data.outputFile || outputFile,
+          errors: data.errors || [],
+          processingTime,
+          startTime: processingStartTime,
+          endTime: new Date().toISOString(),
+        })
+
+        addMessage("success", "Processing completed successfully!")
+        setActiveTab("results") // Auto-switch to results tab
+        break
       case "download":
         setDownloadURL(data.url)
         addMessage("success", "Processing complete! Download ready.")
@@ -366,40 +410,24 @@ export default function Home() {
     }))
   }
 
-  // const loadHistory = async () => {
-  //   try {
-  //     const response = await fetch("/api/history")
-  //     if (response.ok) {
-  //       const data = await response.json()
-  //       // Ensure data.history is an array
-  //       if (Array.isArray(data.history)) {
-  //         setHistory(data.history)
-  //       } else {
-  //         console.warn("History data is not an array:", data)
-  //         setHistory([])
-  //       }
-  //     } else {
-  //       console.error("Failed to load history")
-  //       setHistory([])
-  //     }
-  //   } catch (error) {
-  //     console.error("Error loading history:", error)
-  //     setHistory([])
-  //   }
-  // }
-
   const startProcessing = async () => {
     setIsRunning(true)
     setMessages([])
     setErrorMessages([])
     setProgress(0)
     setDownloadURL(null)
+    setProcessingResults(null)
+    setProcessingStartTime(new Date().toISOString())
+    setProcessingEndTime(null)
     setStats({
       totalFiles: 0,
       processedFiles: 0,
       successCount: 0,
       errorCount: 0,
     })
+
+    // Auto-switch to logs tab
+    setActiveTab("logs")
 
     try {
       // Prepare the final filter config
@@ -450,6 +478,23 @@ export default function Home() {
         if (data.downloadURL) {
           setDownloadURL(data.downloadURL)
         }
+
+        // Set results for regular mode
+        setProcessingEndTime(new Date().toISOString())
+        const processingTime = processingStartTime
+          ? formatDuration(processingStartTime, new Date().toISOString())
+          : "Unknown"
+
+        setProcessingResults({
+          stats: data.stats || stats,
+          outputFile: data.outputFile || outputFile,
+          errors: data.errors || [],
+          processingTime,
+          startTime: processingStartTime,
+          endTime: new Date().toISOString(),
+        })
+
+        setActiveTab("results") // Auto-switch to results tab
       } else {
         // Handle streaming response
         const reader = response.body?.getReader()
@@ -497,6 +542,7 @@ export default function Home() {
       }
     } catch (error: any) {
       addMessage("error", `Error: ${error.message}`)
+      setActiveTab("logs") // Show logs on error
     } finally {
       setIsRunning(false)
     }
@@ -532,111 +578,6 @@ export default function Home() {
       addMessage("error", "Failed to stop processing")
     }
   }
-
-  // const pauseProcessing = async () => {
-  //   if (!currentJob) return
-
-  //   try {
-  //     const response = await fetch("/api/parse/pause", {
-  //       method: "POST",
-  //       headers: { "Content-Type": "application/json" },
-  //       body: JSON.stringify({ jobId: currentJob.id }),
-  //     })
-
-  //     const data = await response.json()
-  //     if (data.success) {
-  //       setIsPaused(true)
-  //       addLog("⏸️ Processing paused")
-  //     } else {
-  //       addLog(`❌ Failed to pause: ${data.error}`)
-  //     }
-  //   } catch (error) {
-  //     addLog(`❌ Error pausing: ${error}`)
-  //   }
-  // }
-
-  // const resumeProcessing = async () => {
-  //   try {
-  //     const response = await fetch("/api/resume", {
-  //       method: "POST",
-  //       headers: { "Content-Type": "application/json" },
-  //       body: JSON.stringify({
-  //         sessionId: currentJob?.id,
-  //         filterConfig,
-  //       }),
-  //     })
-
-  //     const data = await response.json()
-  //     if (data.success) {
-  //       setIsPaused(false)
-  //       addLog("▶️ Processing resumed")
-  //     } else {
-  //       addLog(`❌ Failed to resume: ${data.error}`)
-  //     }
-  //   } catch (error) {
-  //     addLog(`❌ Error resuming: ${error}`)
-  //   }
-  // }
-
-  // const checkJobStatus = async (jobId: string) => {
-  //   try {
-  //     const response = await fetch(`/api/progress/${jobId}`)
-  //     const data = await response.json()
-
-  //     if (data.success && data.progress) {
-  //       setCurrentJob((prev) =>
-  //         prev
-  //           ? {
-  //               ...prev,
-  //               progress: data.progress.percentage,
-  //               processedFiles: data.progress.processedFiles,
-  //               filteredFiles: data.progress.filteredFiles,
-  //               movedFiles: data.progress.movedFiles,
-  //               status: data.progress.status,
-  //             }
-  //           : null,
-  //       )
-
-  //       if (data.progress.status === "completed") {
-  //         setIsProcessing(false)
-  //         setIsPaused(false)
-  //         addLog("✅ Processing completed successfully!")
-  //         loadHistory()
-  //       } else if (data.progress.status === "error") {
-  //         setIsProcessing(false)
-  //         setIsPaused(false)
-  //         addLog("❌ Processing failed with errors")
-  //         loadHistory()
-  //       }
-  //     }
-  //   } catch (error) {
-  //     console.error("Error checking job status:", error)
-  //   }
-  // }
-
-  // const downloadResults = async () => {
-  //   if (!currentJob) return
-
-  //   try {
-  //     const response = await fetch(`/api/download?file=${encodeURIComponent(currentJob.outputFile)}`)
-  //     if (response.ok) {
-  //       const blob = await response.blob()
-  //       const url = window.URL.createObjectURL(blob)
-  //       const a = document.createElement("a")
-  //       a.href = url
-  //       a.download = currentJob.outputFile
-  //       document.body.appendChild(a)
-  //       a.click()
-  //       window.URL.revokeObjectURL(url)
-  //       document.body.removeChild(a)
-  //       addLog("📥 Results downloaded successfully")
-  //     } else {
-  //       addLog("❌ Failed to download results")
-  //     }
-  //   } catch (error) {
-  //     addLog(`❌ Error downloading results: ${error}`)
-  //   }
-  // }
 
   // Watcher functions
   const startWatching = async () => {
@@ -708,75 +649,6 @@ export default function Home() {
       addMessage("error", `❌ Error stopping watcher: ${error.message}`)
     }
   }
-
-  // const startWatcher = async () => {
-  //   if (!watcherRootDir.trim()) {
-  //     addLog("❌ Please select a directory to watch")
-  //     return
-  //   }
-
-  //   try {
-  //     addLog("🔍 Starting file watcher...")
-
-  //     const response = await fetch("/api/watch/start", {
-  //       method: "POST",
-  //       headers: { "Content-Type": "application/json" },
-  //       body: JSON.stringify({
-  //         rootDir: watcherRootDir.trim(),
-  //         outputFile: watcherOutputFile.trim() || "watched_images.csv",
-  //         numWorkers: 1,
-  //         verbose: watcherVerbose,
-  //         filterConfig,
-  //       }),
-  //     })
-
-  //     const data = await response.json()
-
-  //     if (data.success) {
-  //       addLog(`✅ File watcher started successfully`)
-  //       addLog(`👀 Watching: ${data.watchingPath}`)
-  //       addLog(`📄 Output: ${data.outputFile}`)
-  //       addLog(`🔗 Looking for XML-Image pairs...`)
-  //       checkWatcherStatus()
-  //     } else {
-  //       addLog(`❌ Failed to start watcher: ${data.error}`)
-  //     }
-  //   } catch (error) {
-  //     addLog(`❌ Error starting watcher: ${error}`)
-  //   }
-  // }
-
-  // const stopWatcher = async () => {
-  //   try {
-  //     const response = await fetch("/api/watch/stop", {
-  //       method: "POST",
-  //     })
-
-  //     const data = await response.json()
-
-  //     if (data.success) {
-  //       setWatcherStatus(null)
-  //       addLog("🛑 File watcher stopped")
-  //     } else {
-  //       addLog(`❌ Failed to stop watcher: ${data.error}`)
-  //     }
-  //   } catch (error) {
-  //     addLog(`❌ Error stopping watcher: ${error}`)
-  //   }
-  // }
-
-  // const checkWatcherStatus = async () => {
-  //   try {
-  //     const response = await fetch("/api/watch/status")
-  //     const data = await response.json()
-
-  //     if (data.success) {
-  //       setWatcherStatus(data.status)
-  //     }
-  //   } catch (error) {
-  //     console.error("Error checking watcher status:", error)
-  //   }
-  // }
 
   const deleteSession = async (sessionId: string) => {
     try {
@@ -859,20 +731,6 @@ export default function Home() {
     }
   }
 
-  // const formatDuration = (ms: number) => {
-  //   const seconds = Math.floor(ms / 1000)
-  //   const minutes = Math.floor(seconds / 60)
-  //   const hours = Math.floor(minutes / 60)
-
-  //   if (hours > 0) {
-  //     return `${hours}h ${minutes % 60}m ${seconds % 60}s`
-  //   } else if (minutes > 0) {
-  //     return `${minutes}m ${seconds % 60}s`
-  //   } else {
-  //     return `${seconds}s`
-  //   }
-  // }
-
   const formatDuration = (start: string, end?: string) => {
     const startTime = new Date(start)
     const endTime = end ? new Date(end) : new Date()
@@ -881,34 +739,6 @@ export default function Home() {
     const seconds = Math.floor((duration % 60000) / 1000)
     return `${minutes}m ${seconds}s`
   }
-
-  // const resetJob = () => {
-  //   setCurrentJob(null)
-  //   setIsProcessing(false)
-  //   setIsPaused(false)
-  //   addLog("🔄 Job reset")
-  // }
-
-  // const clearLogs = () => {
-  //   setLogs([])
-  // }
-
-  // const handleFilterChange = (key: string, value: any) => {
-  //   setFilterConfig((prev) => ({
-  //     ...prev,
-  //     [key]: value,
-  //   }))
-  // }
-
-  // const handleTextFilterChange = (filterName: string, field: string, value: string) => {
-  //   setFilterConfig((prev) => ({
-  //     ...prev,
-  //     [filterName]: {
-  //       ...prev[filterName as keyof typeof prev],
-  //       [field]: value,
-  //     },
-  //   }))
-  // }
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -927,6 +757,14 @@ export default function Home() {
     }
   }
 
+  const formatFileSize = (bytes: number) => {
+    if (bytes === 0) return "0 Bytes"
+    const k = 1024
+    const sizes = ["Bytes", "KB", "MB", "GB"]
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return Number.parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
+  }
+
   return (
     <div className="container mx-auto p-6 max-w-7xl">
       <Toaster />
@@ -942,15 +780,19 @@ export default function Home() {
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         {/* Main Configuration Panel */}
         <div className="lg:col-span-3">
-          <Tabs defaultValue="basic" className="w-full">
+          <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
             <TabsList className="grid w-full grid-cols-7">
               <TabsTrigger value="basic">Basic</TabsTrigger>
               <TabsTrigger value="filters">Filters</TabsTrigger>
               <TabsTrigger value="chunked">Chunked</TabsTrigger>
               <TabsTrigger value="watch">Watch</TabsTrigger>
               <TabsTrigger value="history">History</TabsTrigger>
-              <TabsTrigger value="logs">Logs</TabsTrigger>
-              <TabsTrigger value="results">Results</TabsTrigger>
+              <TabsTrigger value="logs" className={isRunning ? "bg-blue-100 text-blue-700" : ""}>
+                Logs {isRunning && <span className="ml-1 animate-pulse">●</span>}
+              </TabsTrigger>
+              <TabsTrigger value="results" className={processingResults ? "bg-green-100 text-green-700" : ""}>
+                Results {processingResults && <span className="ml-1">✓</span>}
+              </TabsTrigger>
             </TabsList>
 
             {/* Basic Configuration */}
@@ -1826,153 +1668,131 @@ export default function Home() {
                   <CardDescription>View and manage previous processing sessions</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="flex justify-between items-center">
-                    <div className="flex space-x-2">
-                      <Button onClick={loadHistory} variant="outline" size="sm">
-                        Refresh
-                      </Button>
-                      <Button onClick={clearHistory} variant="destructive" size="sm">
-                        Clear All
-                      </Button>
-                    </div>
-                    {canResume && (
-                      <Badge variant="outline" className="text-orange-600">
-                        Resume Available
-                      </Badge>
-                    )}
-                  </div>
-
-                  <ScrollArea className="h-96">
-                    <div className="space-y-3">
-                      {!Array.isArray(history) || history.length === 0 ? (
-                        <div className="text-center text-muted-foreground py-8">No processing history found</div>
-                      ) : (
-                        history.map((session) => (
-                          <Card key={session.id} className="p-4">
-                            <div className="flex justify-between items-start">
-                              <div className="space-y-2 flex-1">
-                                <div className="flex items-center space-x-2">
-                                  <Badge variant="outline" className={getStatusColor(session.status)}>
-                                    {session.status.toUpperCase()}
-                                  </Badge>
-                                  <span className="text-sm text-muted-foreground">
-                                    {new Date(session.startTime).toLocaleString()}
-                                  </span>
-                                </div>
-
-                                <div className="text-sm">
-                                  <div>
-                                    <strong>Directory:</strong> {session.config.rootDir}
-                                  </div>
-                                  <div>
-                                    <strong>Output:</strong> {session.config.outputFile}
-                                  </div>
-                                  <div>
-                                    <strong>Mode:</strong> {session.config.processingMode}
-                                  </div>
-                                  <div>
-                                    <strong>Duration:</strong> {formatDuration(session.startTime, session.endTime)}
-                                  </div>
-                                </div>
-
-                                <div className="grid grid-cols-3 gap-4 text-sm">
-                                  <div>
-                                    <div className="font-medium">Progress</div>
-                                    <div>
-                                      {session.progress.processedFiles}/{session.progress.totalFiles}
-                                    </div>
-                                  </div>
-                                  <div>
-                                    <div className="font-medium">Success</div>
-                                    <div className="text-green-600">{session.progress.successCount}</div>
-                                  </div>
-                                  <div>
-                                    <div className="font-medium">Errors</div>
-                                    <div className="text-red-600">{session.progress.errorCount}</div>
-                                  </div>
-                                </div>
-
-                                {session.progress.totalFiles > 0 && (
-                                  <Progress
-                                    value={(session.progress.processedFiles / session.progress.totalFiles) * 100}
-                                    className="h-2"
-                                  />
-                                )}
-                              </div>
-
-                              <div className="flex flex-col space-y-2 ml-4">
-                                {(session.status === "interrupted" || session.status === "paused") && (
-                                  <Button size="sm" onClick={() => resumeFromSession(session.id)} className="text-xs">
+                  {history.length === 0 ? (
+                    <Alert>
+                      <AlertDescription>No processing history available.</AlertDescription>
+                    </Alert>
+                  ) : (
+                    <div className="space-y-4">
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-gray-200">
+                          <thead className="bg-gray-50">
+                            <tr>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Session ID
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Start Time
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                End Time
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Status
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Files
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Success
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Errors
+                              </th>
+                              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Actions
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody className="bg-white divide-y divide-gray-200">
+                            {history.map((session) => (
+                              <tr key={session.id}>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                                  {session.id}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                  {new Date(session.startTime).toLocaleString()}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                  {session.endTime ? new Date(session.endTime).toLocaleString() : "N/A"}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                  <Badge className={getStatusColor(session.status)}>{session.status}</Badge>
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                  {session.progress.totalFiles}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-green-600">
+                                  {session.progress.successCount}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-red-600">
+                                  {session.progress.errorCount}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => resumeFromSession(session.id)}
+                                    disabled={session.status !== "interrupted"}
+                                  >
                                     Resume
                                   </Button>
-                                )}
-                                {session.results?.outputPath && (
-                                  <Button size="sm" variant="outline" asChild className="text-xs bg-transparent">
-                                    <a href={`/api/download?file=${encodeURIComponent(session.results.outputPath)}`}>
-                                      Download
-                                    </a>
+                                  <Button variant="destructive" size="sm" onClick={() => deleteSession(session.id)}>
+                                    Delete
                                   </Button>
-                                )}
-                                <Button
-                                  size="sm"
-                                  variant="destructive"
-                                  onClick={() => deleteSession(session.id)}
-                                  className="text-xs"
-                                >
-                                  Delete
-                                </Button>
-                              </div>
-                            </div>
-                          </Card>
-                        ))
-                      )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <Button variant="destructive" onClick={clearHistory}>
+                        Clear History
+                      </Button>
                     </div>
-                  </ScrollArea>
+                  )}
                 </CardContent>
               </Card>
             </TabsContent>
 
             {/* Logs */}
             <TabsContent value="logs" className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Processing Logs</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <ScrollArea className="h-64">
-                      <div className="space-y-1">
-                        {messages.map((message, index) => (
-                          <div key={index} className="text-sm">
-                            <span className="text-muted-foreground">{message.timestamp}</span>
-                            <span className="ml-2 font-medium">[{message.type}]</span>
-                            <span className="ml-2">{JSON.stringify(message.message)}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </ScrollArea>
-                  </CardContent>
-                </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Logs</CardTitle>
+                  <CardDescription>View processing logs</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label>Processing Logs</Label>
+                    <div className="border rounded-md p-2 h-64 overflow-y-auto bg-gray-50">
+                      {messages.map((message, index) => (
+                        <div key={index} className="text-sm">
+                          <span className="text-gray-500">{message.timestamp}</span>{" "}
+                          {message.type === "error" ? (
+                            <span className="text-red-500">Error: {message.message}</span>
+                          ) : (
+                            <span>{message.message}</span>
+                          )}
+                        </div>
+                      ))}
+                      <div ref={logsEndRef} />
+                    </div>
+                  </div>
 
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Error Logs</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <ScrollArea className="h-64">
-                      <div className="space-y-1">
-                        {errorMessages.map((message, index) => (
-                          <div key={index} className="text-sm text-red-600">
-                            <span className="text-muted-foreground">{message.timestamp}</span>
-                            <span className="ml-2 font-medium">[ERROR]</span>
-                            <span className="ml-2">{JSON.stringify(message.message)}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </ScrollArea>
-                  </CardContent>
-                </Card>
-              </div>
+                  <div className="space-y-2">
+                    <Label>Error Logs</Label>
+                    <div className="border rounded-md p-2 h-64 overflow-y-auto bg-gray-50">
+                      {errorMessages.map((message, index) => (
+                        <div key={index} className="text-sm text-red-500">
+                          <span className="text-gray-500">{message.timestamp}</span> Error: {message.message}
+                        </div>
+                      ))}
+                      <div ref={errorLogsEndRef} />
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
             </TabsContent>
 
             {/* Results */}
@@ -1980,54 +1800,93 @@ export default function Home() {
               <Card>
                 <CardHeader>
                   <CardTitle>Processing Results</CardTitle>
-                  <CardDescription>View progress and download results</CardDescription>
+                  <CardDescription>View the results of the processing</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label>Overall Progress</Label>
-                      <span className="text-sm font-medium">{progress}%</span>
-                    </div>
-                    <Progress value={progress} />
-                  </div>
+                  {processingResults ? (
+                    <>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <Label>Total Files</Label>
+                          <div className="text-lg font-medium">{processingResults.stats.totalFiles}</div>
+                        </div>
+                        <div>
+                          <Label>Processed Files</Label>
+                          <div className="text-lg font-medium">{processingResults.stats.processedFiles}</div>
+                        </div>
+                        <div>
+                          <Label>Successful Files</Label>
+                          <div className="text-lg font-medium text-green-600">
+                            {processingResults.stats.successfulFiles}
+                          </div>
+                        </div>
+                        <div>
+                          <Label>Error Files</Label>
+                          <div className="text-lg font-medium text-red-600">{processingResults.stats.errorFiles}</div>
+                        </div>
+                        <div>
+                          <Label>Filtered Files</Label>
+                          <div className="text-lg font-medium">{processingResults.stats.filteredFiles}</div>
+                        </div>
+                        <div>
+                          <Label>Moved Files</Label>
+                          <div className="text-lg font-medium">{processingResults.stats.movedFiles}</div>
+                        </div>
+                        <div>
+                          <Label>Records Written</Label>
+                          <div className="text-lg font-medium">{processingResults.stats.recordsWritten}</div>
+                        </div>
+                        <div>
+                          <Label>Output File</Label>
+                          <div className="text-lg font-medium">{processingResults.outputFile}</div>
+                        </div>
+                        <div>
+                          <Label>Start Time</Label>
+                          <div className="text-lg font-medium">
+                            {processingResults.startTime
+                              ? new Date(processingResults.startTime).toLocaleString()
+                              : "N/A"}
+                          </div>
+                        </div>
+                        <div>
+                          <Label>End Time</Label>
+                          <div className="text-lg font-medium">
+                            {processingResults.endTime ? new Date(processingResults.endTime).toLocaleString() : "N/A"}
+                          </div>
+                        </div>
+                        <div>
+                          <Label>Processing Time</Label>
+                          <div className="text-lg font-medium">{processingResults.processingTime}</div>
+                        </div>
+                      </div>
 
-                  {stats.totalFiles > 0 && (
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                      <div className="text-center">
-                        <div className="text-2xl font-bold">{stats.totalFiles}</div>
-                        <div className="text-sm text-muted-foreground">Total Files</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-2xl font-bold">{stats.processedFiles}</div>
-                        <div className="text-sm text-muted-foreground">Processed</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-2xl font-bold text-green-600">{stats.successCount}</div>
-                        <div className="text-sm text-muted-foreground">Success</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-2xl font-bold text-red-600">{stats.errorCount}</div>
-                        <div className="text-sm text-muted-foreground">Errors</div>
-                      </div>
-                    </div>
-                  )}
+                      {processingResults.errors.length > 0 && (
+                        <div className="space-y-2 mt-4">
+                          <Label className="text-red-600">Errors</Label>
+                          <div className="border rounded-md p-2 h-48 overflow-y-auto bg-gray-50">
+                            {processingResults.errors.map((error, index) => (
+                              <div key={index} className="text-sm text-red-500">
+                                {error}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
 
-                  {stats.currentFile && (
-                    <div className="space-y-1">
-                      <Label>Currently Processing</Label>
-                      <p className="text-sm text-muted-foreground truncate">{stats.currentFile}</p>
-                    </div>
-                  )}
-
-                  {downloadURL && (
-                    <div className="space-y-2">
-                      <Label>Download Results</Label>
-                      <Button asChild className="w-full">
-                        <a href={downloadURL} download>
-                          Download CSV File
+                      {downloadURL && (
+                        <a
+                          href={downloadURL}
+                          download
+                          className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4 py-2"
+                        >
+                          Download Results
                         </a>
-                      </Button>
-                    </div>
+                      )}
+                    </>
+                  ) : (
+                    <Alert>
+                      <AlertDescription>No results to display yet. Start processing to see results.</AlertDescription>
+                    </Alert>
                   )}
                 </CardContent>
               </Card>
@@ -2035,179 +1894,71 @@ export default function Home() {
           </Tabs>
         </div>
 
-        {/* Quick Stats Sidebar */}
-        <div className="space-y-4">
+        {/* Processing Status Sidebar */}
+        <div className="lg:col-span-1">
           <Card>
             <CardHeader>
-              <CardTitle className="text-lg">Quick Stats</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex justify-between">
-                <span className="text-sm">Status:</span>
-                <Badge variant={isRunning ? "default" : "secondary"}>{isRunning ? "Running" : "Idle"}</Badge>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-sm">Mode:</span>
-                <span className="text-sm font-medium">{processingMode}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-sm">Workers:</span>
-                <span className="text-sm font-medium">{numWorkers}</span>
-              </div>
-              {filterEnabled && (
-                <div className="flex justify-between">
-                  <span className="text-sm">Filters:</span>
-                  <Badge variant="outline">Enabled</Badge>
-                </div>
-              )}
-              {processingMode === "chunked" && (
-                <div className="flex justify-between">
-                  <span className="text-sm">Chunk Size:</span>
-                  <span className="text-sm font-medium">{chunkSize}</span>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">Controls</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <Button onClick={startProcessing} disabled={isRunning || !rootDir} className="w-full">
-                {isRunning ? "Processing..." : "Start Processing"}
-              </Button>
-
-              {isRunning && (
-                <>
-                  <Button
-                    onClick={isPaused ? resumeProcessing : pauseProcessing}
-                    variant="outline"
-                    className="w-full bg-transparent"
-                  >
-                    {isPaused ? "Resume" : "Pause"}
-                  </Button>
-                  <Button onClick={stopProcessing} variant="destructive" className="w-full">
-                    Stop
-                  </Button>
-                </>
-              )}
-            </CardContent>
-          </Card>
-
-          {filterEnabled && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-lg">Filter Summary</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <div className="text-sm">
-                  <span className="font-medium">File Types:</span>
-                  <div className="flex flex-wrap gap-1 mt-1">
-                    {filterConfig.fileTypes?.map((type) => (
-                      <Badge key={type} variant="secondary" className="text-xs">
-                        {type}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-                {(filterConfig.minWidth || filterConfig.maxWidth) && (
-                  <div className="text-sm">
-                    <span className="font-medium">Dimensions:</span>
-                    <span className="ml-1">
-                      {filterConfig.minWidth || 0} - {filterConfig.maxWidth || "∞"}px
-                    </span>
-                  </div>
-                )}
-                {(filterConfig.minFileSize || filterConfig.maxFileSize) && (
-                  <div className="text-sm">
-                    <span className="font-medium">File Size:</span>
-                    <span className="ml-1">
-                      {filterConfig.minFileSizeValue
-                        ? `${filterConfig.minFileSizeValue}${filterConfig.minFileSizeUnit}`
-                        : "0"}{" "}
-                      -{" "}
-                      {filterConfig.maxFileSizeValue
-                        ? `${filterConfig.maxFileSizeValue}${filterConfig.maxFileSizeUnit}`
-                        : "∞"}
-                    </span>
-                  </div>
-                )}
-                {filterConfig.moveImages && (
-                  <div className="text-sm">
-                    <span className="font-medium">Move Images:</span>
-                    <Badge variant="outline" className="ml-1">
-                      Enabled
-                    </Badge>
-                  </div>
-                )}
-                <div className="text-xs text-muted-foreground">
-                  {[
-                    filterConfig.creditLine?.operator && "Credit Line",
-                    filterConfig.copyright?.operator && "Copyright",
-                    filterConfig.usageType?.operator && "Usage Type",
-                    filterConfig.rightsHolder?.operator && "Rights Holder",
-                    filterConfig.location?.operator && "Location",
-                  ]
-                    .filter(Boolean)
-                    .join(", ") || "No metadata filters"}
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </div>
-      </div>
-
-      {/* Resume Dialog */}
-      {showResumeDialog && resumeSession && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <Card className="w-96">
-            <CardHeader>
-              <CardTitle>Resume Processing?</CardTitle>
-              <CardDescription>
-                An interrupted processing session was found. Would you like to resume from where you left off?
-              </CardDescription>
+              <CardTitle>Processing Status</CardTitle>
+              <CardDescription>Real-time processing updates</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="text-sm space-y-2">
-                <div>
-                  <strong>Directory:</strong> {resumeSession.config.rootDir}
-                </div>
-                <div>
-                  <strong>Progress:</strong> {resumeSession.progress.processedFiles}/{resumeSession.progress.totalFiles}{" "}
-                  files
-                </div>
-                <div>
-                  <strong>Started:</strong> {new Date(resumeSession.startTime).toLocaleString()}
+              <div className="space-y-2">
+                <Label>Progress</Label>
+                <Progress value={progress} />
+                <div className="flex items-center justify-between text-sm text-muted-foreground">
+                  <span>{Math.round(progress)}%</span>
+                  <span>
+                    {stats.processedFiles} / {stats.totalFiles} files
+                  </span>
                 </div>
               </div>
-              <Progress value={(resumeSession.progress.processedFiles / resumeSession.progress.totalFiles) * 100} />
-            </CardContent>
-            <CardContent className="flex space-x-2">
-              <Button
-                onClick={() => {
-                  resumeFromSession(resumeSession.id)
-                  setShowResumeDialog(false)
-                }}
-                className="flex-1"
-              >
-                Resume
-              </Button>
-              <Button
-                variant="outline"
-                onClick={async () => {
-                  await fetch("/api/resume", { method: "DELETE" })
-                  setShowResumeDialog(false)
-                  setCanResume(false)
-                }}
-                className="flex-1"
-              >
-                Start Fresh
-              </Button>
+
+              <div className="space-y-2">
+                <Label>Stats</Label>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
+                  <div>
+                    <span className="text-muted-foreground">Total:</span> {stats.totalFiles}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Processed:</span> {stats.processedFiles}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Success:</span>{" "}
+                    <span className="text-green-600">{stats.successCount}</span>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Errors:</span>{" "}
+                    <span className="text-red-600">{stats.errorCount}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex space-x-2">
+                {!isRunning && (
+                  <Button onClick={startProcessing} disabled={isRunning} className="flex-1">
+                    Start Processing
+                  </Button>
+                )}
+                {isRunning && !isPaused && (
+                  <Button onClick={pauseProcessing} disabled={isPaused} variant="secondary" className="flex-1">
+                    Pause
+                  </Button>
+                )}
+                {isRunning && isPaused && (
+                  <Button onClick={resumeProcessing} disabled={!isPaused} variant="secondary" className="flex-1">
+                    Resume
+                  </Button>
+                )}
+                {isRunning && (
+                  <Button onClick={stopProcessing} variant="destructive" className="flex-1">
+                    Stop
+                  </Button>
+                )}
+              </div>
             </CardContent>
           </Card>
         </div>
-      )}
+      </div>
     </div>
   )
 }
