@@ -1,102 +1,72 @@
-import { type NextRequest, NextResponse } from "next/server"
-import { startWatcher } from "@/lib/watcher-manager"
-import fs from "fs"
+import type { NextRequest } from "next/server"
+import { startWatcher } from "@/lib/file-watcher"
 import path from "path"
+import fs from "fs/promises"
 
 export async function POST(request: NextRequest) {
+  const body = await request.json()
+  const {
+    rootDir,
+    filterConfig,
+    outputFile = "watched_images.csv",
+    outputFolder = "", // Add this line
+    numWorkers = 1,
+    verbose = false,
+  } = body
+
+  if (!rootDir) {
+    return new Response("Root directory is required", { status: 400 })
+  }
+
+  // Create full output path
+  const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
+
+  // Ensure output directory exists
+  if (outputFolder) {
+    try {
+      await fs.mkdir(outputFolder, { recursive: true })
+    } catch (error) {
+      console.error("Error creating output directory:", error)
+      return new Response(`Failed to create output directory: ${outputFolder}`, { status: 400 })
+    }
+  }
+
   try {
-    const body = await request.json()
-    const { rootDir, filterConfig, outputFile, numWorkers, verbose } = body
-
-    console.log("Watch start request:", { rootDir, filterConfig, outputFile, numWorkers, verbose })
-
-    if (!rootDir) {
-      return NextResponse.json({ success: false, error: "Root directory is required" }, { status: 400 })
-    }
-
-    // Validate that the directory exists
-    try {
-      const stats = fs.statSync(rootDir)
-      if (!stats.isDirectory()) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "Path exists but is not a directory",
-            path: rootDir,
-          },
-          { status: 400 },
-        )
-      }
-    } catch (err: any) {
-      console.error("Directory validation error:", err)
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Directory does not exist or is not accessible",
-          path: rootDir,
-          details: err.message,
-        },
-        { status: 400 },
-      )
-    }
-
-    // Ensure output directory exists
-    const outputFilePath = outputFile || "watched_images.csv"
-    const outputDir = path.dirname(path.resolve(outputFilePath))
-
-    try {
-      if (!fs.existsSync(outputDir)) {
-        fs.mkdirSync(outputDir, { recursive: true })
-      }
-    } catch (err: any) {
-      console.error("Output directory creation error:", err)
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Failed to create output directory",
-          details: err.message,
-        },
-        { status: 500 },
-      )
-    }
-
-    // Start the watcher with proper error handling
     const result = await startWatcher({
       rootDir,
-      filterConfig: filterConfig || {},
-      outputFile: outputFilePath,
-      numWorkers: numWorkers || 1,
-      verbose: verbose || false,
+      filterConfig,
+      outputFile: fullOutputPath, // Use fullOutputPath here
+      numWorkers,
+      verbose,
     })
 
     if (result.success) {
-      return NextResponse.json({
-        success: true,
-        message: "Watcher started successfully",
-        watchingPath: rootDir,
-        outputFile: outputFilePath,
-        watcherId: result.watcherId,
-      })
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "File watcher started successfully",
+          watcherId: result.watcherId,
+          watchingPath: rootDir,
+          outputFile: fullOutputPath, // Return fullOutputPath
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      )
     } else {
-      return NextResponse.json(
-        {
+      return new Response(
+        JSON.stringify({
           success: false,
-          error: "Failed to start watcher",
-          message: result.error,
-        },
-        { status: 500 },
+          error: result.error,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
       )
     }
   } catch (error: any) {
-    console.error("Watch start error:", error)
-    return NextResponse.json(
-      {
+    return new Response(
+      JSON.stringify({
         success: false,
-        error: "Failed to start watcher",
-        message: error.message,
-        stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
-      },
-      { status: 500 },
+        error: error.message,
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
     )
   }
 }

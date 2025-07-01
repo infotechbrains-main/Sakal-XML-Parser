@@ -103,6 +103,7 @@ export default function Home() {
   // Basic configuration
   const [rootDir, setRootDir] = useState("")
   const [outputFile, setOutputFile] = useState("image_metadata.csv")
+  const [outputFolder, setOutputFolder] = useState("")
   const [numWorkers, setNumWorkers] = useState(4)
   const [verbose, setVerbose] = useState(false)
   const [processingMode, setProcessingMode] = useState<"regular" | "stream" | "chunked">("stream")
@@ -144,6 +145,7 @@ export default function Home() {
   const [watchInterval, setWatchInterval] = useState(30)
   const [watchDirectory, setWatchDirectory] = useState("/Users/amangupta/Desktop/test-images")
   const [watchOutputFile, setWatchOutputFile] = useState("watched_images.csv")
+  const [watchOutputFolder, setWatchOutputFolder] = useState("")
   const [useFiltersForWatch, setUseFiltersForWatch] = useState(true)
   const [watcherStatus, setWatcherStatus] = useState<any>(null)
 
@@ -415,6 +417,7 @@ export default function Home() {
       const requestBody = {
         rootDir,
         outputFile,
+        outputFolder, // Add this line
         numWorkers,
         verbose,
         filterConfig: finalFilterConfig,
@@ -656,6 +659,7 @@ export default function Home() {
               }
             : { enabled: false },
           outputFile: watchOutputFile,
+          outputFolder: watchOutputFolder, // Add this line
           numWorkers: 1,
           verbose: true,
         }),
@@ -974,6 +978,15 @@ export default function Home() {
                         value={outputFile}
                         onChange={(e) => setOutputFile(e.target.value)}
                         placeholder="output.csv"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="outputFolder">Output Folder (optional)</Label>
+                      <Input
+                        id="outputFolder"
+                        value={outputFolder}
+                        onChange={(e) => setOutputFolder(e.target.value)}
+                        placeholder="/path/to/save/csv/files (leave empty for current directory)"
                       />
                     </div>
                   </div>
@@ -1715,6 +1728,15 @@ export default function Home() {
                         value={watchOutputFile}
                         onChange={(e) => setWatchOutputFile(e.target.value)}
                         placeholder="watched_images.csv"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="watchOutputFolder">Output Folder (optional)</Label>
+                      <Input
+                        id="watchOutputFolder"
+                        value={watchOutputFolder}
+                        onChange={(e) => setWatchOutputFolder(e.target.value)}
+                        placeholder="/path/to/save/csv/files (leave empty for current directory)"
                       />
                     </div>
                   </div>

@@ -94,6 +94,19 @@ class WatcherManager {
         return { success: false, error: `Directory not accessible: ${config.rootDir} - ${err.message}` }
       }
 
+      // Ensure output directory exists
+      const outputDir = path.dirname(config.outputFile)
+      if (outputDir !== "." && outputDir !== "") {
+        try {
+          fs.mkdirSync(outputDir, { recursive: true })
+          if (config.verbose) {
+            console.log(`📁 Created output directory: ${outputDir}`)
+          }
+        } catch (err: any) {
+          return { success: false, error: `Failed to create output directory: ${outputDir} - ${err.message}` }
+        }
+      }
+
       this.config = config
       this.watcherId = `watcher_${Date.now()}`
       this.stats = {

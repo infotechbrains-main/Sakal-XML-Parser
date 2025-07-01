@@ -75,11 +75,21 @@ async function saveProcessingState(state: any) {
 
 export async function POST(request: NextRequest) {
   const body = await request.json()
-  const { rootDir, outputFile = "image_metadata.csv", numWorkers = 4, verbose = false, filterConfig = null } = body
+  const {
+    rootDir,
+    outputFile = "image_metadata.csv",
+    outputFolder = "", // Add this line
+    numWorkers = 4,
+    verbose = false,
+    filterConfig = null,
+  } = body
 
   if (!rootDir) {
     return new Response("Root directory is required", { status: 400 })
   }
+
+  // Create full output path
+  const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
 
   // Create SSE response
   const encoder = new TextEncoder()
@@ -91,8 +101,14 @@ export async function POST(request: NextRequest) {
       const data = `data: ${JSON.stringify({ type: "start", message: "Starting XML processing..." })}\n\n`
       controller.enqueue(encoder.encode(data))
 
-      // Start processing in background
-      processFiles(controller, encoder, { rootDir, outputFile, numWorkers, verbose, filterConfig })
+      // Pass fullOutputPath to processFiles function
+      processFiles(controller, encoder, {
+        rootDir,
+        outputFile: fullOutputPath, // Use fullOutputPath here
+        numWorkers,
+        verbose,
+        filterConfig,
+      })
         .then(() => {
           if (!isControllerClosed) {
             isControllerClosed = true
@@ -131,6 +147,18 @@ export async function POST(request: NextRequest) {
 
 async function processFiles(controller: ReadableStreamDefaultController, encoder: TextEncoder, config: any) {
   const { rootDir, outputFile, numWorkers, verbose, filterConfig } = config
+
+  // Ensure output directory exists
+  const outputDir = path.dirname(outputFile)
+  if (outputDir !== "." && outputDir !== "") {
+    try {
+      await fs.mkdir(outputDir, { recursive: true })
+    } catch (error) {
+      console.error(`Failed to create output directory: ${outputDir}`)
+      return
+    }
+  }
+
   let isControllerClosed = false
   let tempDir: string | null = null
   const allRecords: any[] = []

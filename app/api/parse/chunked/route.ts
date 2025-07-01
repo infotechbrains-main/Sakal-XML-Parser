@@ -167,6 +167,7 @@ export async function POST(request: NextRequest) {
   const {
     rootDir,
     outputFile = "image_metadata.csv",
+    outputFolder = "", // Add this line
     numWorkers = 4,
     verbose = false,
     filterConfig = null,
@@ -180,6 +181,9 @@ export async function POST(request: NextRequest) {
     return new Response("Root directory is required", { status: 400 })
   }
 
+  // Create full output path
+  const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
+
   // Create SSE response
   const encoder = new TextEncoder()
   let isControllerClosed = false
@@ -191,9 +195,10 @@ export async function POST(request: NextRequest) {
       controller.enqueue(encoder.encode(data))
 
       // Start chunked processing in background
+      // Pass fullOutputPath to processFilesInChunks
       processFilesInChunks(controller, encoder, {
         rootDir,
-        outputFile,
+        outputFile: fullOutputPath, // Use fullOutputPath here
         numWorkers,
         verbose,
         filterConfig,
@@ -270,6 +275,18 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
     } catch (error) {
       console.error("Error sending SSE message:", error)
       isControllerClosed = true
+    }
+  }
+
+  // Ensure output directory exists
+  const outputDir = path.dirname(outputFile)
+  if (outputDir !== "." && outputDir !== "") {
+    try {
+      await fs.mkdir(outputDir, { recursive: true })
+      sendMessage("log", { message: `Created output directory: ${outputDir}` })
+    } catch (error) {
+      sendMessage("error", { message: `Failed to create output directory: ${outputDir}` })
+      return
     }
   }
 
