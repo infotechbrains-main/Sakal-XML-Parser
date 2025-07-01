@@ -1,1861 +1,1119 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Checkbox } from "@/components/ui/checkbox"
+import { Progress } from "@/components/ui/progress"
+import { Badge } from "@/components/ui/badge"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
-import { Switch } from "@/components/ui/switch"
-import { Badge } from "@/components/ui/badge"
-import { Progress } from "@/components/ui/progress"
-import { ScrollArea } from "@/components/ui/scroll-area"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Toaster } from "sonner"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
+import { Checkbox } from "@/components/ui/checkbox"
+import {
+  Download,
+  Play,
+  Pause,
+  RotateCcw,
+  FileText,
+  Filter,
+  Settings,
+  Clock,
+  AlertCircle,
+  Eye,
+  EyeOff,
+  PlayCircle,
+  StopCircle,
+  Activity,
+} from "lucide-react"
 
-interface Message {
-  type: string
-  message: any
-  timestamp?: string
-}
-
-interface ProcessingStats {
+interface ProcessingJob {
+  id: string
+  status: "running" | "paused" | "completed" | "error"
+  progress: number
   totalFiles: number
   processedFiles: number
-  successCount: number
-  errorCount: number
-  currentFile?: string
-  estimatedTimeRemaining?: string
-}
-
-interface FilterConfig {
-  enabled: boolean
-  fileTypes: string[]
-  customExtensions: string
-  allowedFileTypes: string[]
-  minWidth?: number
-  maxWidth?: number
-  minHeight?: number
-  maxHeight?: number
-  minFileSize?: number
-  maxFileSize?: number
-  minFileSizeValue?: number
-  maxFileSizeValue?: number
-  minFileSizeUnit?: string
-  maxFileSizeUnit?: string
-
-  // Complete metadata filters
-  creditLine?: {
-    operator: string
-    value: string
-  }
-  copyright?: {
-    operator: string
-    value: string
-  }
-  usageType?: {
-    operator: string
-    value: string
-  }
-  rightsHolder?: {
-    operator: string
-    value: string
-  }
-  location?: {
-    operator: string
-    value: string
-  }
-
-  // Image moving configuration
-  moveImages: boolean
-  moveDestinationPath?: string
-  moveFolderStructureOption?: "replicate" | "flat"
-}
-
-interface ProcessingSession {
-  id: string
+  filteredFiles: number
+  movedFiles: number
   startTime: string
   endTime?: string
-  status: string
-  config: {
-    rootDir: string
-    outputFile: string
-    numWorkers: number
-    verbose: boolean
-    filterConfig: FilterConfig | null
-    processingMode: string
+  rootDir: string
+  outputFile: string
+  filterConfig: any
+}
+
+interface HistoryEntry {
+  sessionId: string
+  timestamp: string
+  rootDir: string
+  outputFile: string
+  totalFiles: number
+  processedFiles: number
+  filteredFiles: number
+  movedFiles: number
+  status: "completed" | "error" | "paused"
+  duration: number
+  filterConfig: any
+}
+
+interface WatcherStatus {
+  isWatching: boolean
+  watcherId: string | null
+  config: any
+  stats: {
+    filesProcessed: number
+    filesSuccessful: number
+    filesMoved: number
+    filesErrored: number
+    xmlFilesDetected: number
+    imageFilesDetected: number
+    pairsProcessed: number
+    startTime: string
   }
-  progress: {
-    totalFiles: number
-    processedFiles: number
-    successCount: number
-    errorCount: number
-  }
-  results?: {
-    outputPath: string
-  }
+  uptime: number
+  pendingPairs: number
+  completePairs: number
 }
 
 export default function Home() {
-  // Basic configuration
+  // State management
   const [rootDir, setRootDir] = useState("")
   const [outputFile, setOutputFile] = useState("image_metadata.csv")
   const [numWorkers, setNumWorkers] = useState(4)
   const [verbose, setVerbose] = useState(false)
-  const [processingMode, setProcessingMode] = useState<"regular" | "stream" | "chunked">("stream")
-
-  // Processing state
-  const [messages, setMessages] = useState<Message[]>([])
-  const [errorMessages, setErrorMessages] = useState<Message[]>([])
-  const [isRunning, setIsRunning] = useState(false)
+  const [currentJob, setCurrentJob] = useState<ProcessingJob | null>(null)
+  const [history, setHistory] = useState<HistoryEntry[]>([])
+  const [logs, setLogs] = useState<string[]>([])
+  const [isProcessing, setIsProcessing] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
-  const [progress, setProgress] = useState(0)
-  const [stats, setStats] = useState<ProcessingStats>({
-    totalFiles: 0,
-    processedFiles: 0,
-    successCount: 0,
-    errorCount: 0,
-  })
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
-  // Chunked processing
-  const [chunkSize, setChunkSize] = useState(100)
-  const [pauseBetweenChunks, setPauseBetweenChunks] = useState(false)
-  const [pauseDuration, setPauseDuration] = useState(5)
-  const [organizeByCity, setOrganizeByCity] = useState(false)
-  const [currentChunk, setCurrentChunk] = useState(0)
-  const [totalChunks, setTotalChunks] = useState(0)
+  // Watcher state
+  const [watcherStatus, setWatcherStatus] = useState<WatcherStatus | null>(null)
+  const [watcherRootDir, setWatcherRootDir] = useState("")
+  const [watcherOutputFile, setWatcherOutputFile] = useState("watched_images.csv")
+  const [watcherVerbose, setWatcherVerbose] = useState(true)
 
   // Filter configuration
-  const [filterEnabled, setFilterEnabled] = useState(false)
-  const [filterConfig, setFilterConfig] = useState<FilterConfig>({
+  const [filterConfig, setFilterConfig] = useState({
     enabled: false,
     fileTypes: ["jpg", "jpeg", "png", "tiff", "bmp"],
     customExtensions: "",
     allowedFileTypes: ["jpg", "jpeg", "png", "tiff", "bmp"],
+    minWidth: 0,
+    minHeight: 0,
+    minFileSize: 0,
+    maxFileSize: 0,
+    creditLine: { operator: "", value: "" },
+    copyright: { operator: "", value: "" },
+    usageType: { operator: "", value: "" },
+    rightsHolder: { operator: "", value: "" },
+    location: { operator: "", value: "" },
     moveImages: false,
+    moveDestinationPath: "",
     moveFolderStructureOption: "replicate",
   })
 
-  // Watch mode
-  const [watchMode, setWatchMode] = useState(false)
-  const [watchInterval, setWatchInterval] = useState(30)
-  const [watchDirectory, setWatchDirectory] = useState("/Users/amangupta/Desktop/test-images")
-  const [watchOutputFile, setWatchOutputFile] = useState("watched_images.csv")
-  const [useFiltersForWatch, setUseFiltersForWatch] = useState(true)
-  const [watcherStatus, setWatcherStatus] = useState<any>(null)
+  const logsEndRef = useRef<HTMLDivElement>(null)
 
-  // Results
-  const [downloadURL, setDownloadURL] = useState<string | null>(null)
-  const [jobId, setJobId] = useState<string | null>(null)
-
-  // History - Initialize as empty array
-  const [history, setHistory] = useState<ProcessingSession[]>([])
-  const [canResume, setCanResume] = useState(false)
-  const [resumeSession, setResumeSession] = useState<ProcessingSession | null>(null)
-  const [showResumeDialog, setShowResumeDialog] = useState(false)
-
-  const ws = useRef<WebSocket | null>(null)
-
-  // Update filterConfig.enabled when filterEnabled changes
+  // Auto-scroll logs
   useEffect(() => {
-    setFilterConfig((prev) => ({
-      ...prev,
-      enabled: filterEnabled,
-    }))
-  }, [filterEnabled])
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [logs])
 
-  // Update allowedFileTypes when fileTypes changes
-  useEffect(() => {
-    setFilterConfig((prev) => ({
-      ...prev,
-      allowedFileTypes: prev.fileTypes,
-    }))
-  }, [filterConfig.fileTypes])
-
-  useEffect(() => {
-    if (ws.current) {
-      ws.current.onopen = () => {
-        addMessage("system", "WebSocket Connected")
-      }
-
-      ws.current.onclose = () => {
-        addMessage("system", "WebSocket Disconnected")
-      }
-
-      ws.current.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
-          handleStreamMessage(data)
-        } catch (e) {
-          console.error("Error parsing WebSocket message:", e)
-        }
-      }
-
-      ws.current.onerror = (error) => {
-        console.error("WebSocket error:", error)
-        addMessage("error", "WebSocket connection error")
-      }
-    }
-
-    return () => {
-      if (ws.current) {
-        ws.current.close()
-      }
-    }
-  }, [])
-
-  // Add this useEffect after the existing ones
+  // Load processing history
   useEffect(() => {
     loadHistory()
-    checkResumeStatus()
   }, [])
+
+  // Poll for job status and watcher status
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (isProcessing && currentJob) {
+        checkJobStatus(currentJob.id)
+      }
+      if (watcherStatus?.isWatching) {
+        checkWatcherStatus()
+      }
+    }, 2000)
+
+    return () => clearInterval(interval)
+  }, [isProcessing, currentJob, watcherStatus?.isWatching])
+
+  const addLog = (message: string) => {
+    const timestamp = new Date().toLocaleTimeString()
+    setLogs((prev) => [...prev, `[${timestamp}] ${message}`])
+  }
 
   const loadHistory = async () => {
     try {
       const response = await fetch("/api/history")
-
-      if (!response.ok) {
-        console.error("History API error:", response.status)
-        setHistory([])
-        return
-      }
-
-      const contentType = response.headers.get("content-type")
-      if (!contentType || !contentType.includes("application/json")) {
-        console.error("History response is not JSON")
-        setHistory([])
-        return
-      }
-
-      const data = await response.json()
-
-      if (data.success && Array.isArray(data.history)) {
-        setHistory(data.history)
-      } else {
-        console.error("Invalid history data:", data)
-        setHistory([])
-        if (data.error) {
-          addMessage("error", `Failed to load history: ${data.error}`)
+      if (response.ok) {
+        const data = await response.json()
+        // Ensure data.history is an array
+        if (Array.isArray(data.history)) {
+          setHistory(data.history)
+        } else {
+          console.warn("History data is not an array:", data)
+          setHistory([])
         }
+      } else {
+        console.error("Failed to load history")
+        setHistory([])
       }
     } catch (error) {
-      console.error("Failed to load history:", error)
+      console.error("Error loading history:", error)
       setHistory([])
-      addMessage("error", `Failed to load history: ${error.message}`)
     }
   }
 
-  const checkResumeStatus = async () => {
+  const startProcessing = async () => {
+    if (!rootDir.trim()) {
+      addLog("❌ Please select a root directory")
+      return
+    }
+
     try {
-      const response = await fetch("/api/resume")
+      setIsProcessing(true)
+      addLog("🚀 Starting XML processing...")
 
-      if (!response.ok) {
-        console.error("Resume check failed:", response.status)
-        return
-      }
-
-      const contentType = response.headers.get("content-type")
-      if (!contentType || !contentType.includes("application/json")) {
-        console.error("Resume response is not JSON")
-        return
-      }
+      const response = await fetch("/api/parse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rootDir: rootDir.trim(),
+          outputFile: outputFile.trim() || "image_metadata.csv",
+          numWorkers,
+          verbose,
+          filterConfig,
+        }),
+      })
 
       const data = await response.json()
 
       if (data.success) {
-        setCanResume(data.canResume)
-        if (data.canResume && data.session) {
-          setResumeSession(data.session)
-          setShowResumeDialog(true)
-        }
+        setCurrentJob({
+          id: data.jobId,
+          status: "running",
+          progress: 0,
+          totalFiles: data.totalFiles || 0,
+          processedFiles: 0,
+          filteredFiles: 0,
+          movedFiles: 0,
+          startTime: new Date().toISOString(),
+          rootDir,
+          outputFile: outputFile.trim() || "image_metadata.csv",
+          filterConfig,
+        })
+        addLog(`✅ Processing started with job ID: ${data.jobId}`)
+        addLog(`📁 Found ${data.totalFiles} XML files to process`)
+      } else {
+        addLog(`❌ Failed to start processing: ${data.error}`)
+        setIsProcessing(false)
       }
     } catch (error) {
-      console.error("Failed to check resume status:", error)
-    }
-  }
-
-  const addMessage = (type: string, message: any) => {
-    const newMessage: Message = {
-      type,
-      message,
-      timestamp: new Date().toLocaleTimeString(),
-    }
-
-    if (type === "error") {
-      setErrorMessages((prev) => [...prev, newMessage])
-    } else {
-      setMessages((prev) => [...prev, newMessage])
-    }
-  }
-
-  const handleStreamMessage = (data: any) => {
-    switch (data.type) {
-      case "log":
-        addMessage("log", data.message)
-        break
-      case "error":
-        addMessage("error", data.message)
-        break
-      case "progress":
-        setProgress(data.percentage || 0)
-        if (data.stats) {
-          setStats(data.stats)
-        }
-        break
-      case "chunk_start":
-        setCurrentChunk(data.chunkNumber)
-        setTotalChunks(data.totalChunks)
-        addMessage("chunk", `Starting chunk ${data.chunkNumber}/${data.totalChunks}`)
-        break
-      case "chunk_complete":
-        addMessage("chunk", `Completed chunk ${data.chunkNumber}/${data.totalChunks}`)
-        break
-      case "download":
-        setDownloadURL(data.url)
-        addMessage("success", "Processing complete! Download ready.")
-        break
-      case "job_created":
-        setJobId(data.jobId)
-        break
-    }
-  }
-
-  const handleFileTypeChange = (fileType: string, checked: boolean) => {
-    setFilterConfig((prev) => ({
-      ...prev,
-      fileTypes: checked ? [...prev.fileTypes, fileType] : prev.fileTypes.filter((type) => type !== fileType),
-    }))
-  }
-
-  const selectAllCommonTypes = () => {
-    setFilterConfig((prev) => ({
-      ...prev,
-      fileTypes: ["jpg", "jpeg", "png", "tiff", "bmp", "gif", "webp", "raw", "cr2", "nef"],
-    }))
-  }
-
-  const clearAllTypes = () => {
-    setFilterConfig((prev) => ({
-      ...prev,
-      fileTypes: [],
-    }))
-  }
-
-  const startProcessing = async () => {
-    setIsRunning(true)
-    setMessages([])
-    setErrorMessages([])
-    setProgress(0)
-    setDownloadURL(null)
-    setStats({
-      totalFiles: 0,
-      processedFiles: 0,
-      successCount: 0,
-      errorCount: 0,
-    })
-
-    try {
-      // Prepare the final filter config
-      const finalFilterConfig = filterEnabled
-        ? {
-            ...filterConfig,
-            enabled: true,
-            allowedFileTypes: filterConfig.fileTypes, // Ensure this is set
-          }
-        : null
-
-      // Debug log the filter config being sent
-      console.log("Filter config being sent:", finalFilterConfig)
-
-      const requestBody = {
-        rootDir,
-        outputFile,
-        numWorkers,
-        verbose,
-        filterConfig: finalFilterConfig,
-        chunkSize: processingMode === "chunked" ? chunkSize : undefined,
-        pauseBetweenChunks: processingMode === "chunked" ? pauseBetweenChunks : undefined,
-        pauseDuration: processingMode === "chunked" ? pauseDuration : undefined,
-        organizeByCity: processingMode === "chunked" ? organizeByCity : undefined,
-      }
-
-      console.log("Full request body:", requestBody)
-
-      let endpoint = "/api/parse"
-      if (processingMode === "stream" || processingMode === "chunked") {
-        endpoint = "/api/parse/stream"
-      }
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      })
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
-
-      if (processingMode === "regular") {
-        const data = await response.json()
-        addMessage("success", data.message)
-        if (data.downloadURL) {
-          setDownloadURL(data.downloadURL)
-        }
-      } else {
-        // Handle streaming response
-        const reader = response.body?.getReader()
-        if (!reader) {
-          throw new Error("No response body")
-        }
-
-        const textDecoder = new TextDecoder()
-        let partialData = ""
-
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          partialData += textDecoder.decode(value)
-
-          let completeLines
-          if (partialData.includes("\n")) {
-            completeLines = partialData.split("\n")
-            partialData = completeLines.pop() || ""
-          } else {
-            completeLines = []
-          }
-
-          for (const line of completeLines) {
-            if (line.startsWith("data: ")) {
-              try {
-                const data = JSON.parse(line.slice(6))
-                handleStreamMessage(data)
-              } catch (e) {
-                console.error("Error parsing SSE data:", e)
-              }
-            }
-          }
-        }
-
-        if (partialData.startsWith("data: ")) {
-          try {
-            const data = JSON.parse(partialData.slice(6))
-            handleStreamMessage(data)
-          } catch (e) {
-            console.error("Error parsing SSE data:", e)
-          }
-        }
-      }
-    } catch (error: any) {
-      addMessage("error", `Error: ${error.message}`)
-    } finally {
-      setIsRunning(false)
+      addLog(`❌ Error starting processing: ${error}`)
+      setIsProcessing(false)
     }
   }
 
   const pauseProcessing = async () => {
+    if (!currentJob) return
+
     try {
-      await fetch("/api/parse/pause", { method: "POST" })
-      setIsPaused(true)
-      addMessage("system", "Processing paused")
+      const response = await fetch("/api/parse/pause", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId: currentJob.id }),
+      })
+
+      const data = await response.json()
+      if (data.success) {
+        setIsPaused(true)
+        addLog("⏸️ Processing paused")
+      } else {
+        addLog(`❌ Failed to pause: ${data.error}`)
+      }
     } catch (error) {
-      addMessage("error", "Failed to pause processing")
+      addLog(`❌ Error pausing: ${error}`)
     }
   }
 
   const resumeProcessing = async () => {
     try {
-      await fetch("/api/resume", { method: "POST" })
-      setIsPaused(false)
-      addMessage("system", "Processing resumed")
+      const response = await fetch("/api/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: currentJob?.id,
+          filterConfig,
+        }),
+      })
+
+      const data = await response.json()
+      if (data.success) {
+        setIsPaused(false)
+        addLog("▶️ Processing resumed")
+      } else {
+        addLog(`❌ Failed to resume: ${data.error}`)
+      }
     } catch (error) {
-      addMessage("error", "Failed to resume processing")
+      addLog(`❌ Error resuming: ${error}`)
     }
   }
 
-  const stopProcessing = async () => {
+  const checkJobStatus = async (jobId: string) => {
     try {
-      await fetch("/api/parse/pause", { method: "POST" })
-      setIsRunning(false)
-      setIsPaused(false)
-      addMessage("system", "Processing stopped")
+      const response = await fetch(`/api/progress/${jobId}`)
+      const data = await response.json()
+
+      if (data.success && data.progress) {
+        setCurrentJob((prev) =>
+          prev
+            ? {
+                ...prev,
+                progress: data.progress.percentage,
+                processedFiles: data.progress.processedFiles,
+                filteredFiles: data.progress.filteredFiles,
+                movedFiles: data.progress.movedFiles,
+                status: data.progress.status,
+              }
+            : null,
+        )
+
+        if (data.progress.status === "completed") {
+          setIsProcessing(false)
+          setIsPaused(false)
+          addLog("✅ Processing completed successfully!")
+          loadHistory()
+        } else if (data.progress.status === "error") {
+          setIsProcessing(false)
+          setIsPaused(false)
+          addLog("❌ Processing failed with errors")
+          loadHistory()
+        }
+      }
     } catch (error) {
-      addMessage("error", "Failed to stop processing")
+      console.error("Error checking job status:", error)
     }
   }
 
-  const startWatching = async () => {
-    if (!watchDirectory.trim()) {
-      alert("Please enter a directory to watch")
+  const downloadResults = async () => {
+    if (!currentJob) return
+
+    try {
+      const response = await fetch(`/api/download?file=${encodeURIComponent(currentJob.outputFile)}`)
+      if (response.ok) {
+        const blob = await response.blob()
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = currentJob.outputFile
+        document.body.appendChild(a)
+        a.click()
+        window.URL.revokeObjectURL(url)
+        document.body.removeChild(a)
+        addLog("📥 Results downloaded successfully")
+      } else {
+        addLog("❌ Failed to download results")
+      }
+    } catch (error) {
+      addLog(`❌ Error downloading results: ${error}`)
+    }
+  }
+
+  // Watcher functions
+  const startWatcher = async () => {
+    if (!watcherRootDir.trim()) {
+      addLog("❌ Please select a directory to watch")
       return
     }
 
     try {
-      setWatchMode(true)
+      addLog("🔍 Starting file watcher...")
+
       const response = await fetch("/api/watch/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          rootDir: watchDirectory,
-          filterConfig: useFiltersForWatch
-            ? {
-                ...filterConfig,
-                enabled: filterEnabled,
-              }
-            : { enabled: false },
-          outputFile: watchOutputFile,
+          rootDir: watcherRootDir.trim(),
+          outputFile: watcherOutputFile.trim() || "watched_images.csv",
           numWorkers: 1,
-          verbose: true,
+          verbose: watcherVerbose,
+          filterConfig,
         }),
       })
 
-      const result = await response.json()
-      if (result.success) {
-        addMessage("system", `✅ Watcher started: ${result.message}`)
-        // Poll for status updates
-        const statusInterval = setInterval(async () => {
-          try {
-            const statusResponse = await fetch("/api/watch/status")
-            const status = await statusResponse.json()
-            setWatcherStatus(status)
-            if (!status.isWatching) {
-              clearInterval(statusInterval)
-              setWatchMode(false)
-            }
-          } catch (err) {
-            console.error("Status check failed:", err)
-          }
-        }, 2000)
+      const data = await response.json()
+
+      if (data.success) {
+        addLog(`✅ File watcher started successfully`)
+        addLog(`👀 Watching: ${data.watchingPath}`)
+        addLog(`📄 Output: ${data.outputFile}`)
+        addLog(`🔗 Looking for XML-Image pairs...`)
+        checkWatcherStatus()
       } else {
-        addMessage("error", `❌ Failed to start watcher: ${result.error}`)
-        setWatchMode(false)
+        addLog(`❌ Failed to start watcher: ${data.error}`)
       }
-    } catch (error: any) {
-      addMessage("error", `❌ Error starting watcher: ${error.message}`)
-      setWatchMode(false)
+    } catch (error) {
+      addLog(`❌ Error starting watcher: ${error}`)
     }
   }
 
-  const stopWatching = async () => {
+  const stopWatcher = async () => {
     try {
       const response = await fetch("/api/watch/stop", {
         method: "POST",
       })
-      const result = await response.json()
-      addMessage("system", `🛑 Watcher stopped: ${result.message}`)
-      setWatchMode(false)
-      setWatcherStatus(null)
-    } catch (error: any) {
-      addMessage("error", `❌ Error stopping watcher: ${error.message}`)
-    }
-  }
-
-  const deleteSession = async (sessionId: string) => {
-    try {
-      const response = await fetch(`/api/history/${sessionId}`, { method: "DELETE" })
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
 
       const data = await response.json()
 
       if (data.success) {
-        await loadHistory()
-        addMessage("system", "Session deleted successfully")
+        setWatcherStatus(null)
+        addLog("🛑 File watcher stopped")
       } else {
-        addMessage("error", `Failed to delete session: ${data.error}`)
+        addLog(`❌ Failed to stop watcher: ${data.error}`)
       }
     } catch (error) {
-      console.error("Failed to delete session:", error)
-      addMessage("error", `Failed to delete session: ${error.message}`)
+      addLog(`❌ Error stopping watcher: ${error}`)
     }
   }
 
-  const clearHistory = async () => {
+  const checkWatcherStatus = async () => {
     try {
-      const response = await fetch("/api/history", { method: "DELETE" })
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
-
+      const response = await fetch("/api/watch/status")
       const data = await response.json()
 
       if (data.success) {
-        await loadHistory()
-        addMessage("system", "History cleared successfully")
-      } else {
-        addMessage("error", `Failed to clear history: ${data.error}`)
+        setWatcherStatus(data.status)
       }
     } catch (error) {
-      console.error("Failed to clear history:", error)
-      addMessage("error", `Failed to clear history: ${error.message}`)
+      console.error("Error checking watcher status:", error)
     }
   }
 
-  const resumeFromSession = async (sessionId: string) => {
-    try {
-      const response = await fetch("/api/resume", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId }),
-      })
+  const formatDuration = (ms: number) => {
+    const seconds = Math.floor(ms / 1000)
+    const minutes = Math.floor(seconds / 60)
+    const hours = Math.floor(minutes / 60)
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
-
-      const data = await response.json()
-
-      if (data.success) {
-        // Load session config
-        const session = data.session || history.find((s) => s.id === sessionId)
-        if (session) {
-          setRootDir(session.config.rootDir)
-          setOutputFile(session.config.outputFile)
-          setNumWorkers(session.config.numWorkers)
-          setProcessingMode(session.config.processingMode as any)
-          if (session.config.filterConfig) {
-            setFilterConfig(session.config.filterConfig)
-            setFilterEnabled(true)
-          }
-          addMessage("system", `Prepared to resume session: ${sessionId}`)
-        }
-      } else {
-        addMessage("error", `Failed to prepare resume: ${data.error}`)
-      }
-    } catch (error) {
-      console.error("Failed to prepare resume:", error)
-      addMessage("error", `Failed to prepare resume: ${error.message}`)
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m ${seconds % 60}s`
+    } else if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`
+    } else {
+      return `${seconds}s`
     }
   }
 
-  const formatDuration = (start: string, end?: string) => {
-    const startTime = new Date(start)
-    const endTime = end ? new Date(end) : new Date()
-    const duration = endTime.getTime() - startTime.getTime()
-    const minutes = Math.floor(duration / 60000)
-    const seconds = Math.floor((duration % 60000) / 1000)
-    return `${minutes}m ${seconds}s`
+  const resetJob = () => {
+    setCurrentJob(null)
+    setIsProcessing(false)
+    setIsPaused(false)
+    addLog("🔄 Job reset")
   }
 
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case "completed":
-        return "text-green-600"
-      case "running":
-        return "text-blue-600"
-      case "paused":
-        return "text-yellow-600"
-      case "failed":
-        return "text-red-600"
-      case "interrupted":
-        return "text-orange-600"
-      default:
-        return "text-gray-600"
-    }
+  const clearLogs = () => {
+    setLogs([])
+  }
+
+  const handleFilterChange = (key: string, value: any) => {
+    setFilterConfig((prev) => ({
+      ...prev,
+      [key]: value,
+    }))
+  }
+
+  const handleTextFilterChange = (filterName: string, field: string, value: string) => {
+    setFilterConfig((prev) => ({
+      ...prev,
+      [filterName]: {
+        ...prev[filterName as keyof typeof prev],
+        [field]: value,
+      },
+    }))
   }
 
   return (
-    <div className="container mx-auto p-6 max-w-7xl">
-      <Toaster />
-      <div className="flex items-center justify-between mb-6">
-        <h1 className="text-3xl font-bold">XML to CSV Converter</h1>
-        <div className="flex items-center space-x-2">
-          <Badge variant={isRunning ? "default" : "secondary"}>{isRunning ? "Processing" : "Ready"}</Badge>
-          {isPaused && <Badge variant="outline">Paused</Badge>}
-          {watchMode && <Badge variant="outline">Watching</Badge>}
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+      <div className="max-w-7xl mx-auto space-y-6">
+        {/* Header */}
+        <div className="text-center space-y-2">
+          <h1 className="text-4xl font-bold text-gray-900">XML to CSV Converter</h1>
+          <p className="text-gray-600">Process XML files and extract image metadata with advanced filtering</p>
         </div>
-      </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        {/* Main Configuration Panel */}
-        <div className="lg:col-span-3">
-          <Tabs defaultValue="basic" className="w-full">
-            <TabsList className="grid w-full grid-cols-7">
-              <TabsTrigger value="basic">Basic</TabsTrigger>
-              <TabsTrigger value="filters">Filters</TabsTrigger>
-              <TabsTrigger value="chunked">Chunked</TabsTrigger>
-              <TabsTrigger value="watch">Watch</TabsTrigger>
-              <TabsTrigger value="history">History</TabsTrigger>
-              <TabsTrigger value="logs">Logs</TabsTrigger>
-              <TabsTrigger value="results">Results</TabsTrigger>
-            </TabsList>
+        <Tabs defaultValue="batch" className="w-full">
+          <TabsList className="grid w-full grid-cols-4">
+            <TabsTrigger value="batch" className="flex items-center gap-2">
+              <FileText className="w-4 h-4" />
+              Batch Processing
+            </TabsTrigger>
+            <TabsTrigger value="watcher" className="flex items-center gap-2">
+              <Eye className="w-4 h-4" />
+              File Watcher
+            </TabsTrigger>
+            <TabsTrigger value="filters" className="flex items-center gap-2">
+              <Filter className="w-4 h-4" />
+              Filters & Settings
+            </TabsTrigger>
+            <TabsTrigger value="history" className="flex items-center gap-2">
+              <Clock className="w-4 h-4" />
+              History & Logs
+            </TabsTrigger>
+          </TabsList>
 
-            {/* Basic Configuration */}
-            <TabsContent value="basic" className="space-y-4">
+          {/* Batch Processing Tab */}
+          <TabsContent value="batch" className="space-y-6">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* Input Configuration */}
               <Card>
                 <CardHeader>
-                  <CardTitle>Basic Configuration</CardTitle>
-                  <CardDescription>Configure the basic parsing settings</CardDescription>
+                  <CardTitle className="flex items-center gap-2">
+                    <Settings className="w-5 h-5" />
+                    Configuration
+                  </CardTitle>
+                  <CardDescription>Configure your XML processing settings</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="rootDir">Root Directory</Label>
-                      <Input
-                        id="rootDir"
-                        value={rootDir}
-                        onChange={(e) => setRootDir(e.target.value)}
-                        placeholder="/path/to/xml/files"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="outputFile">Output File</Label>
-                      <Input
-                        id="outputFile"
-                        value={outputFile}
-                        onChange={(e) => setOutputFile(e.target.value)}
-                        placeholder="output.csv"
-                      />
-                    </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="rootDir">Root Directory</Label>
+                    <Input
+                      id="rootDir"
+                      placeholder="/path/to/xml/files"
+                      value={rootDir}
+                      onChange={(e) => setRootDir(e.target.value)}
+                      disabled={isProcessing}
+                    />
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="numWorkers">Workers: {numWorkers}</Label>
-                      <Slider
-                        id="numWorkers"
-                        min={1}
-                        max={16}
-                        step={1}
-                        value={[numWorkers]}
-                        onValueChange={(value) => setNumWorkers(value[0])}
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="processingMode">Processing Mode</Label>
-                      <Select
-                        value={processingMode}
-                        onValueChange={(value) => setProcessingMode(value as "regular" | "stream" | "chunked")}
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="regular">Regular</SelectItem>
-                          <SelectItem value="stream">Stream</SelectItem>
-                          <SelectItem value="chunked">Chunked</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="outputFile">Output CSV File</Label>
+                    <Input
+                      id="outputFile"
+                      placeholder="image_metadata.csv"
+                      value={outputFile}
+                      onChange={(e) => setOutputFile(e.target.value)}
+                      disabled={isProcessing}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="numWorkers">Number of Workers: {numWorkers}</Label>
+                    <Slider
+                      id="numWorkers"
+                      min={1}
+                      max={8}
+                      step={1}
+                      value={[numWorkers]}
+                      onValueChange={(value) => setNumWorkers(value[0])}
+                      disabled={isProcessing}
+                      className="w-full"
+                    />
                   </div>
 
                   <div className="flex items-center space-x-2">
-                    <Switch id="verbose" checked={verbose} onCheckedChange={setVerbose} />
-                    <Label htmlFor="verbose">Verbose logging</Label>
+                    <Switch id="verbose" checked={verbose} onCheckedChange={setVerbose} disabled={isProcessing} />
+                    <Label htmlFor="verbose">Verbose Logging</Label>
                   </div>
-                </CardContent>
-              </Card>
-            </TabsContent>
 
-            {/* Filters Configuration */}
-            <TabsContent value="filters" className="space-y-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle>File Filters</CardTitle>
-                  <CardDescription>Configure which files to process</CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-4">
                   <div className="flex items-center space-x-2">
-                    <Switch id="filterEnabled" checked={filterEnabled} onCheckedChange={setFilterEnabled} />
-                    <Label htmlFor="filterEnabled">Enable filtering</Label>
-                    {filterEnabled && (
-                      <Badge variant="outline" className="ml-2">
-                        Filters Active
-                      </Badge>
-                    )}
+                    <Switch id="showAdvanced" checked={showAdvanced} onCheckedChange={setShowAdvanced} />
+                    <Label htmlFor="showAdvanced">Show Advanced Options</Label>
                   </div>
 
-                  {filterEnabled && (
-                    <>
-                      <div className="space-y-3">
-                        <div className="flex items-center justify-between">
-                          <Label>File Types</Label>
-                          <div className="space-x-2">
-                            <Button size="sm" variant="outline" onClick={selectAllCommonTypes}>
-                              Select All Common
-                            </Button>
-                            <Button size="sm" variant="outline" onClick={clearAllTypes}>
-                              Clear All
-                            </Button>
-                          </div>
-                        </div>
-
-                        <div className="grid grid-cols-3 md:grid-cols-5 gap-2">
-                          {["jpg", "jpeg", "png", "tiff", "bmp", "gif", "webp", "raw", "cr2", "nef"].map((type) => (
-                            <div key={type} className="flex items-center space-x-2">
-                              <Checkbox
-                                id={type}
-                                checked={filterConfig.fileTypes.includes(type)}
-                                onCheckedChange={(checked) => handleFileTypeChange(type, checked as boolean)}
-                              />
-                              <Label htmlFor={type} className="text-sm">
-                                {type.toUpperCase()}
-                              </Label>
-                            </div>
-                          ))}
-                        </div>
-
-                        <div className="space-y-2">
-                          <Label htmlFor="customExtensions">Custom Extensions</Label>
-                          <Input
-                            id="customExtensions"
-                            value={filterConfig.customExtensions}
-                            onChange={(e) => setFilterConfig((prev) => ({ ...prev, customExtensions: e.target.value }))}
-                            placeholder="heic,dng,arw (comma-separated)"
-                          />
-                        </div>
+                  {showAdvanced && (
+                    <div className="space-y-4 p-4 bg-gray-50 rounded-lg">
+                      <h4 className="font-medium">Advanced Settings</h4>
+                      <div className="space-y-2">
+                        <Label>Processing Mode</Label>
+                        <Select defaultValue="standard">
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="standard">Standard</SelectItem>
+                            <SelectItem value="chunked">Chunked Processing</SelectItem>
+                            <SelectItem value="stream">Stream Processing</SelectItem>
+                          </SelectContent>
+                        </Select>
                       </div>
-
-                      <div className="space-y-3">
-                        <Label>Image Dimensions</Label>
-
-                        {/* Dimension Presets */}
-                        <div className="space-y-2">
-                          <Label className="text-sm font-medium">Quick Presets</Label>
-                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                            {[
-                              { label: "200×200", width: 200, height: 200 },
-                              { label: "500×500", width: 500, height: 500 },
-                              { label: "1024×1024", width: 1024, height: 1024 },
-                              { label: "1280×1280", width: 1280, height: 1280 },
-                              { label: "1920×1080", width: 1920, height: 1080 },
-                              { label: "2048×2048", width: 2048, height: 2048 },
-                              { label: "4K (3840×2160)", width: 3840, height: 2160 },
-                              { label: "Clear", width: null, height: null },
-                            ].map((preset) => (
-                              <Button
-                                key={preset.label}
-                                size="sm"
-                                variant="outline"
-                                onClick={() => {
-                                  setFilterConfig((prev) => ({
-                                    ...prev,
-                                    minWidth: preset.width,
-                                    minHeight: preset.height,
-                                  }))
-                                }}
-                                className="text-xs"
-                              >
-                                {preset.label}
-                              </Button>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* Manual Input */}
-                        <div className="grid grid-cols-2 gap-4">
-                          <div className="space-y-2">
-                            <Label htmlFor="minWidth">Min Width (px)</Label>
-                            <Input
-                              id="minWidth"
-                              type="number"
-                              value={filterConfig.minWidth || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  minWidth: e.target.value ? Number.parseInt(e.target.value) : undefined,
-                                }))
-                              }
-                              placeholder="e.g. 1024"
-                            />
-                          </div>
-                          <div className="space-y-2">
-                            <Label htmlFor="minHeight">Min Height (px)</Label>
-                            <Input
-                              id="minHeight"
-                              type="number"
-                              value={filterConfig.minHeight || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  minHeight: e.target.value ? Number.parseInt(e.target.value) : undefined,
-                                }))
-                              }
-                              placeholder="e.g. 1024"
-                            />
-                          </div>
-                        </div>
-
-                        <div className="grid grid-cols-2 gap-4">
-                          <div className="space-y-2">
-                            <Label htmlFor="maxWidth">Max Width (px)</Label>
-                            <Input
-                              id="maxWidth"
-                              type="number"
-                              value={filterConfig.maxWidth || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  maxWidth: e.target.value ? Number.parseInt(e.target.value) : undefined,
-                                }))
-                              }
-                              placeholder="e.g. 4096"
-                            />
-                          </div>
-                          <div className="space-y-2">
-                            <Label htmlFor="maxHeight">Max Height (px)</Label>
-                            <Input
-                              id="maxHeight"
-                              type="number"
-                              value={filterConfig.maxHeight || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  maxHeight: e.target.value ? Number.parseInt(e.target.value) : undefined,
-                                }))
-                              }
-                              placeholder="e.g. 4096"
-                            />
-                          </div>
-                        </div>
-
-                        {/* Current Selection Display */}
-                        {(filterConfig.minWidth || filterConfig.minHeight) && (
-                          <div className="p-3 bg-muted rounded-lg">
-                            <div className="text-sm font-medium">Current Filter:</div>
-                            <div className="text-sm text-muted-foreground">
-                              Min: {filterConfig.minWidth || 0} × {filterConfig.minHeight || 0} pixels
-                              {(filterConfig.maxWidth || filterConfig.maxHeight) && (
-                                <span>
-                                  {" "}
-                                  | Max: {filterConfig.maxWidth || "∞"} × {filterConfig.maxHeight || "∞"} pixels
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="space-y-4">
-                        <Label className="text-base font-semibold">Metadata Filters</Label>
-
-                        {/* Credit Line Filter */}
-                        <div className="space-y-2">
-                          <Label htmlFor="creditLineOperator">Credit Line</Label>
-                          <div className="grid grid-cols-2 gap-2">
-                            <Select
-                              value={filterConfig.creditLine?.operator || ""}
-                              onValueChange={(value) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  creditLine: {
-                                    ...prev.creditLine,
-                                    operator: value,
-                                    value: prev.creditLine?.value || "",
-                                  },
-                                }))
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue placeholder="Select operator" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="like">Contains</SelectItem>
-                                <SelectItem value="notLike">Does not contain</SelectItem>
-                                <SelectItem value="equals">Equals</SelectItem>
-                                <SelectItem value="notEquals">Not equals</SelectItem>
-                                <SelectItem value="startsWith">Starts with</SelectItem>
-                                <SelectItem value="endsWith">Ends with</SelectItem>
-                                <SelectItem value="notBlank">Not blank</SelectItem>
-                                <SelectItem value="isBlank">Is blank</SelectItem>
-                              </SelectContent>
-                            </Select>
-                            <Input
-                              value={filterConfig.copyright?.value || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  copyright: {
-                                    ...prev.copyright,
-                                    operator: prev.copyright?.operator || "like",
-                                    value: e.target.value,
-                                  },
-                                }))
-                              }
-                              placeholder="Filter value"
-                              disabled={!filterConfig.copyright?.operator}
-                            />
-                          </div>
-                        </div>
-
-                        {/* Usage Type Filter */}
-                        <div className="space-y-2">
-                          <Label htmlFor="usageTypeOperator">Usage Type</Label>
-                          <div className="grid grid-cols-2 gap-2">
-                            <Select
-                              value={filterConfig.usageType?.operator || ""}
-                              onValueChange={(value) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  usageType: { ...prev.usageType, operator: value, value: prev.usageType?.value || "" },
-                                }))
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue placeholder="Select operator" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="like">Contains</SelectItem>
-                                <SelectItem value="notLike">Does not contain</SelectItem>
-                                <SelectItem value="equals">Equals</SelectItem>
-                                <SelectItem value="notEquals">Not equals</SelectItem>
-                                <SelectItem value="startsWith">Starts with</SelectItem>
-                                <SelectItem value="endsWith">Ends with</SelectItem>
-                                <SelectItem value="notBlank">Not blank</SelectItem>
-                                <SelectItem value="isBlank">Is blank</SelectItem>
-                              </SelectContent>
-                            </Select>
-                            <Input
-                              value={filterConfig.usageType?.value || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  usageType: {
-                                    ...prev.usageType,
-                                    operator: prev.usageType?.operator || "like",
-                                    value: e.target.value,
-                                  },
-                                }))
-                              }
-                              placeholder="Filter value"
-                              disabled={!filterConfig.usageType?.operator}
-                            />
-                          </div>
-                        </div>
-
-                        {/* Rights Holder Filter */}
-                        <div className="space-y-2">
-                          <Label htmlFor="rightsHolderOperator">Rights Holder</Label>
-                          <div className="grid grid-cols-2 gap-2">
-                            <Select
-                              value={filterConfig.rightsHolder?.operator || ""}
-                              onValueChange={(value) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  rightsHolder: {
-                                    ...prev.rightsHolder,
-                                    operator: value,
-                                    value: prev.rightsHolder?.value || "",
-                                  },
-                                }))
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue placeholder="Select operator" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="like">Contains</SelectItem>
-                                <SelectItem value="notLike">Does not contain</SelectItem>
-                                <SelectItem value="equals">Equals</SelectItem>
-                                <SelectItem value="notEquals">Not equals</SelectItem>
-                                <SelectItem value="startsWith">Starts with</SelectItem>
-                                <SelectItem value="endsWith">Ends with</SelectItem>
-                                <SelectItem value="notBlank">Not blank</SelectItem>
-                                <SelectItem value="isBlank">Is blank</SelectItem>
-                              </SelectContent>
-                            </Select>
-                            <Input
-                              value={filterConfig.rightsHolder?.value || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  rightsHolder: {
-                                    ...prev.rightsHolder,
-                                    operator: prev.rightsHolder?.operator || "like",
-                                    value: e.target.value,
-                                  },
-                                }))
-                              }
-                              placeholder="Filter value"
-                              disabled={!filterConfig.rightsHolder?.operator}
-                            />
-                          </div>
-                        </div>
-
-                        {/* Location Filter */}
-                        <div className="space-y-2">
-                          <Label htmlFor="locationOperator">Location</Label>
-                          <div className="grid grid-cols-2 gap-2">
-                            <Select
-                              value={filterConfig.location?.operator || ""}
-                              onValueChange={(value) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  location: { ...prev.location, operator: value, value: prev.location?.value || "" },
-                                }))
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue placeholder="Select operator" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="like">Contains</SelectItem>
-                                <SelectItem value="notLike">Does not contain</SelectItem>
-                                <SelectItem value="equals">Equals</SelectItem>
-                                <SelectItem value="notEquals">Not equals</SelectItem>
-                                <SelectItem value="startsWith">Starts with</SelectItem>
-                                <SelectItem value="endsWith">Ends with</SelectItem>
-                                <SelectItem value="notBlank">Is blank</SelectItem>
-                                <SelectItem value="isBlank">Is blank</SelectItem>
-                              </SelectContent>
-                            </Select>
-                            <Input
-                              value={filterConfig.location?.value || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  location: {
-                                    ...prev.location,
-                                    operator: prev.location?.operator || "like",
-                                    value: e.target.value,
-                                  },
-                                }))
-                              }
-                              placeholder="Filter value"
-                              disabled={!filterConfig.location?.operator}
-                            />
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="space-y-4">
-                        <Label className="text-base font-semibold">File Size Filters</Label>
-
-                        <div className="grid grid-cols-2 gap-4">
-                          <div className="space-y-2">
-                            <Label htmlFor="minFileSize">Min File Size</Label>
-                            <div className="flex space-x-2">
-                              <Input
-                                id="minFileSize"
-                                type="number"
-                                step="0.1"
-                                value={filterConfig.minFileSizeValue || ""}
-                                onChange={(e) => {
-                                  const value = e.target.value ? Number.parseFloat(e.target.value) : undefined
-                                  const unit = filterConfig.minFileSizeUnit || "MB"
-                                  setFilterConfig((prev) => ({
-                                    ...prev,
-                                    minFileSizeValue: value,
-                                    minFileSize: value
-                                      ? unit === "MB"
-                                        ? value * 1024 * 1024
-                                        : value * 1024
-                                      : undefined,
-                                  }))
-                                }}
-                                placeholder="0.0"
-                              />
-                              <Select
-                                value={filterConfig.minFileSizeUnit || "MB"}
-                                onValueChange={(unit) => {
-                                  const value = filterConfig.minFileSizeValue
-                                  setFilterConfig((prev) => ({
-                                    ...prev,
-                                    minFileSizeUnit: unit,
-                                    minFileSize: value
-                                      ? unit === "MB"
-                                        ? value * 1024 * 1024
-                                        : value * 1024
-                                      : undefined,
-                                  }))
-                                }}
-                              >
-                                <SelectTrigger className="w-20">
-                                  <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  <SelectItem value="KB">KB</SelectItem>
-                                  <SelectItem value="MB">MB</SelectItem>
-                                </SelectContent>
-                              </Select>
-                            </div>
-                          </div>
-                          <div className="space-y-2">
-                            <Label htmlFor="maxFileSize">Max File Size</Label>
-                            <div className="flex space-x-2">
-                              <Input
-                                id="maxFileSize"
-                                type="number"
-                                step="0.1"
-                                value={filterConfig.maxFileSizeValue || ""}
-                                onChange={(e) => {
-                                  const value = e.target.value ? Number.parseFloat(e.target.value) : undefined
-                                  const unit = filterConfig.maxFileSizeUnit || "MB"
-                                  setFilterConfig((prev) => ({
-                                    ...prev,
-                                    maxFileSizeValue: value,
-                                    maxFileSize: value
-                                      ? unit === "MB"
-                                        ? value * 1024 * 1024
-                                        : value * 1024
-                                      : undefined,
-                                  }))
-                                }}
-                                placeholder="100.0"
-                              />
-                              <Select
-                                value={filterConfig.maxFileSizeUnit || "MB"}
-                                onValueChange={(unit) => {
-                                  const value = filterConfig.maxFileSizeValue
-                                  setFilterConfig((prev) => ({
-                                    ...prev,
-                                    maxFileSizeUnit: unit,
-                                    maxFileSize: value
-                                      ? unit === "MB"
-                                        ? value * 1024 * 1024
-                                        : value * 1024
-                                      : undefined,
-                                  }))
-                                }}
-                              >
-                                <SelectTrigger className="w-20">
-                                  <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  <SelectItem value="KB">KB</SelectItem>
-                                  <SelectItem value="MB">MB</SelectItem>
-                                </SelectContent>
-                              </Select>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="space-y-4">
-                        <Label className="text-base font-semibold">Image Moving</Label>
-
-                        <div className="flex items-center space-x-2">
-                          <Switch
-                            id="moveImages"
-                            checked={filterConfig.moveImages}
-                            onCheckedChange={(checked) =>
-                              setFilterConfig((prev) => ({
-                                ...prev,
-                                moveImages: checked,
-                              }))
-                            }
-                          />
-                          <Label htmlFor="moveImages">Move filtered images to destination</Label>
-                          {filterConfig.moveImages && (
-                            <Badge variant="outline" className="ml-2">
-                              Move Enabled
-                            </Badge>
-                          )}
-                        </div>
-
-                        {filterConfig.moveImages && (
-                          <>
-                            <div className="space-y-2">
-                              <Label htmlFor="moveDestinationPath">Destination Path</Label>
-                              <Input
-                                id="moveDestinationPath"
-                                value={filterConfig.moveDestinationPath || ""}
-                                onChange={(e) =>
-                                  setFilterConfig((prev) => ({
-                                    ...prev,
-                                    moveDestinationPath: e.target.value,
-                                  }))
-                                }
-                                placeholder="/path/to/filtered/images"
-                              />
-                            </div>
-
-                            <div className="space-y-2">
-                              <Label htmlFor="moveFolderStructure">Folder Structure</Label>
-                              <Select
-                                value={filterConfig.moveFolderStructureOption || "replicate"}
-                                onValueChange={(value) =>
-                                  setFilterConfig((prev) => ({
-                                    ...prev,
-                                    moveFolderStructureOption: value as "replicate" | "flat",
-                                  }))
-                                }
-                              >
-                                <SelectTrigger>
-                                  <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  <SelectItem value="replicate">Replicate source structure</SelectItem>
-                                  <SelectItem value="flat">Single folder (flat)</SelectItem>
-                                </SelectContent>
-                              </Select>
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    </>
+                    </div>
                   )}
                 </CardContent>
               </Card>
-            </TabsContent>
 
-            {/* Chunked Processing */}
-            <TabsContent value="chunked" className="space-y-4">
+              {/* Processing Status */}
               <Card>
                 <CardHeader>
-                  <CardTitle>Chunked Processing</CardTitle>
-                  <CardDescription>Process large directories in manageable chunks</CardDescription>
+                  <CardTitle className="flex items-center gap-2">
+                    <Activity className="w-5 h-5" />
+                    Processing Status
+                  </CardTitle>
+                  <CardDescription>Monitor your current processing job</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  {processingMode === "chunked" ? (
+                  {currentJob ? (
                     <>
                       <div className="space-y-2">
-                        <Label htmlFor="chunkSize">Chunk Size: {chunkSize} files</Label>
-                        <Slider
-                          id="chunkSize"
-                          min={10}
-                          max={500}
-                          step={10}
-                          value={[chunkSize]}
-                          onValueChange={(value) => setChunkSize(value[0])}
-                        />
-                        <p className="text-sm text-muted-foreground">
-                          Smaller chunks use less memory but may be slower overall
-                        </p>
-                      </div>
-
-                      <div className="flex items-center space-x-2">
-                        <Switch
-                          id="pauseBetweenChunks"
-                          checked={pauseBetweenChunks}
-                          onCheckedChange={setPauseBetweenChunks}
-                        />
-                        <Label htmlFor="pauseBetweenChunks">Pause between chunks</Label>
-                      </div>
-
-                      {pauseBetweenChunks && (
-                        <div className="space-y-2">
-                          <Label htmlFor="pauseDuration">Pause Duration: {pauseDuration}s</Label>
-                          <Slider
-                            id="pauseDuration"
-                            min={1}
-                            max={60}
-                            step={1}
-                            value={[pauseDuration]}
-                            onValueChange={(value) => setPauseDuration(value[0])}
-                          />
+                        <div className="flex justify-between text-sm">
+                          <span>Progress</span>
+                          <span>{Math.round(currentJob.progress)}%</span>
                         </div>
-                      )}
-
-                      <div className="flex items-center space-x-2">
-                        <Switch id="organizeByCity" checked={organizeByCity} onCheckedChange={setOrganizeByCity} />
-                        <Label htmlFor="organizeByCity">Organize results by city</Label>
+                        <Progress value={currentJob.progress} className="w-full" />
                       </div>
 
-                      {totalChunks > 0 && (
-                        <div className="space-y-2">
-                          <Label>Chunk Progress</Label>
-                          <div className="flex items-center justify-between text-sm">
-                            <span>
-                              Chunk {currentChunk} of {totalChunks}
-                            </span>
-                            <span>{Math.round((currentChunk / totalChunks) * 100)}%</span>
+                      <div className="grid grid-cols-2 gap-4 text-sm">
+                        <div className="space-y-1">
+                          <div className="flex justify-between">
+                            <span>Total Files:</span>
+                            <Badge variant="outline">{currentJob.totalFiles}</Badge>
                           </div>
-                          <Progress value={(currentChunk / totalChunks) * 100} />
+                          <div className="flex justify-between">
+                            <span>Processed:</span>
+                            <Badge variant="default">{currentJob.processedFiles}</Badge>
+                          </div>
                         </div>
-                      )}
+                        <div className="space-y-1">
+                          <div className="flex justify-between">
+                            <span>Filtered:</span>
+                            <Badge variant="secondary">{currentJob.filteredFiles}</Badge>
+                          </div>
+                          <div className="flex justify-between">
+                            <span>Moved:</span>
+                            <Badge variant="destructive">{currentJob.movedFiles}</Badge>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <div
+                          className={`w-2 h-2 rounded-full ${
+                            currentJob.status === "running"
+                              ? "bg-green-500 animate-pulse"
+                              : currentJob.status === "paused"
+                                ? "bg-yellow-500"
+                                : currentJob.status === "completed"
+                                  ? "bg-blue-500"
+                                  : "bg-red-500"
+                          }`}
+                        />
+                        <span className="text-sm font-medium capitalize">{currentJob.status}</span>
+                      </div>
                     </>
                   ) : (
-                    <Alert>
-                      <AlertDescription>
-                        Chunked processing is only available when "Chunked" mode is selected in Basic Configuration.
-                      </AlertDescription>
-                    </Alert>
+                    <div className="text-center py-8 text-gray-500">
+                      <FileText className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                      <p>No active processing job</p>
+                    </div>
                   )}
                 </CardContent>
               </Card>
-            </TabsContent>
+            </div>
 
-            {/* Watch Mode */}
-            <TabsContent value="watch" className="space-y-4">
+            {/* Control Buttons */}
+            <Card>
+              <CardContent className="pt-6">
+                <div className="flex flex-wrap gap-3">
+                  {!isProcessing ? (
+                    <Button onClick={startProcessing} className="flex items-center gap-2">
+                      <Play className="w-4 h-4" />
+                      Start Processing
+                    </Button>
+                  ) : (
+                    <>
+                      {!isPaused ? (
+                        <Button
+                          onClick={pauseProcessing}
+                          variant="outline"
+                          className="flex items-center gap-2 bg-transparent"
+                        >
+                          <Pause className="w-4 h-4" />
+                          Pause
+                        </Button>
+                      ) : (
+                        <Button onClick={resumeProcessing} className="flex items-center gap-2">
+                          <Play className="w-4 h-4" />
+                          Resume
+                        </Button>
+                      )}
+                    </>
+                  )}
+
+                  <Button
+                    onClick={resetJob}
+                    variant="outline"
+                    disabled={isProcessing && !isPaused}
+                    className="flex items-center gap-2 bg-transparent"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    Reset
+                  </Button>
+
+                  <Button
+                    onClick={downloadResults}
+                    variant="outline"
+                    disabled={!currentJob || currentJob.status !== "completed"}
+                    className="flex items-center gap-2 bg-transparent"
+                  >
+                    <Download className="w-4 h-4" />
+                    Download Results
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* File Watcher Tab */}
+          <TabsContent value="watcher" className="space-y-6">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* Watcher Configuration */}
               <Card>
                 <CardHeader>
-                  <CardTitle>File Watcher</CardTitle>
-                  <CardDescription>Monitor directories for new files and process them automatically</CardDescription>
+                  <CardTitle className="flex items-center gap-2">
+                    <Eye className="w-5 h-5" />
+                    File Watcher Configuration
+                  </CardTitle>
+                  <CardDescription>
+                    Monitor a directory for new XML-Image pairs and process them automatically
+                  </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="watchDirectory">Directory to Watch</Label>
-                      <Input
-                        id="watchDirectory"
-                        value={watchDirectory}
-                        onChange={(e) => setWatchDirectory(e.target.value)}
-                        placeholder="/Users/amangupta/Desktop/test-images"
-                      />
-                      <p className="text-xs text-gray-500">
-                        💡 <strong>Tip:</strong> Create directory first:{" "}
-                        <code>mkdir -p /Users/amangupta/Desktop/test-images</code>
-                      </p>
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="watchOutputFile">Output CSV File</Label>
-                      <Input
-                        id="watchOutputFile"
-                        value={watchOutputFile}
-                        onChange={(e) => setWatchOutputFile(e.target.value)}
-                        placeholder="watched_images.csv"
-                      />
-                    </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="watcherRootDir">Directory to Watch</Label>
+                    <Input
+                      id="watcherRootDir"
+                      placeholder="/path/to/watch/directory"
+                      value={watcherRootDir}
+                      onChange={(e) => setWatcherRootDir(e.target.value)}
+                      disabled={watcherStatus?.isWatching}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="watcherOutputFile">Output CSV File</Label>
+                    <Input
+                      id="watcherOutputFile"
+                      placeholder="watched_images.csv"
+                      value={watcherOutputFile}
+                      onChange={(e) => setWatcherOutputFile(e.target.value)}
+                      disabled={watcherStatus?.isWatching}
+                    />
                   </div>
 
                   <div className="flex items-center space-x-2">
                     <Switch
-                      id="useFiltersForWatch"
-                      checked={useFiltersForWatch}
-                      onCheckedChange={setUseFiltersForWatch}
+                      id="watcherVerbose"
+                      checked={watcherVerbose}
+                      onCheckedChange={setWatcherVerbose}
+                      disabled={watcherStatus?.isWatching}
                     />
-                    <Label htmlFor="useFiltersForWatch">Apply current filters to watched files</Label>
+                    <Label htmlFor="watcherVerbose">Verbose Logging</Label>
                   </div>
-
-                  <div className="flex space-x-2">
-                    <Button onClick={startWatching} disabled={watchMode || !watchDirectory.trim()} className="flex-1">
-                      {watchMode ? "Watching..." : "Start Watching"}
-                    </Button>
-                    <Button
-                      onClick={stopWatching}
-                      disabled={!watchMode}
-                      variant="outline"
-                      className="flex-1 bg-transparent"
-                    >
-                      Stop Watching
-                    </Button>
-                  </div>
-
-                  {watcherStatus && (
-                    <div className="mt-4 p-4 bg-muted rounded-lg">
-                      <h4 className="font-medium mb-2">Watcher Status</h4>
-                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                        <div>
-                          <span className="text-muted-foreground">Status:</span>
-                          <div className={`font-medium ${watchMode ? "text-green-600" : "text-gray-600"}`}>
-                            {watchMode ? "🟢 Active" : "🔴 Stopped"}
-                          </div>
-                        </div>
-                        <div>
-                          <span className="text-muted-foreground">Processed:</span>
-                          <div className="font-medium">{watcherStatus.stats?.filesProcessed || 0}</div>
-                        </div>
-                        <div>
-                          <span className="text-muted-foreground">Successful:</span>
-                          <div className="font-medium text-green-600">{watcherStatus.stats?.filesSuccessful || 0}</div>
-                        </div>
-                        <div>
-                          <span className="text-muted-foreground">Moved:</span>
-                          <div className="font-medium text-blue-600">{watcherStatus.stats?.filesMoved || 0}</div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
 
                   <Alert>
+                    <AlertCircle className="h-4 w-4" />
                     <AlertDescription>
-                      <strong>How it works:</strong> The watcher monitors the specified directory for new image files.
-                      When files are added, they are automatically processed and results are appended to the CSV file.
-                      If filters are enabled, only images that pass the filters will be processed and moved.
+                      The watcher looks for XML-Image pairs with matching base names. Both files must be present before
+                      processing begins.
                     </AlertDescription>
                   </Alert>
                 </CardContent>
               </Card>
-            </TabsContent>
 
-            {/* History */}
-            <TabsContent value="history" className="space-y-4">
+              {/* Watcher Status */}
               <Card>
                 <CardHeader>
-                  <CardTitle>Processing History</CardTitle>
-                  <CardDescription>View and manage previous processing sessions</CardDescription>
+                  <CardTitle className="flex items-center gap-2">
+                    <Activity className="w-5 h-5" />
+                    Watcher Status
+                  </CardTitle>
+                  <CardDescription>Monitor file watcher activity and statistics</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="flex justify-between items-center">
-                    <div className="flex space-x-2">
-                      <Button onClick={loadHistory} variant="outline" size="sm">
-                        Refresh
-                      </Button>
-                      <Button onClick={clearHistory} variant="destructive" size="sm">
-                        Clear All
-                      </Button>
-                    </div>
-                    {canResume && (
-                      <Badge variant="outline" className="text-orange-600">
-                        Resume Available
-                      </Badge>
-                    )}
-                  </div>
-
-                  <ScrollArea className="h-96">
-                    <div className="space-y-3">
-                      {!Array.isArray(history) || history.length === 0 ? (
-                        <div className="text-center text-muted-foreground py-8">No processing history found</div>
-                      ) : (
-                        history.map((session) => (
-                          <Card key={session.id} className="p-4">
-                            <div className="flex justify-between items-start">
-                              <div className="space-y-2 flex-1">
-                                <div className="flex items-center space-x-2">
-                                  <Badge variant="outline" className={getStatusColor(session.status)}>
-                                    {session.status.toUpperCase()}
-                                  </Badge>
-                                  <span className="text-sm text-muted-foreground">
-                                    {new Date(session.startTime).toLocaleString()}
-                                  </span>
-                                </div>
-
-                                <div className="text-sm">
-                                  <div>
-                                    <strong>Directory:</strong> {session.config.rootDir}
-                                  </div>
-                                  <div>
-                                    <strong>Output:</strong> {session.config.outputFile}
-                                  </div>
-                                  <div>
-                                    <strong>Mode:</strong> {session.config.processingMode}
-                                  </div>
-                                  <div>
-                                    <strong>Duration:</strong> {formatDuration(session.startTime, session.endTime)}
-                                  </div>
-                                </div>
-
-                                <div className="grid grid-cols-3 gap-4 text-sm">
-                                  <div>
-                                    <div className="font-medium">Progress</div>
-                                    <div>
-                                      {session.progress.processedFiles}/{session.progress.totalFiles}
-                                    </div>
-                                  </div>
-                                  <div>
-                                    <div className="font-medium">Success</div>
-                                    <div className="text-green-600">{session.progress.successCount}</div>
-                                  </div>
-                                  <div>
-                                    <div className="font-medium">Errors</div>
-                                    <div className="text-red-600">{session.progress.errorCount}</div>
-                                  </div>
-                                </div>
-
-                                {session.progress.totalFiles > 0 && (
-                                  <Progress
-                                    value={(session.progress.processedFiles / session.progress.totalFiles) * 100}
-                                    className="h-2"
-                                  />
-                                )}
-                              </div>
-
-                              <div className="flex flex-col space-y-2 ml-4">
-                                {(session.status === "interrupted" || session.status === "paused") && (
-                                  <Button size="sm" onClick={() => resumeFromSession(session.id)} className="text-xs">
-                                    Resume
-                                  </Button>
-                                )}
-                                {session.results?.outputPath && (
-                                  <Button size="sm" variant="outline" asChild className="text-xs bg-transparent">
-                                    <a href={`/api/download?file=${encodeURIComponent(session.results.outputPath)}`}>
-                                      Download
-                                    </a>
-                                  </Button>
-                                )}
-                                <Button
-                                  size="sm"
-                                  variant="destructive"
-                                  onClick={() => deleteSession(session.id)}
-                                  className="text-xs"
-                                >
-                                  Delete
-                                </Button>
-                              </div>
-                            </div>
-                          </Card>
-                        ))
-                      )}
-                    </div>
-                  </ScrollArea>
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            {/* Logs */}
-            <TabsContent value="logs" className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Processing Logs</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <ScrollArea className="h-64">
-                      <div className="space-y-1">
-                        {messages.map((message, index) => (
-                          <div key={index} className="text-sm">
-                            <span className="text-muted-foreground">{message.timestamp}</span>
-                            <span className="ml-2 font-medium">[{message.type}]</span>
-                            <span className="ml-2">{JSON.stringify(message.message)}</span>
-                          </div>
-                        ))}
+                  {watcherStatus?.isWatching ? (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                        <span className="text-sm font-medium">Watching Active</span>
                       </div>
-                    </ScrollArea>
-                  </CardContent>
-                </Card>
 
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Error Logs</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <ScrollArea className="h-64">
-                      <div className="space-y-1">
-                        {errorMessages.map((message, index) => (
-                          <div key={index} className="text-sm text-red-600">
-                            <span className="text-muted-foreground">{message.timestamp}</span>
-                            <span className="ml-2 font-medium">[ERROR]</span>
-                            <span className="ml-2">{JSON.stringify(message.message)}</span>
-                          </div>
-                        ))}
+                      <div className="space-y-2 text-sm">
+                        <div className="flex justify-between">
+                          <span>Uptime:</span>
+                          <Badge variant="outline">{formatDuration(watcherStatus.uptime)}</Badge>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>XML Files Detected:</span>
+                          <Badge variant="default">{watcherStatus.stats.xmlFilesDetected}</Badge>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Image Files Detected:</span>
+                          <Badge variant="default">{watcherStatus.stats.imageFilesDetected}</Badge>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Pairs Processed:</span>
+                          <Badge variant="secondary">{watcherStatus.stats.pairsProcessed}</Badge>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Pending Pairs:</span>
+                          <Badge variant="outline">{watcherStatus.pendingPairs}</Badge>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Files Moved:</span>
+                          <Badge variant="destructive">{watcherStatus.stats.filesMoved}</Badge>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Errors:</span>
+                          <Badge variant="destructive">{watcherStatus.stats.filesErrored}</Badge>
+                        </div>
                       </div>
-                    </ScrollArea>
-                  </CardContent>
-                </Card>
-              </div>
-            </TabsContent>
-
-            {/* Results */}
-            <TabsContent value="results" className="space-y-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Processing Results</CardTitle>
-                  <CardDescription>View progress and download results</CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label>Overall Progress</Label>
-                      <span className="text-sm font-medium">{progress}%</span>
-                    </div>
-                    <Progress value={progress} />
-                  </div>
-
-                  {stats.totalFiles > 0 && (
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                      <div className="text-center">
-                        <div className="text-2xl font-bold">{stats.totalFiles}</div>
-                        <div className="text-sm text-muted-foreground">Total Files</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-2xl font-bold">{stats.processedFiles}</div>
-                        <div className="text-sm text-muted-foreground">Processed</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-2xl font-bold text-green-600">{stats.successCount}</div>
-                        <div className="text-sm text-muted-foreground">Success</div>
-                      </div>
-                      <div className="text-center">
-                        <div className="text-2xl font-bold text-red-600">{stats.errorCount}</div>
-                        <div className="text-sm text-muted-foreground">Errors</div>
-                      </div>
-                    </div>
-                  )}
-
-                  {stats.currentFile && (
-                    <div className="space-y-1">
-                      <Label>Currently Processing</Label>
-                      <p className="text-sm text-muted-foreground truncate">{stats.currentFile}</p>
-                    </div>
-                  )}
-
-                  {downloadURL && (
-                    <div className="space-y-2">
-                      <Label>Download Results</Label>
-                      <Button asChild className="w-full">
-                        <a href={downloadURL} download>
-                          Download CSV File
-                        </a>
-                      </Button>
+                    </>
+                  ) : (
+                    <div className="text-center py-8 text-gray-500">
+                      <EyeOff className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                      <p>File watcher is not active</p>
                     </div>
                   )}
                 </CardContent>
               </Card>
-            </TabsContent>
-          </Tabs>
-        </div>
+            </div>
 
-        {/* Quick Stats Sidebar */}
-        <div className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">Quick Stats</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex justify-between">
-                <span className="text-sm">Status:</span>
-                <Badge variant={isRunning ? "default" : "secondary"}>{isRunning ? "Running" : "Idle"}</Badge>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-sm">Mode:</span>
-                <span className="text-sm font-medium">{processingMode}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-sm">Workers:</span>
-                <span className="text-sm font-medium">{numWorkers}</span>
-              </div>
-              {filterEnabled && (
-                <div className="flex justify-between">
-                  <span className="text-sm">Filters:</span>
-                  <Badge variant="outline">Enabled</Badge>
-                </div>
-              )}
-              {processingMode === "chunked" && (
-                <div className="flex justify-between">
-                  <span className="text-sm">Chunk Size:</span>
-                  <span className="text-sm font-medium">{chunkSize}</span>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">Controls</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <Button onClick={startProcessing} disabled={isRunning || !rootDir} className="w-full">
-                {isRunning ? "Processing..." : "Start Processing"}
-              </Button>
-
-              {isRunning && (
-                <>
-                  <Button
-                    onClick={isPaused ? resumeProcessing : pauseProcessing}
-                    variant="outline"
-                    className="w-full bg-transparent"
-                  >
-                    {isPaused ? "Resume" : "Pause"}
-                  </Button>
-                  <Button onClick={stopProcessing} variant="destructive" className="w-full">
-                    Stop
-                  </Button>
-                </>
-              )}
-            </CardContent>
-          </Card>
-
-          {filterEnabled && (
+            {/* Watcher Control Buttons */}
             <Card>
-              <CardHeader>
-                <CardTitle className="text-lg">Filter Summary</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <div className="text-sm">
-                  <span className="font-medium">File Types:</span>
-                  <div className="flex flex-wrap gap-1 mt-1">
-                    {filterConfig.fileTypes?.map((type) => (
-                      <Badge key={type} variant="secondary" className="text-xs">
-                        {type}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-                {(filterConfig.minWidth || filterConfig.maxWidth) && (
-                  <div className="text-sm">
-                    <span className="font-medium">Dimensions:</span>
-                    <span className="ml-1">
-                      {filterConfig.minWidth || 0} - {filterConfig.maxWidth || "∞"}px
-                    </span>
-                  </div>
-                )}
-                {(filterConfig.minFileSize || filterConfig.maxFileSize) && (
-                  <div className="text-sm">
-                    <span className="font-medium">File Size:</span>
-                    <span className="ml-1">
-                      {filterConfig.minFileSizeValue
-                        ? `${filterConfig.minFileSizeValue}${filterConfig.minFileSizeUnit}`
-                        : "0"}{" "}
-                      -{" "}
-                      {filterConfig.maxFileSizeValue
-                        ? `${filterConfig.maxFileSizeValue}${filterConfig.maxFileSizeUnit}`
-                        : "∞"}
-                    </span>
-                  </div>
-                )}
-                {filterConfig.moveImages && (
-                  <div className="text-sm">
-                    <span className="font-medium">Move Images:</span>
-                    <Badge variant="outline" className="ml-1">
-                      Enabled
-                    </Badge>
-                  </div>
-                )}
-                <div className="text-xs text-muted-foreground">
-                  {[
-                    filterConfig.creditLine?.operator && "Credit Line",
-                    filterConfig.copyright?.operator && "Copyright",
-                    filterConfig.usageType?.operator && "Usage Type",
-                    filterConfig.rightsHolder?.operator && "Rights Holder",
-                    filterConfig.location?.operator && "Location",
-                  ]
-                    .filter(Boolean)
-                    .join(", ") || "No metadata filters"}
+              <CardContent className="pt-6">
+                <div className="flex flex-wrap gap-3">
+                  {!watcherStatus?.isWatching ? (
+                    <Button onClick={startWatcher} className="flex items-center gap-2">
+                      <PlayCircle className="w-4 h-4" />
+                      Start Watcher
+                    </Button>
+                  ) : (
+                    <Button onClick={stopWatcher} variant="destructive" className="flex items-center gap-2">
+                      <StopCircle className="w-4 h-4" />
+                      Stop Watcher
+                    </Button>
+                  )}
+
+                  <Button
+                    onClick={checkWatcherStatus}
+                    variant="outline"
+                    className="flex items-center gap-2 bg-transparent"
+                  >
+                    <Activity className="w-4 h-4" />
+                    Refresh Status
+                  </Button>
                 </div>
               </CardContent>
             </Card>
-          )}
-        </div>
-      </div>
+          </TabsContent>
 
-      {/* Resume Dialog */}
-      {showResumeDialog && resumeSession && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <Card className="w-96">
-            <CardHeader>
-              <CardTitle>Resume Processing?</CardTitle>
-              <CardDescription>
-                An interrupted processing session was found. Would you like to resume from where you left off?
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="text-sm space-y-2">
-                <div>
-                  <strong>Directory:</strong> {resumeSession.config.rootDir}
+          {/* Filters & Settings Tab */}
+          <TabsContent value="filters" className="space-y-6">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Filter className="w-5 h-5" />
+                  Filter Configuration
+                </CardTitle>
+                <CardDescription>Configure filters to process only specific images</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-6">
+                <div className="flex items-center space-x-2">
+                  <Switch
+                    id="filtersEnabled"
+                    checked={filterConfig.enabled}
+                    onCheckedChange={(checked) => handleFilterChange("enabled", checked)}
+                  />
+                  <Label htmlFor="filtersEnabled">Enable Filters</Label>
                 </div>
-                <div>
-                  <strong>Progress:</strong> {resumeSession.progress.processedFiles}/{resumeSession.progress.totalFiles}{" "}
-                  files
-                </div>
-                <div>
-                  <strong>Started:</strong> {new Date(resumeSession.startTime).toLocaleString()}
-                </div>
-              </div>
-              <Progress value={(resumeSession.progress.processedFiles / resumeSession.progress.totalFiles) * 100} />
-            </CardContent>
-            <CardContent className="flex space-x-2">
-              <Button
-                onClick={() => {
-                  resumeFromSession(resumeSession.id)
-                  setShowResumeDialog(false)
-                }}
-                className="flex-1"
-              >
-                Resume
-              </Button>
-              <Button
-                variant="outline"
-                onClick={async () => {
-                  await fetch("/api/resume", { method: "DELETE" })
-                  setShowResumeDialog(false)
-                  setCanResume(false)
-                }}
-                className="flex-1"
-              >
-                Start Fresh
-              </Button>
-            </CardContent>
-          </Card>
-        </div>
-      )}
+
+                {filterConfig.enabled && (
+                  <div className="space-y-6 p-4 bg-gray-50 rounded-lg">
+                    {/* File Type Filters */}
+                    <div className="space-y-3">
+                      <Label className="text-base font-medium">File Type Filters</Label>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                        {["jpg", "jpeg", "png", "tiff", "bmp", "gif", "webp"].map((type) => (
+                          <div key={type} className="flex items-center space-x-2">
+                            <Checkbox
+                              id={type}
+                              checked={filterConfig.allowedFileTypes.includes(type)}
+                              onCheckedChange={(checked) => {
+                                const newTypes = checked
+                                  ? [...filterConfig.allowedFileTypes, type]
+                                  : filterConfig.allowedFileTypes.filter((t) => t !== type)
+                                handleFilterChange("allowedFileTypes", newTypes)
+                              }}
+                            />
+                            <Label htmlFor={type} className="text-sm">
+                              .{type}
+                            </Label>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Dimension Filters */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="minWidth">Minimum Width: {filterConfig.minWidth}px</Label>
+                        <Slider
+                          id="minWidth"
+                          min={0}
+                          max={5000}
+                          step={50}
+                          value={[filterConfig.minWidth]}
+                          onValueChange={(value) => handleFilterChange("minWidth", value[0])}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="minHeight">Minimum Height: {filterConfig.minHeight}px</Label>
+                        <Slider
+                          id="minHeight"
+                          min={0}
+                          max={5000}
+                          step={50}
+                          value={[filterConfig.minHeight]}
+                          onValueChange={(value) => handleFilterChange("minHeight", value[0])}
+                        />
+                      </div>
+                    </div>
+
+                    {/* File Size Filters */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="minFileSize">
+                          Min File Size: {Math.round(filterConfig.minFileSize / 1024)}KB
+                        </Label>
+                        <Slider
+                          id="minFileSize"
+                          min={0}
+                          max={10485760}
+                          step={51200}
+                          value={[filterConfig.minFileSize]}
+                          onValueChange={(value) => handleFilterChange("minFileSize", value[0])}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="maxFileSize">
+                          Max File Size:{" "}
+                          {filterConfig.maxFileSize === 0
+                            ? "No limit"
+                            : Math.round(filterConfig.maxFileSize / 1024) + "KB"}
+                        </Label>
+                        <Slider
+                          id="maxFileSize"
+                          min={0}
+                          max={104857600}
+                          step={1048576}
+                          value={[filterConfig.maxFileSize]}
+                          onValueChange={(value) => handleFilterChange("maxFileSize", value[0])}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Text Filters */}
+                    <div className="space-y-4">
+                      <Label className="text-base font-medium">Text Filters</Label>
+                      {[
+                        { key: "creditLine", label: "Credit Line" },
+                        { key: "copyright", label: "Copyright" },
+                        { key: "usageType", label: "Usage Type" },
+                        { key: "rightsHolder", label: "Rights Holder" },
+                        { key: "location", label: "Location" },
+                      ].map(({ key, label }) => (
+                        <div key={key} className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+                          <div className="space-y-1">
+                            <Label className="text-sm">{label}</Label>
+                            <Select
+                              value={filterConfig[key as keyof typeof filterConfig]?.operator || "none"}
+                              onValueChange={(value) => handleTextFilterChange(key, "operator", value)}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Select operator" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="none">No filter</SelectItem>
+                                <SelectItem value="like">Contains</SelectItem>
+                                <SelectItem value="notLike">Does not contain</SelectItem>
+                                <SelectItem value="equals">Equals</SelectItem>
+                                <SelectItem value="notEquals">Does not equal</SelectItem>
+                                <SelectItem value="startsWith">Starts with</SelectItem>
+                                <SelectItem value="endsWith">Ends with</SelectItem>
+                                <SelectItem value="notBlank">Is not blank</SelectItem>
+                                <SelectItem value="isBlank">Is blank</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="md:col-span-2">
+                            <Input
+                              placeholder="Filter value"
+                              value={filterConfig[key as keyof typeof filterConfig]?.value || ""}
+                              onChange={(e) => handleTextFilterChange(key, "value", e.target.value)}
+                              disabled={filterConfig[key as keyof typeof filterConfig]?.operator === "none"}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Image Moving Options */}
+                    <div className="space-y-4 p-4 bg-white rounded-lg border">
+                      <div className="flex items-center space-x-2">
+                        <Switch
+                          id="moveImages"
+                          checked={filterConfig.moveImages}
+                          onCheckedChange={(checked) => handleFilterChange("moveImages", checked)}
+                        />
+                        <Label htmlFor="moveImages" className="font-medium">
+                          Move Filtered Images
+                        </Label>
+                      </div>
+
+                      {filterConfig.moveImages && (
+                        <div className="space-y-4">
+                          <div className="space-y-2">
+                            <Label htmlFor="moveDestination">Destination Directory</Label>
+                            <Input
+                              id="moveDestination"
+                              placeholder="/path/to/destination"
+                              value={filterConfig.moveDestinationPath}
+                              onChange={(e) => handleFilterChange("moveDestinationPath", e.target.value)}
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label>Folder Structure</Label>
+                            <RadioGroup
+                              value={filterConfig.moveFolderStructureOption}
+                              onValueChange={(value) => handleFilterChange("moveFolderStructureOption", value)}
+                            >
+                              <div className="flex items-center space-x-2">
+                                <RadioGroupItem value="flat" id="flat" />
+                                <Label htmlFor="flat">Flat (all images in one folder)</Label>
+                              </div>
+                              <div className="flex items-center space-x-2">
+                                <RadioGroupItem value="replicate" id="replicate" />
+                                <Label htmlFor="replicate">Replicate original structure</Label>
+                              </div>
+                            </RadioGroup>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* History & Logs Tab */}
+          <TabsContent value="history" className="space-y-6">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* Processing History */}
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Clock className="w-5 h-5" />
+                    Processing History
+                  </CardTitle>
+                  <CardDescription>View your recent processing sessions</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <ScrollArea className="h-64">
+                    {!Array.isArray(history) || history.length === 0 ? (
+                      <div className="text-center py-8 text-gray-500">
+                        <Clock className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                        <p>No processing history available</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {history.map((entry, index) => (
+                          <div key={index} className="p-3 bg-gray-50 rounded-lg">
+                            <div className="flex items-center justify-between mb-2">
+                              <Badge
+                                variant={
+                                  entry.status === "completed"
+                                    ? "default"
+                                    : entry.status === "error"
+                                      ? "destructive"
+                                      : "secondary"
+                                }
+                              >
+                                {entry.status}
+                              </Badge>
+                              <span className="text-xs text-gray-500">
+                                {new Date(entry.timestamp).toLocaleString()}
+                              </span>
+                            </div>
+                            <div className="text-sm space-y-1">
+                              <div className="flex justify-between">
+                                <span>Files:</span>
+                                <span>
+                                  {entry.processedFiles}/{entry.totalFiles}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Duration:</span>
+                                <span>{formatDuration(entry.duration)}</span>
+                              </div>
+                              <div className="text-xs text-gray-600 truncate">{entry.rootDir}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </ScrollArea>
+                </CardContent>
+              </Card>
+
+              {/* Live Logs */}
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <FileText className="w-5 h-5" />
+                    Live Logs
+                  </CardTitle>
+                  <CardDescription>Real-time processing logs and status updates</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-3">
+                    <div className="flex justify-between items-center">
+                      <Badge variant="outline">{logs.length} entries</Badge>
+                      <Button onClick={clearLogs} variant="outline" size="sm">
+                        Clear Logs
+                      </Button>
+                    </div>
+                    <ScrollArea className="h-64 w-full border rounded-md p-3 bg-gray-50 font-mono text-xs">
+                      {logs.length === 0 ? (
+                        <div className="text-center py-8 text-gray-500">
+                          <FileText className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                          <p>No logs available</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          {logs.map((log, index) => (
+                            <div key={index} className="text-gray-700">
+                              {log}
+                            </div>
+                          ))}
+                          <div ref={logsEndRef} />
+                        </div>
+                      )}
+                    </ScrollArea>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+        </Tabs>
+      </div>
     </div>
   )
 }

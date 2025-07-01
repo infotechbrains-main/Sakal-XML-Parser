@@ -4,7 +4,7 @@ import fs from "fs"
 import { Worker } from "worker_threads"
 import { createObjectCsvWriter } from "csv-writer"
 
-// Define CSV headers here since we can't import from the route
+// Define CSV headers for image metadata
 const CSV_HEADERS = [
   { id: "filename", title: "Filename" },
   { id: "filepath", title: "Filepath" },
@@ -28,6 +28,8 @@ const CSV_HEADERS = [
   { id: "filtersPassed", title: "Filters Passed" },
   { id: "imageMoved", title: "Image Moved" },
   { id: "destinationPath", title: "Destination Path" },
+  { id: "xmlFile", title: "Associated XML File" },
+  { id: "xmlExists", title: "XML Exists" },
 ]
 
 interface WatcherConfig {
@@ -43,7 +45,17 @@ interface WatcherStats {
   filesSuccessful: number
   filesMoved: number
   filesErrored: number
+  xmlFilesDetected: number
+  imageFilesDetected: number
+  pairsProcessed: number
   startTime: Date
+}
+
+interface FilePair {
+  xmlPath?: string
+  imagePath?: string
+  baseName: string
+  isComplete: boolean
 }
 
 class WatcherManager {
@@ -55,9 +67,13 @@ class WatcherManager {
     filesSuccessful: 0,
     filesMoved: 0,
     filesErrored: 0,
+    xmlFilesDetected: 0,
+    imageFilesDetected: 0,
+    pairsProcessed: 0,
     startTime: new Date(),
   }
   private watcherId: string | null = null
+  private filePairs: Map<string, FilePair> = new Map()
 
   async startWatcher(config: WatcherConfig) {
     try {
@@ -85,8 +101,12 @@ class WatcherManager {
         filesSuccessful: 0,
         filesMoved: 0,
         filesErrored: 0,
+        xmlFilesDetected: 0,
+        imageFilesDetected: 0,
+        pairsProcessed: 0,
         startTime: new Date(),
       }
+      this.filePairs.clear()
 
       // Initialize CSV file with headers if it doesn't exist
       const csvPath = path.resolve(config.outputFile)
@@ -105,7 +125,7 @@ class WatcherManager {
         return { success: false, error: `Failed to create CSV file: ${err.message}` }
       }
 
-      // Start watching for image files
+      // Start watching for both XML and image files
       this.watcher = chokidar.watch(config.rootDir, {
         ignored: /[/\\]\./,
         persistent: true,
@@ -128,6 +148,7 @@ class WatcherManager {
       this.watcher.on("ready", () => {
         if (config.verbose) {
           console.log(`✅ Watcher ready and monitoring: ${config.rootDir}`)
+          console.log(`🔍 Looking for XML-Image pairs...`)
         }
       })
 
@@ -137,6 +158,7 @@ class WatcherManager {
         console.log(`✅ Watcher started for directory: ${config.rootDir}`)
         console.log(`📄 Output file: ${csvPath}`)
         console.log(`🔍 Filters enabled: ${config.filterConfig?.enabled ? "YES" : "NO"}`)
+        console.log(`📋 Will process XML-Image pairs only`)
       }
 
       return { success: true, watcherId: this.watcherId }
@@ -160,11 +182,12 @@ class WatcherManager {
 
       console.log("🛑 Watcher stopped")
       console.log(
-        `📊 Final stats: ${this.stats.filesSuccessful}/${this.stats.filesProcessed} files processed successfully, ${this.stats.filesMoved} moved, ${this.stats.filesErrored} errors, ${duration}s total`,
+        `📊 Final stats: ${this.stats.pairsProcessed} pairs processed, ${this.stats.filesSuccessful}/${this.stats.filesProcessed} files successful, ${this.stats.filesMoved} moved, ${this.stats.filesErrored} errors, ${duration}s total`,
       )
 
       this.config = null
       this.watcherId = null
+      this.filePairs.clear()
 
       return { success: true }
     } catch (error: any) {
@@ -180,28 +203,105 @@ class WatcherManager {
       config: this.config,
       stats: this.stats,
       uptime: this.isWatching ? Date.now() - this.stats.startTime.getTime() : 0,
+      pendingPairs: Array.from(this.filePairs.values()).filter((pair) => !pair.isComplete).length,
+      completePairs: Array.from(this.filePairs.values()).filter((pair) => pair.isComplete).length,
     }
+  }
+
+  private getBaseName(filePath: string): string {
+    // Extract base name without extension for pairing
+    // For files like "2025-05-16_ABD25J42542_MED_1_Org_pr.jpg" and "2025-05-16_ABD25J42542_MED_1_Org_pr.xml"
+    const fileName = path.basename(filePath)
+    const nameWithoutExt = path.parse(fileName).name
+    return nameWithoutExt
+  }
+
+  private isXmlFile(filePath: string): boolean {
+    return path.extname(filePath).toLowerCase() === ".xml"
+  }
+
+  private isImageFile(filePath: string): boolean {
+    const imageExtensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".svg"]
+    const ext = path.extname(filePath).toLowerCase()
+    return imageExtensions.includes(ext)
   }
 
   private async handleNewFile(filePath: string) {
     if (!this.config) return
 
-    // Check if it's an image file
-    const imageExtensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".svg"]
-    const ext = path.extname(filePath).toLowerCase()
+    const isXml = this.isXmlFile(filePath)
+    const isImage = this.isImageFile(filePath)
 
-    if (!imageExtensions.includes(ext)) {
+    // Only process XML and image files
+    if (!isXml && !isImage) {
       return
     }
 
+    const baseName = this.getBaseName(filePath)
+
     if (this.config.verbose) {
-      console.log(`📁 New image detected: ${filePath}`)
+      console.log(`📁 New ${isXml ? "XML" : "image"} file detected: ${path.basename(filePath)}`)
+      console.log(`🔗 Base name for pairing: ${baseName}`)
     }
+
+    // Update stats
+    if (isXml) {
+      this.stats.xmlFilesDetected++
+    } else {
+      this.stats.imageFilesDetected++
+    }
+
+    // Get or create file pair
+    let pair = this.filePairs.get(baseName)
+    if (!pair) {
+      pair = {
+        baseName,
+        isComplete: false,
+      }
+      this.filePairs.set(baseName, pair)
+    }
+
+    // Update the pair
+    if (isXml) {
+      pair.xmlPath = filePath
+    } else {
+      pair.imagePath = filePath
+    }
+
+    // Check if pair is complete
+    pair.isComplete = !!(pair.xmlPath && pair.imagePath)
+
+    if (pair.isComplete) {
+      if (this.config.verbose) {
+        console.log(`✅ Complete pair found for ${baseName}:`)
+        console.log(`  📄 XML: ${path.basename(pair.xmlPath!)}`)
+        console.log(`  🖼️  Image: ${path.basename(pair.imagePath!)}`)
+      }
+
+      // Process the complete pair
+      await this.processPair(pair)
+
+      // Remove from pending pairs
+      this.filePairs.delete(baseName)
+    } else {
+      if (this.config.verbose) {
+        console.log(`⏳ Waiting for ${pair.xmlPath ? "image" : "XML"} file to complete pair: ${baseName}`)
+      }
+    }
+  }
+
+  private async processPair(pair: FilePair) {
+    if (!this.config || !pair.xmlPath || !pair.imagePath) return
 
     try {
       this.stats.filesProcessed++
+      this.stats.pairsProcessed++
 
-      // Process the file using the worker
+      if (this.config.verbose) {
+        console.log(`🔄 Processing pair: ${pair.baseName}`)
+      }
+
+      // Use the XML parser worker to process the XML file and find associated image
       const workerScriptPath = path.resolve(process.cwd(), "app/api/parse/xml-parser-worker.js")
 
       if (!fs.existsSync(workerScriptPath)) {
@@ -212,12 +312,13 @@ class WatcherManager {
 
       const worker = new Worker(workerScriptPath, {
         workerData: {
-          imagePath: filePath,
+          xmlFilePath: pair.xmlPath,
           filterConfig: this.config.filterConfig,
           originalRootDir: this.config.rootDir,
           workerId: 0,
           verbose: this.config.verbose,
           isWatchMode: true,
+          associatedImagePath: pair.imagePath, // Pass the known image path
         },
       })
 
@@ -225,7 +326,7 @@ class WatcherManager {
         worker.terminate()
         this.stats.filesErrored++
         if (this.config?.verbose) {
-          console.error(`❌ Worker timeout for ${path.basename(filePath)}`)
+          console.error(`❌ Worker timeout for pair ${pair.baseName}`)
         }
       }, 30000) // 30 second timeout
 
@@ -236,7 +337,7 @@ class WatcherManager {
           if (result.error) {
             this.stats.filesErrored++
             if (this.config?.verbose) {
-              console.error(`❌ Error processing ${path.basename(filePath)}:`, result.error)
+              console.error(`❌ Error processing pair ${pair.baseName}:`, result.error)
             }
           } else if (result.record) {
             this.stats.filesSuccessful++
@@ -245,14 +346,18 @@ class WatcherManager {
             }
 
             if (this.config?.verbose) {
-              console.log(`✅ Successfully processed ${path.basename(filePath)}`)
+              console.log(`✅ Successfully processed pair ${pair.baseName}`)
             }
+
+            // Add XML file info to the record
+            result.record.xmlFile = path.basename(pair.xmlPath!)
+            result.record.xmlExists = "Yes"
 
             // Append to CSV
             await this.appendToCsv(this.config!.outputFile, result.record)
           } else {
             if (this.config?.verbose) {
-              console.log(`⏭️ File ${path.basename(filePath)} was filtered out`)
+              console.log(`⏭️ Pair ${pair.baseName} was filtered out`)
             }
           }
 
@@ -260,7 +365,7 @@ class WatcherManager {
         } catch (err: any) {
           await worker.terminate()
           this.stats.filesErrored++
-          console.error(`❌ Error handling worker result for ${path.basename(filePath)}:`, err)
+          console.error(`❌ Error handling worker result for pair ${pair.baseName}:`, err)
         }
       })
 
@@ -268,7 +373,7 @@ class WatcherManager {
         clearTimeout(timeout)
         this.stats.filesErrored++
         if (this.config?.verbose) {
-          console.error(`❌ Worker error for ${path.basename(filePath)}:`, err.message)
+          console.error(`❌ Worker error for pair ${pair.baseName}:`, err.message)
         }
         await worker.terminate()
       })
@@ -276,12 +381,12 @@ class WatcherManager {
       worker.on("exit", (code) => {
         clearTimeout(timeout)
         if (code !== 0 && this.config?.verbose) {
-          console.error(`❌ Worker exited with code ${code} for ${path.basename(filePath)}`)
+          console.error(`❌ Worker exited with code ${code} for pair ${pair.baseName}`)
         }
       })
     } catch (error: any) {
       this.stats.filesErrored++
-      console.error(`❌ Error handling file ${filePath}:`, error)
+      console.error(`❌ Error processing pair ${pair.baseName}:`, error)
     }
   }
 
