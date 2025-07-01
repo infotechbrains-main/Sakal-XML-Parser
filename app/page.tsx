@@ -157,6 +157,7 @@ export default function Home() {
   const [resumeSession, setResumeSession] = useState<ProcessingSession | null>(null)
   const [showResumeDialog, setShowResumeDialog] = useState(false)
 
+  const logsEndRef = useRef<HTMLDivElement>(null)
   const ws = useRef<WebSocket | null>(null)
 
   // Update filterConfig.enabled when filterEnabled changes
@@ -277,6 +278,25 @@ export default function Home() {
     }
   }
 
+  // Auto-scroll logs
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [messages, errorMessages])
+
+  // Poll for job status and watcher status
+  // useEffect(() => {
+  //   const interval = setInterval(() => {
+  //     if (isProcessing && currentJob) {
+  //       checkJobStatus(currentJob.id)
+  //     }
+  //     if (watcherStatus?.isWatching) {
+  //       checkWatcherStatus()
+  //     }
+  //   }, 2000)
+
+  //   return () => clearInterval(interval)
+  // }, [isProcessing, currentJob, watcherStatus?.isWatching])
+
   const addMessage = (type: string, message: any) => {
     const newMessage: Message = {
       type,
@@ -343,6 +363,28 @@ export default function Home() {
       fileTypes: [],
     }))
   }
+
+  // const loadHistory = async () => {
+  //   try {
+  //     const response = await fetch("/api/history")
+  //     if (response.ok) {
+  //       const data = await response.json()
+  //       // Ensure data.history is an array
+  //       if (Array.isArray(data.history)) {
+  //         setHistory(data.history)
+  //       } else {
+  //         console.warn("History data is not an array:", data)
+  //         setHistory([])
+  //       }
+  //     } else {
+  //       console.error("Failed to load history")
+  //       setHistory([])
+  //     }
+  //   } catch (error) {
+  //     console.error("Error loading history:", error)
+  //     setHistory([])
+  //   }
+  // }
 
   const startProcessing = async () => {
     setIsRunning(true)
@@ -488,6 +530,112 @@ export default function Home() {
     }
   }
 
+  // const pauseProcessing = async () => {
+  //   if (!currentJob) return
+
+  //   try {
+  //     const response = await fetch("/api/parse/pause", {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify({ jobId: currentJob.id }),
+  //     })
+
+  //     const data = await response.json()
+  //     if (data.success) {
+  //       setIsPaused(true)
+  //       addLog("⏸️ Processing paused")
+  //     } else {
+  //       addLog(`❌ Failed to pause: ${data.error}`)
+  //     }
+  //   } catch (error) {
+  //     addLog(`❌ Error pausing: ${error}`)
+  //   }
+  // }
+
+  // const resumeProcessing = async () => {
+  //   try {
+  //     const response = await fetch("/api/resume", {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify({
+  //         sessionId: currentJob?.id,
+  //         filterConfig,
+  //       }),
+  //     })
+
+  //     const data = await response.json()
+  //     if (data.success) {
+  //       setIsPaused(false)
+  //       addLog("▶️ Processing resumed")
+  //     } else {
+  //       addLog(`❌ Failed to resume: ${data.error}`)
+  //     }
+  //   } catch (error) {
+  //     addLog(`❌ Error resuming: ${error}`)
+  //   }
+  // }
+
+  // const checkJobStatus = async (jobId: string) => {
+  //   try {
+  //     const response = await fetch(`/api/progress/${jobId}`)
+  //     const data = await response.json()
+
+  //     if (data.success && data.progress) {
+  //       setCurrentJob((prev) =>
+  //         prev
+  //           ? {
+  //               ...prev,
+  //               progress: data.progress.percentage,
+  //               processedFiles: data.progress.processedFiles,
+  //               filteredFiles: data.progress.filteredFiles,
+  //               movedFiles: data.progress.movedFiles,
+  //               status: data.progress.status,
+  //             }
+  //           : null,
+  //       )
+
+  //       if (data.progress.status === "completed") {
+  //         setIsProcessing(false)
+  //         setIsPaused(false)
+  //         addLog("✅ Processing completed successfully!")
+  //         loadHistory()
+  //       } else if (data.progress.status === "error") {
+  //         setIsProcessing(false)
+  //         setIsPaused(false)
+  //         addLog("❌ Processing failed with errors")
+  //         loadHistory()
+  //       }
+  //     }
+  //   } catch (error) {
+  //     console.error("Error checking job status:", error)
+  //   }
+  // }
+
+  // const downloadResults = async () => {
+  //   if (!currentJob) return
+
+  //   try {
+  //     const response = await fetch(`/api/download?file=${encodeURIComponent(currentJob.outputFile)}`)
+  //     if (response.ok) {
+  //       const blob = await response.blob()
+  //       const url = window.URL.createObjectURL(blob)
+  //       const a = document.createElement("a")
+  //       a.href = url
+  //       a.download = currentJob.outputFile
+  //       document.body.appendChild(a)
+  //       a.click()
+  //       window.URL.revokeObjectURL(url)
+  //       document.body.removeChild(a)
+  //       addLog("📥 Results downloaded successfully")
+  //     } else {
+  //       addLog("❌ Failed to download results")
+  //     }
+  //   } catch (error) {
+  //     addLog(`❌ Error downloading results: ${error}`)
+  //   }
+  // }
+
+  // Watcher functions
   const startWatching = async () => {
     if (!watchDirectory.trim()) {
       alert("Please enter a directory to watch")
@@ -515,7 +663,10 @@ export default function Home() {
 
       const result = await response.json()
       if (result.success) {
-        addMessage("system", `✅ Watcher started: ${result.message}`)
+        addMessage("system", `✅ Watcher started successfully`)
+        addMessage("system", `👀 Monitoring: ${watchDirectory}`)
+        addMessage("system", `📄 Output: ${watchOutputFile}`)
+        addMessage("system", `🔗 Looking for XML-Image pairs...`)
         // Poll for status updates
         const statusInterval = setInterval(async () => {
           try {
@@ -546,13 +697,82 @@ export default function Home() {
         method: "POST",
       })
       const result = await response.json()
-      addMessage("system", `🛑 Watcher stopped: ${result.message}`)
+      addMessage("system", `🛑 Watcher stopped`)
       setWatchMode(false)
       setWatcherStatus(null)
     } catch (error: any) {
       addMessage("error", `❌ Error stopping watcher: ${error.message}`)
     }
   }
+
+  // const startWatcher = async () => {
+  //   if (!watcherRootDir.trim()) {
+  //     addLog("❌ Please select a directory to watch")
+  //     return
+  //   }
+
+  //   try {
+  //     addLog("🔍 Starting file watcher...")
+
+  //     const response = await fetch("/api/watch/start", {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify({
+  //         rootDir: watcherRootDir.trim(),
+  //         outputFile: watcherOutputFile.trim() || "watched_images.csv",
+  //         numWorkers: 1,
+  //         verbose: watcherVerbose,
+  //         filterConfig,
+  //       }),
+  //     })
+
+  //     const data = await response.json()
+
+  //     if (data.success) {
+  //       addLog(`✅ File watcher started successfully`)
+  //       addLog(`👀 Watching: ${data.watchingPath}`)
+  //       addLog(`📄 Output: ${data.outputFile}`)
+  //       addLog(`🔗 Looking for XML-Image pairs...`)
+  //       checkWatcherStatus()
+  //     } else {
+  //       addLog(`❌ Failed to start watcher: ${data.error}`)
+  //     }
+  //   } catch (error) {
+  //     addLog(`❌ Error starting watcher: ${error}`)
+  //   }
+  // }
+
+  // const stopWatcher = async () => {
+  //   try {
+  //     const response = await fetch("/api/watch/stop", {
+  //       method: "POST",
+  //     })
+
+  //     const data = await response.json()
+
+  //     if (data.success) {
+  //       setWatcherStatus(null)
+  //       addLog("🛑 File watcher stopped")
+  //     } else {
+  //       addLog(`❌ Failed to stop watcher: ${data.error}`)
+  //     }
+  //   } catch (error) {
+  //     addLog(`❌ Error stopping watcher: ${error}`)
+  //   }
+  // }
+
+  // const checkWatcherStatus = async () => {
+  //   try {
+  //     const response = await fetch("/api/watch/status")
+  //     const data = await response.json()
+
+  //     if (data.success) {
+  //       setWatcherStatus(data.status)
+  //     }
+  //   } catch (error) {
+  //     console.error("Error checking watcher status:", error)
+  //   }
+  // }
 
   const deleteSession = async (sessionId: string) => {
     try {
@@ -635,6 +855,20 @@ export default function Home() {
     }
   }
 
+  // const formatDuration = (ms: number) => {
+  //   const seconds = Math.floor(ms / 1000)
+  //   const minutes = Math.floor(seconds / 60)
+  //   const hours = Math.floor(minutes / 60)
+
+  //   if (hours > 0) {
+  //     return `${hours}h ${minutes % 60}m ${seconds % 60}s`
+  //   } else if (minutes > 0) {
+  //     return `${minutes}m ${seconds % 60}s`
+  //   } else {
+  //     return `${seconds}s`
+  //   }
+  // }
+
   const formatDuration = (start: string, end?: string) => {
     const startTime = new Date(start)
     const endTime = end ? new Date(end) : new Date()
@@ -643,6 +877,34 @@ export default function Home() {
     const seconds = Math.floor((duration % 60000) / 1000)
     return `${minutes}m ${seconds}s`
   }
+
+  // const resetJob = () => {
+  //   setCurrentJob(null)
+  //   setIsProcessing(false)
+  //   setIsPaused(false)
+  //   addLog("🔄 Job reset")
+  // }
+
+  // const clearLogs = () => {
+  //   setLogs([])
+  // }
+
+  // const handleFilterChange = (key: string, value: any) => {
+  //   setFilterConfig((prev) => ({
+  //     ...prev,
+  //     [key]: value,
+  //   }))
+  // }
+
+  // const handleTextFilterChange = (filterName: string, field: string, value: string) => {
+  //   setFilterConfig((prev) => ({
+  //     ...prev,
+  //     [filterName]: {
+  //       ...prev[filterName as keyof typeof prev],
+  //       [field]: value,
+  //     },
+  //   }))
+  // }
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -968,6 +1230,55 @@ export default function Home() {
                               </SelectContent>
                             </Select>
                             <Input
+                              value={filterConfig.creditLine?.value || ""}
+                              onChange={(e) =>
+                                setFilterConfig((prev) => ({
+                                  ...prev,
+                                  creditLine: {
+                                    ...prev.creditLine,
+                                    operator: prev.creditLine?.operator || "like",
+                                    value: e.target.value,
+                                  },
+                                }))
+                              }
+                              placeholder="Filter value"
+                              disabled={!filterConfig.creditLine?.operator}
+                            />
+                          </div>
+                        </div>
+
+                        {/* Copyright Filter */}
+                        <div className="space-y-2">
+                          <Label htmlFor="copyrightOperator">Copyright</Label>
+                          <div className="grid grid-cols-2 gap-2">
+                            <Select
+                              value={filterConfig.copyright?.operator || ""}
+                              onValueChange={(value) =>
+                                setFilterConfig((prev) => ({
+                                  ...prev,
+                                  copyright: {
+                                    ...prev.copyright,
+                                    operator: value,
+                                    value: prev.copyright?.value || "",
+                                  },
+                                }))
+                              }
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Select operator" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="like">Contains</SelectItem>
+                                <SelectItem value="notLike">Does not contain</SelectItem>
+                                <SelectItem value="equals">Equals</SelectItem>
+                                <SelectItem value="notEquals">Not equals</SelectItem>
+                                <SelectItem value="startsWith">Starts with</SelectItem>
+                                <SelectItem value="endsWith">Ends with</SelectItem>
+                                <SelectItem value="notBlank">Not blank</SelectItem>
+                                <SelectItem value="isBlank">Is blank</SelectItem>
+                              </SelectContent>
+                            </Select>
+                            <Input
                               value={filterConfig.copyright?.value || ""}
                               onChange={(e) =>
                                 setFilterConfig((prev) => ({
@@ -1102,7 +1413,7 @@ export default function Home() {
                                 <SelectItem value="notEquals">Not equals</SelectItem>
                                 <SelectItem value="startsWith">Starts with</SelectItem>
                                 <SelectItem value="endsWith">Ends with</SelectItem>
-                                <SelectItem value="notBlank">Is blank</SelectItem>
+                                <SelectItem value="notBlank">Not blank</SelectItem>
                                 <SelectItem value="isBlank">Is blank</SelectItem>
                               </SelectContent>
                             </Select>
@@ -1378,7 +1689,9 @@ export default function Home() {
               <Card>
                 <CardHeader>
                   <CardTitle>File Watcher</CardTitle>
-                  <CardDescription>Monitor directories for new files and process them automatically</CardDescription>
+                  <CardDescription>
+                    Monitor directories for new XML-Image pairs and process them automatically
+                  </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1440,16 +1753,32 @@ export default function Home() {
                           </div>
                         </div>
                         <div>
-                          <span className="text-muted-foreground">Processed:</span>
-                          <div className="font-medium">{watcherStatus.stats?.filesProcessed || 0}</div>
+                          <span className="text-muted-foreground">XML Files:</span>
+                          <div className="font-medium">{watcherStatus.stats?.xmlFilesDetected || 0}</div>
                         </div>
                         <div>
-                          <span className="text-muted-foreground">Successful:</span>
-                          <div className="font-medium text-green-600">{watcherStatus.stats?.filesSuccessful || 0}</div>
+                          <span className="text-muted-foreground">Image Files:</span>
+                          <div className="font-medium">{watcherStatus.stats?.imageFilesDetected || 0}</div>
                         </div>
                         <div>
-                          <span className="text-muted-foreground">Moved:</span>
-                          <div className="font-medium text-blue-600">{watcherStatus.stats?.filesMoved || 0}</div>
+                          <span className="text-muted-foreground">Pairs Processed:</span>
+                          <div className="font-medium text-green-600">{watcherStatus.stats?.pairsProcessed || 0}</div>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Pending Pairs:</span>
+                          <div className="font-medium text-yellow-600">{watcherStatus.pendingPairs || 0}</div>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Complete Pairs:</span>
+                          <div className="font-medium text-blue-600">{watcherStatus.completePairs || 0}</div>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Files Moved:</span>
+                          <div className="font-medium text-purple-600">{watcherStatus.stats?.filesMoved || 0}</div>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Errors:</span>
+                          <div className="font-medium text-red-600">{watcherStatus.stats?.filesErrored || 0}</div>
                         </div>
                       </div>
                     </div>
@@ -1457,9 +1786,10 @@ export default function Home() {
 
                   <Alert>
                     <AlertDescription>
-                      <strong>How it works:</strong> The watcher monitors the specified directory for new image files.
-                      When files are added, they are automatically processed and results are appended to the CSV file.
-                      If filters are enabled, only images that pass the filters will be processed and moved.
+                      <strong>How it works:</strong> The watcher monitors the specified directory for new XML and image
+                      files. When both files with matching base names are detected (e.g., "image.xml" and "image.jpg"),
+                      they are automatically processed as a pair and results are appended to the CSV file. If filters
+                      are enabled, only pairs that pass the filters will be processed and moved.
                     </AlertDescription>
                   </Alert>
                 </CardContent>

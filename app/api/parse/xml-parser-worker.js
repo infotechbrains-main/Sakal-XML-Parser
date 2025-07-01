@@ -64,8 +64,33 @@ function isImageFile(fileName) {
 }
 
 // Enhanced image path finder - tries multiple possible locations
-async function findImagePath(xmlFilePath, imageHref, verbose, workerId) {
+async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associatedImagePath) {
   if (!imageHref) return null
+
+  // If we have an associated image path from the watcher, use it first
+  if (associatedImagePath && workerData.isWatchMode) {
+    try {
+      await fs.access(associatedImagePath)
+      const stats = await fs.stat(associatedImagePath)
+
+      if (verbose) {
+        console.log(`[Worker ${workerId}] ✓ Using associated image from watcher: ${associatedImagePath}`)
+        console.log(`[Worker ${workerId}] Image size: ${stats.size} bytes`)
+      }
+
+      return {
+        exists: true,
+        size: stats.size,
+        path: associatedImagePath,
+        fileName: path.basename(associatedImagePath),
+        foundAt: "watcher_provided",
+      }
+    } catch (error) {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] ✗ Associated image from watcher not accessible: ${associatedImagePath}`)
+      }
+    }
+  }
 
   const xmlDir = path.dirname(xmlFilePath)
   const parentDir = path.dirname(xmlDir)
@@ -448,11 +473,15 @@ async function processXmlFileInWorker(
   verbose,
   isRemote,
   originalRemoteXmlUrl,
+  associatedImagePath,
 ) {
   try {
     if (verbose) {
       console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
       console.log(`[Worker ${workerId}] Filter config:`, JSON.stringify(filterConfig, null, 2))
+      if (associatedImagePath) {
+        console.log(`[Worker ${workerId}] Associated image: ${associatedImagePath}`)
+      }
     }
 
     const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
@@ -629,7 +658,7 @@ async function processXmlFileInWorker(
     let imageInfo = null
 
     if (imageHref) {
-      imageInfo = await findImagePath(xmlFilePath, imageHref, verbose, workerId)
+      imageInfo = await findImagePath(xmlFilePath, imageHref, verbose, workerId, associatedImagePath)
       imageExists = imageInfo.exists
       actualFileSize = imageInfo.size
       imagePath = imageInfo.path
@@ -771,7 +800,16 @@ async function main() {
       throw new Error("No workerData provided")
     }
 
-    const { xmlFilePath, filterConfig, originalRootDir, workerId, verbose, isRemote, originalRemoteXmlUrl } = workerData
+    const {
+      xmlFilePath,
+      filterConfig,
+      originalRootDir,
+      workerId,
+      verbose,
+      isRemote,
+      originalRemoteXmlUrl,
+      associatedImagePath,
+    } = workerData
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Starting to process: ${path.basename(xmlFilePath)}`)
@@ -794,6 +832,7 @@ async function main() {
       verbose,
       isRemote,
       originalRemoteXmlUrl,
+      associatedImagePath,
     )
 
     if (verbose) {
