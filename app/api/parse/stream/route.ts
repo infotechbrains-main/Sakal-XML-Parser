@@ -78,7 +78,7 @@ export async function POST(request: NextRequest) {
   const {
     rootDir,
     outputFile = "image_metadata.csv",
-    outputFolder = "", // Add this line
+    outputFolder = "",
     numWorkers = 4,
     verbose = false,
     filterConfig = null,
@@ -104,7 +104,7 @@ export async function POST(request: NextRequest) {
       // Pass fullOutputPath to processFiles function
       processFiles(controller, encoder, {
         rootDir,
-        outputFile: fullOutputPath, // Use fullOutputPath here
+        outputFile: fullOutputPath,
         numWorkers,
         verbose,
         filterConfig,
@@ -153,6 +153,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
   if (outputDir !== "." && outputDir !== "") {
     try {
       await fs.mkdir(outputDir, { recursive: true })
+      console.log(`Created output directory: ${outputDir}`)
     } catch (error) {
       console.error(`Failed to create output directory: ${outputDir}`)
       return
@@ -241,10 +242,9 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     activeWorkers.clear()
 
     // Save current results
-    const outputPath = path.join(process.cwd(), outputFile)
     if (allRecords.length > 0) {
-      const savedPath = await savePartialResults(allRecords, outputPath, true)
-      sendMessage("log", { message: `Partial results saved to ${path.basename(savedPath || outputPath)}` })
+      const savedPath = await savePartialResults(allRecords, outputFile, true)
+      sendMessage("log", { message: `Partial results saved to ${path.basename(savedPath || outputFile)}` })
     }
 
     // Save processing state
@@ -295,7 +295,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
         filteredFiles: filteredCount,
         movedFiles: movedCount,
       },
-      outputFile: path.basename(outputPath),
+      outputFile: path.basename(outputFile),
       errors: errors.slice(0, 10),
       reason,
     })
@@ -414,8 +414,6 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       sendMessage("error", { message: "No XML files found in the specified directory" })
       return
     }
-
-    const outputPath = path.join(process.cwd(), outputFile)
 
     // Filter out already processed files if resuming
     let filesToProcess = xmlFiles
@@ -568,7 +566,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             const now = Date.now()
             if (now - lastSaveTime > SAVE_INTERVAL || allRecords.length % 50 === 0) {
               if (allRecords.length > 0) {
-                await savePartialResults(allRecords, outputPath, true)
+                await savePartialResults(allRecords, outputFile, true)
                 sendMessage("log", { message: `Auto-saved ${allRecords.length} records` })
                 lastSaveTime = now
               }
@@ -649,11 +647,11 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     if (allRecords.length > 0 && !isControllerClosed) {
       sendMessage("log", { message: "Writing final CSV file..." })
       const csvWriterInstance = createObjectCsvWriter({
-        path: outputPath,
+        path: outputFile,
         header: CSV_HEADERS,
       })
       await csvWriterInstance.writeRecords(allRecords)
-      sendMessage("log", { message: `Final CSV file written: ${path.basename(outputPath)}` })
+      sendMessage("log", { message: `Final CSV file written: ${path.basename(outputFile)}` })
     } else if (allRecords.length === 0) {
       sendMessage("log", { message: "No records to write to CSV" })
     }
@@ -662,7 +660,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     currentSession.status = "completed"
     currentSession.endTime = new Date().toISOString()
     currentSession.results = {
-      outputPath: outputPath,
+      outputPath: outputFile,
       stats: {
         totalFiles: xmlFiles.length,
         processedFiles: processedCount,
@@ -690,7 +688,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
           filteredFiles: filteredCount,
           movedFiles: movedCount,
         },
-        outputFile: path.basename(outputPath),
+        outputFile: path.basename(outputFile),
         errors: errors.slice(0, 10),
       })
 

@@ -1,72 +1,49 @@
-import type { NextRequest } from "next/server"
-import { startWatcher } from "@/lib/file-watcher"
-import path from "path"
-import fs from "fs/promises"
+import { type NextRequest, NextResponse } from "next/server"
+import { startWatcher } from "@/lib/watcher-manager"
 
 export async function POST(request: NextRequest) {
-  const body = await request.json()
-  const {
-    rootDir,
-    filterConfig,
-    outputFile = "watched_images.csv",
-    outputFolder = "", // Add this line
-    numWorkers = 1,
-    verbose = false,
-  } = body
-
-  if (!rootDir) {
-    return new Response("Root directory is required", { status: 400 })
-  }
-
-  // Create full output path
-  const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
-
-  // Ensure output directory exists
-  if (outputFolder) {
-    try {
-      await fs.mkdir(outputFolder, { recursive: true })
-    } catch (error) {
-      console.error("Error creating output directory:", error)
-      return new Response(`Failed to create output directory: ${outputFolder}`, { status: 400 })
-    }
-  }
-
   try {
+    const body = await request.json()
+    const {
+      rootDir,
+      filterConfig,
+      outputFile = "watched_images.csv",
+      outputFolder = "",
+      numWorkers = 1,
+      verbose = false,
+    } = body
+
+    if (!rootDir) {
+      return NextResponse.json({ success: false, error: "Root directory is required" }, { status: 400 })
+    }
+
+    // Create full output path
+    const fullOutputPath = outputFolder ? `${outputFolder}/${outputFile}` : outputFile
+
     const result = await startWatcher({
       rootDir,
       filterConfig,
-      outputFile: fullOutputPath, // Use fullOutputPath here
+      outputFile: fullOutputPath,
       numWorkers,
       verbose,
     })
 
     if (result.success) {
-      return new Response(
-        JSON.stringify({
-          success: true,
-          message: "File watcher started successfully",
-          watcherId: result.watcherId,
-          watchingPath: rootDir,
-          outputFile: fullOutputPath, // Return fullOutputPath
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      )
+      return NextResponse.json({
+        success: true,
+        watcherId: result.watcherId,
+        watchingPath: rootDir,
+        outputFile: fullOutputPath,
+        message: "File watcher started successfully",
+      })
     } else {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: result.error,
-        }),
-        { status: 400, headers: { "Content-Type": "application/json" } },
-      )
+      return NextResponse.json({ success: false, error: result.error }, { status: 400 })
     }
-  } catch (error: any) {
-    return new Response(
-      JSON.stringify({
-        success: false,
-        error: error.message,
-      }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
+  } catch (error) {
+    console.error("Error starting watcher:", error)
+    return NextResponse.json(
+      { success: false, error: error instanceof Error ? error.message : "Unknown error" },
+      { status: 500 },
     )
   }
 }
