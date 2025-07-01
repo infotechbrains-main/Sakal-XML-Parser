@@ -1,112 +1,264 @@
-import chokidar from "chokidar"
+import { watch, type FSWatcher } from "chokidar"
+import { Worker } from "worker_threads"
 import path from "path"
 import fs from "fs"
-import { Worker } from "worker_threads"
-import { createObjectCsvWriter } from "csv-writer"
-import { CSV_HEADERS } from "@/app/api/parse/route" // Assuming CSV_HEADERS is exported or defined here
 
-let watcher: chokidar.FSWatcher | null = null
+interface WatcherConfig {
+  rootDir: string
+  filterConfig?: any
+  outputFile: string
+  numWorkers: number
+  verbose: boolean
+}
 
-export function startWatcher(
-  rootDir: string,
-  filterConfig: any, // This will now contain moveDestinationPath and moveFolderStructureOption
-  outputFile: string,
-  numWorkers: number, // Though watcher processes one by one, numWorkers might be for consistency
-  verbose: boolean,
-  onLog: (message: string) => void,
-  onUpdate: (stats: any) => void,
-) {
-  if (watcher) {
-    watcher.close()
-    onLog("Closed existing watcher to start a new session.")
+interface WatcherStats {
+  filesProcessed: number
+  filesSuccessful: number
+  filesMoved: number
+  filesErrored: number
+  startTime: Date
+}
+
+class WatcherManager {
+  private watcher: FSWatcher | null = null
+  private isWatching = false
+  private config: WatcherConfig | null = null
+  private stats: WatcherStats = {
+    filesProcessed: 0,
+    filesSuccessful: 0,
+    filesMoved: 0,
+    filesErrored: 0,
+    startTime: new Date(),
+  }
+  private watcherId: string | null = null
+
+  async startWatcher(config: WatcherConfig) {
+    try {
+      if (this.isWatching) {
+        return { success: false, error: "Watcher is already running" }
+      }
+
+      // Validate directory exists
+      if (!fs.existsSync(config.rootDir)) {
+        return { success: false, error: `Directory does not exist: ${config.rootDir}` }
+      }
+
+      this.config = config
+      this.watcherId = `watcher_${Date.now()}`
+      this.stats = {
+        filesProcessed: 0,
+        filesSuccessful: 0,
+        filesMoved: 0,
+        filesErrored: 0,
+        startTime: new Date(),
+      }
+
+      // Initialize CSV file with headers if it doesn't exist
+      const csvPath = path.resolve(config.outputFile)
+      if (!fs.existsSync(csvPath)) {
+        const headers = [
+          "filename",
+          "filepath",
+          "filesize",
+          "width",
+          "height",
+          "format",
+          "colorSpace",
+          "hasAlpha",
+          "density",
+          "orientation",
+          "created",
+          "modified",
+          "title",
+          "description",
+          "keywords",
+          "creator",
+          "copyright",
+          "creditLine",
+          "usageType",
+          "rightsHolder",
+          "location",
+          "city",
+          "state",
+          "country",
+          "gpsLatitude",
+          "gpsLongitude",
+          "cameraModel",
+          "lensMake",
+          "lensModel",
+          "focalLength",
+          "aperture",
+          "shutterSpeed",
+          "iso",
+          "flash",
+          "whiteBalance",
+          "exposureMode",
+          "meteringMode",
+          "sceneCaptureType",
+          "contrast",
+          "saturation",
+          "sharpness",
+          "digitalZoomRatio",
+          "colorTemperature",
+          "tint",
+          "exposure",
+          "highlights",
+          "shadows",
+          "whites",
+          "blacks",
+          "clarity",
+          "vibrance",
+          "saturationAdj",
+          "luminanceSmoothing",
+          "colorNoiseReduction",
+          "vignetting",
+          "chromaticAberration",
+          "distortionCorrection",
+          "perspectiveCorrection",
+          "cropTop",
+          "cropLeft",
+          "cropBottom",
+          "cropRight",
+          "rotation",
+          "flipHorizontal",
+          "flipVertical",
+        ].join(",")
+        fs.writeFileSync(csvPath, headers + "\n")
+      }
+
+      // Start watching for image files
+      this.watcher = watch(config.rootDir, {
+        ignored: /[/\\]\./,
+        persistent: true,
+        ignoreInitial: true,
+        depth: 10,
+      })
+
+      this.watcher.on("add", (filePath) => {
+        this.handleNewFile(filePath)
+      })
+
+      this.watcher.on("error", (error) => {
+        console.error("Watcher error:", error)
+      })
+
+      this.isWatching = true
+
+      if (config.verbose) {
+        console.log(`✅ Watcher started for directory: ${config.rootDir}`)
+      }
+
+      return { success: true, watcherId: this.watcherId }
+    } catch (error: any) {
+      console.error("Error starting watcher:", error)
+      return { success: false, error: error.message }
+    }
   }
 
-  onLog(`Starting to watch directory: ${rootDir}`)
-  watcher = chokidar.watch(rootDir, {
-    ignored: /(^|[/\\])\../,
-    persistent: true,
-    ignoreInitial: true,
-    depth: 99,
-  })
+  async stopWatcher() {
+    try {
+      if (!this.isWatching || !this.watcher) {
+        return { success: false, error: "No watcher is currently running" }
+      }
 
-  const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
-  const outputPath = path.join(process.cwd(), outputFile)
+      await this.watcher.close()
+      this.watcher = null
+      this.isWatching = false
+      this.config = null
+      this.watcherId = null
 
-  watcher.on("add", async (filePath) => {
-    if (filePath.toLowerCase().endsWith(".xml")) {
-      onLog(`[Watcher] New XML file detected: ${path.basename(filePath)}`)
+      console.log("🛑 Watcher stopped")
+      return { success: true }
+    } catch (error: any) {
+      console.error("Error stopping watcher:", error)
+      return { success: false, error: error.message }
+    }
+  }
 
-      const worker = new Worker(workerScriptPath, {
+  getStatus() {
+    return {
+      isWatching: this.isWatching,
+      watcherId: this.watcherId,
+      config: this.config,
+      stats: this.stats,
+      uptime: this.isWatching ? Date.now() - this.stats.startTime.getTime() : 0,
+    }
+  }
+
+  private async handleNewFile(filePath: string) {
+    if (!this.config) return
+
+    // Check if it's an image file
+    const imageExtensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".svg"]
+    const ext = path.extname(filePath).toLowerCase()
+
+    if (!imageExtensions.includes(ext)) {
+      return
+    }
+
+    if (this.config.verbose) {
+      console.log(`📁 New image detected: ${filePath}`)
+    }
+
+    try {
+      this.stats.filesProcessed++
+
+      // Process the file using the worker
+      const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"), {
         workerData: {
-          xmlFilePath: filePath,
-          filterConfig, // Pass the full filterConfig
-          originalRootDir: rootDir, // Pass rootDir for path replication logic
-          workerId: 0,
-          verbose,
+          filePath,
+          filterConfig: this.config.filterConfig,
+          outputFile: this.config.outputFile,
+          verbose: this.config.verbose,
+          isWatchMode: true,
         },
       })
 
-      worker.on("message", async (result: any) => {
-        if (result.error) {
-          onLog(`[Watcher] Error processing ${path.basename(filePath)}: ${result.error}`)
-          onUpdate({ errorFiles: 1 })
-        } else if (result.record) {
-          onLog(`[Watcher] Successfully processed ${path.basename(filePath)}. Appending to CSV.`)
-          onUpdate({ successfulFiles: 1, processedFiles: 1, recordsWritten: 1, movedFiles: result.imageMoved ? 1 : 0 })
-
-          // Check if CSV exists, if not, write headers first
-          let fileExists = false
-          try {
-            await fs.promises.access(outputPath)
-            fileExists = true
-          } catch (e) {
-            // File doesn't exist
+      worker.on("message", (result) => {
+        if (result.success) {
+          this.stats.filesSuccessful++
+          if (result.moved) {
+            this.stats.filesMoved++
           }
-
-          const csvWriter = createObjectCsvWriter({
-            path: outputPath,
-            header: CSV_HEADERS, // Use the defined CSV_HEADERS
-            append: fileExists, // Append if file exists, otherwise create with headers
-          })
-
-          try {
-            await csvWriter.writeRecords([result.record])
-            onLog(`[Watcher] Record for ${path.basename(filePath)} appended to ${outputFile}.`)
-          } catch (csvError: any) {
-            onLog(`[Watcher] Error appending to CSV: ${csvError.message}`)
+          if (this.config?.verbose) {
+            console.log(`✅ Processed: ${path.basename(filePath)}`)
           }
         } else {
-          onLog(`[Watcher] File ${path.basename(filePath)} was filtered out or not processed.`)
-          onUpdate({ processedFiles: 1 })
+          this.stats.filesErrored++
+          if (this.config?.verbose) {
+            console.error(`❌ Error processing ${path.basename(filePath)}:`, result.error)
+          }
         }
-        worker.terminate().catch((err) => onLog(`[Watcher] Error terminating worker: ${err.message}`))
       })
 
-      worker.on("error", (err) => {
-        onLog(`[Watcher] Worker error for ${path.basename(filePath)}: ${err.message}`)
-        onUpdate({ errorFiles: 1 })
+      worker.on("error", (error) => {
+        this.stats.filesErrored++
+        console.error(`❌ Worker error for ${path.basename(filePath)}:`, error)
       })
+
+      worker.on("exit", (code) => {
+        if (code !== 0 && this.config?.verbose) {
+          console.error(`❌ Worker exited with code ${code} for ${path.basename(filePath)}`)
+        }
+      })
+    } catch (error: any) {
+      this.stats.filesErrored++
+      console.error(`❌ Error handling file ${filePath}:`, error)
     }
-  })
-
-  watcher.on("error", (error) => onLog(`[Watcher] Watcher error: ${error}`))
-  watcher.on("ready", () => onLog("[Watcher] Initial scan complete. Ready for changes."))
+  }
 }
 
-export function stopWatcher(onLog: (message: string) => void) {
-  if (watcher) {
-    watcher.close()
-    watcher = null
-    onLog("[Watcher] File watcher has been stopped.")
-    return true
-  }
-  onLog("[Watcher] No active watcher to stop.")
-  return false
+// Global instance
+const watcherManager = new WatcherManager()
+
+export async function startWatcher(config: WatcherConfig) {
+  return watcherManager.startWatcher(config)
 }
 
-export function getWatcherStatus() {
-  return {
-    isWatching: !!watcher,
-    path: watcher ? watcher.getWatched() : null,
-  }
+export async function stopWatcher() {
+  return watcherManager.stopWatcher()
+}
+
+export async function getWatcherStatus() {
+  return watcherManager.getStatus()
 }

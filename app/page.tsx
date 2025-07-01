@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Toaster } from "sonner"
 
 interface Message {
   type: string
@@ -141,6 +142,10 @@ export default function Home() {
   // Watch mode
   const [watchMode, setWatchMode] = useState(false)
   const [watchInterval, setWatchInterval] = useState(30)
+  const [watchDirectory, setWatchDirectory] = useState("")
+  const [watchOutputFile, setWatchOutputFile] = useState("watched_images.csv")
+  const [useFiltersForWatch, setUseFiltersForWatch] = useState(true)
+  const [watcherStatus, setWatcherStatus] = useState<any>(null)
 
   // Results
   const [downloadURL, setDownloadURL] = useState<string | null>(null)
@@ -477,27 +482,69 @@ export default function Home() {
     }
   }
 
-  const startWatchMode = async () => {
+  const startWatching = async () => {
+    if (!watchDirectory.trim()) {
+      alert("Please enter a directory to watch")
+      return
+    }
+
     try {
-      await fetch("/api/watch/start", {
+      setWatchMode(true)
+      const response = await fetch("/api/watch/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rootDir, interval: watchInterval }),
+        body: JSON.stringify({
+          rootDir: watchDirectory,
+          filterConfig: useFiltersForWatch
+            ? {
+                ...filterConfig,
+                enabled: filterEnabled,
+              }
+            : { enabled: false },
+          outputFile: watchOutputFile,
+          numWorkers: 1,
+          verbose: true,
+        }),
       })
-      setWatchMode(true)
-      addMessage("system", `Watch mode started - monitoring ${rootDir} every ${watchInterval} seconds`)
-    } catch (error) {
-      addMessage("error", "Failed to start watch mode")
+
+      const result = await response.json()
+      if (result.success) {
+        addMessage("system", `✅ Watcher started: ${result.message}`)
+        // Poll for status updates
+        const statusInterval = setInterval(async () => {
+          try {
+            const statusResponse = await fetch("/api/watch/status")
+            const status = await statusResponse.json()
+            setWatcherStatus(status)
+            if (!status.isWatching) {
+              clearInterval(statusInterval)
+              setWatchMode(false)
+            }
+          } catch (err) {
+            console.error("Status check failed:", err)
+          }
+        }, 2000)
+      } else {
+        addMessage("error", `❌ Failed to start watcher: ${result.error}`)
+        setWatchMode(false)
+      }
+    } catch (error: any) {
+      addMessage("error", `❌ Error starting watcher: ${error.message}`)
+      setWatchMode(false)
     }
   }
 
-  const stopWatchMode = async () => {
+  const stopWatching = async () => {
     try {
-      await fetch("/api/watch/stop", { method: "POST" })
+      const response = await fetch("/api/watch/stop", {
+        method: "POST",
+      })
+      const result = await response.json()
+      addMessage("system", `🛑 Watcher stopped: ${result.message}`)
       setWatchMode(false)
-      addMessage("system", "Watch mode stopped")
-    } catch (error) {
-      addMessage("error", "Failed to stop watch mode")
+      setWatcherStatus(null)
+    } catch (error: any) {
+      addMessage("error", `❌ Error stopping watcher: ${error.message}`)
     }
   }
 
@@ -610,6 +657,7 @@ export default function Home() {
 
   return (
     <div className="container mx-auto p-6 max-w-7xl">
+      <Toaster />
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-3xl font-bold">XML to CSV Converter</h1>
         <div className="flex items-center space-x-2">
@@ -1093,7 +1141,7 @@ export default function Home() {
                                 <SelectItem value="notEquals">Not equals</SelectItem>
                                 <SelectItem value="startsWith">Starts with</SelectItem>
                                 <SelectItem value="endsWith">Ends with</SelectItem>
-                                <SelectItem value="notBlank">Not blank</SelectItem>
+                                <SelectItem value="notBlank">Is blank</SelectItem>
                                 <SelectItem value="isBlank">Is blank</SelectItem>
                               </SelectContent>
                             </Select>
@@ -1368,31 +1416,87 @@ export default function Home() {
             <TabsContent value="watch" className="space-y-4">
               <Card>
                 <CardHeader>
-                  <CardTitle>Watch Mode</CardTitle>
-                  <CardDescription>Monitor directories for new files</CardDescription>
+                  <CardTitle>File Watcher</CardTitle>
+                  <CardDescription>Monitor directories for new files and process them automatically</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="watchInterval">Check Interval: {watchInterval}s</Label>
-                    <Slider
-                      id="watchInterval"
-                      min={10}
-                      max={300}
-                      step={10}
-                      value={[watchInterval]}
-                      onValueChange={(value) => setWatchInterval(value[0])}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="watchDirectory">Directory to Watch</Label>
+                      <Input
+                        id="watchDirectory"
+                        value={watchDirectory}
+                        onChange={(e) => setWatchDirectory(e.target.value)}
+                        placeholder="/path/to/watch/directory"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="watchOutputFile">Output CSV File</Label>
+                      <Input
+                        id="watchOutputFile"
+                        value={watchOutputFile}
+                        onChange={(e) => setWatchOutputFile(e.target.value)}
+                        placeholder="watched_images.csv"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center space-x-2">
+                    <Switch
+                      id="useFiltersForWatch"
+                      checked={useFiltersForWatch}
+                      onCheckedChange={setUseFiltersForWatch}
                     />
+                    <Label htmlFor="useFiltersForWatch">Apply current filters to watched files</Label>
                   </div>
 
                   <div className="flex space-x-2">
+                    <Button onClick={startWatching} disabled={watchMode || !watchDirectory.trim()} className="flex-1">
+                      {watchMode ? "Watching..." : "Start Watching"}
+                    </Button>
                     <Button
-                      onClick={watchMode ? stopWatchMode : startWatchMode}
-                      variant={watchMode ? "destructive" : "default"}
-                      disabled={!rootDir}
+                      onClick={stopWatching}
+                      disabled={!watchMode}
+                      variant="outline"
+                      className="flex-1 bg-transparent"
                     >
-                      {watchMode ? "Stop Watching" : "Start Watching"}
+                      Stop Watching
                     </Button>
                   </div>
+
+                  {watcherStatus && (
+                    <div className="mt-4 p-4 bg-muted rounded-lg">
+                      <h4 className="font-medium mb-2">Watcher Status</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                        <div>
+                          <span className="text-muted-foreground">Status:</span>
+                          <div className={`font-medium ${watchMode ? "text-green-600" : "text-gray-600"}`}>
+                            {watchMode ? "🟢 Active" : "🔴 Stopped"}
+                          </div>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Processed:</span>
+                          <div className="font-medium">{watcherStatus.stats?.filesProcessed || 0}</div>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Successful:</span>
+                          <div className="font-medium text-green-600">{watcherStatus.stats?.filesSuccessful || 0}</div>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Moved:</span>
+                          <div className="font-medium text-blue-600">{watcherStatus.stats?.filesMoved || 0}</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <Alert>
+                    <AlertDescription>
+                      <strong>How it works:</strong> The watcher monitors the specified directory for new image files.
+                      When files are added, they are automatically processed and results are appended to the CSV file.
+                      If filters are enabled, only images that pass the filters will be processed and moved.
+                    </AlertDescription>
+                  </Alert>
                 </CardContent>
               </Card>
             </TabsContent>

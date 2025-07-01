@@ -3,13 +3,18 @@ import { stopWatcher } from "@/lib/watcher-manager"
 
 export async function POST(request: NextRequest) {
   try {
-    const stopped = stopWatcher((message) => console.log(message))
-    if (stopped) {
-      return NextResponse.json({ success: true, message: "Watcher stopped successfully." })
+    const result = await stopWatcher()
+
+    if (result.success) {
+      return NextResponse.json({
+        success: true,
+        message: "Watcher stopped successfully",
+      })
     } else {
-      return NextResponse.json({ success: false, message: "No active watcher to stop." })
+      return NextResponse.json({ success: false, error: result.error }, { status: 500 })
     }
   } catch (error: any) {
-    return NextResponse.json({ error: "Failed to stop watcher", message: error.message }, { status: 500 })
+    console.error("Error stopping watcher:", error)
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 })
   }
 }
