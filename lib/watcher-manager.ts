@@ -65,9 +65,17 @@ class WatcherManager {
         return { success: false, error: "Watcher is already running" }
       }
 
-      // Validate directory exists
-      if (!fs.existsSync(config.rootDir)) {
-        return { success: false, error: `Directory does not exist: ${config.rootDir}` }
+      // Validate directory exists and is accessible
+      try {
+        const stats = fs.statSync(config.rootDir)
+        if (!stats.isDirectory()) {
+          return { success: false, error: `Path exists but is not a directory: ${config.rootDir}` }
+        }
+
+        // Test read access
+        fs.readdirSync(config.rootDir)
+      } catch (err: any) {
+        return { success: false, error: `Directory not accessible: ${config.rootDir} - ${err.message}` }
       }
 
       this.config = config
@@ -82,12 +90,19 @@ class WatcherManager {
 
       // Initialize CSV file with headers if it doesn't exist
       const csvPath = path.resolve(config.outputFile)
-      if (!fs.existsSync(csvPath)) {
-        const csvWriter = createObjectCsvWriter({
-          path: csvPath,
-          header: CSV_HEADERS,
-        })
-        await csvWriter.writeRecords([]) // Write headers only
+      try {
+        if (!fs.existsSync(csvPath)) {
+          const csvWriter = createObjectCsvWriter({
+            path: csvPath,
+            header: CSV_HEADERS,
+          })
+          await csvWriter.writeRecords([]) // Write headers only
+          if (config.verbose) {
+            console.log(`📄 Created CSV file: ${csvPath}`)
+          }
+        }
+      } catch (err: any) {
+        return { success: false, error: `Failed to create CSV file: ${err.message}` }
       }
 
       // Start watching for image files
@@ -120,6 +135,8 @@ class WatcherManager {
 
       if (config.verbose) {
         console.log(`✅ Watcher started for directory: ${config.rootDir}`)
+        console.log(`📄 Output file: ${csvPath}`)
+        console.log(`🔍 Filters enabled: ${config.filterConfig?.enabled ? "YES" : "NO"}`)
       }
 
       return { success: true, watcherId: this.watcherId }
@@ -138,10 +155,17 @@ class WatcherManager {
       await this.watcher.close()
       this.watcher = null
       this.isWatching = false
+
+      const duration = Math.round((Date.now() - this.stats.startTime.getTime()) / 1000)
+
+      console.log("🛑 Watcher stopped")
+      console.log(
+        `📊 Final stats: ${this.stats.filesSuccessful}/${this.stats.filesProcessed} files processed successfully, ${this.stats.filesMoved} moved, ${this.stats.filesErrored} errors, ${duration}s total`,
+      )
+
       this.config = null
       this.watcherId = null
 
-      console.log("🛑 Watcher stopped")
       return { success: true }
     } catch (error: any) {
       console.error("Error stopping watcher:", error)

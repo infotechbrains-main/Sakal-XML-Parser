@@ -11,31 +11,60 @@ export async function POST(request: NextRequest) {
     console.log("Watch start request:", { rootDir, filterConfig, outputFile, numWorkers, verbose })
 
     if (!rootDir) {
-      return NextResponse.json({ error: "Root directory is required" }, { status: 400 })
+      return NextResponse.json({ success: false, error: "Root directory is required" }, { status: 400 })
     }
 
     // Validate that the directory exists
-    if (!fs.existsSync(rootDir)) {
+    try {
+      const stats = fs.statSync(rootDir)
+      if (!stats.isDirectory()) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "Path exists but is not a directory",
+            path: rootDir,
+          },
+          { status: 400 },
+        )
+      }
+    } catch (err: any) {
+      console.error("Directory validation error:", err)
       return NextResponse.json(
         {
-          error: "Directory does not exist",
+          success: false,
+          error: "Directory does not exist or is not accessible",
           path: rootDir,
+          details: err.message,
         },
         { status: 400 },
       )
     }
 
     // Ensure output directory exists
-    const outputDir = path.dirname(outputFile || "image_metadata.csv")
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true })
+    const outputFilePath = outputFile || "watched_images.csv"
+    const outputDir = path.dirname(path.resolve(outputFilePath))
+
+    try {
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true })
+      }
+    } catch (err: any) {
+      console.error("Output directory creation error:", err)
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Failed to create output directory",
+          details: err.message,
+        },
+        { status: 500 },
+      )
     }
 
     // Start the watcher with proper error handling
     const result = await startWatcher({
       rootDir,
       filterConfig: filterConfig || {},
-      outputFile: outputFile || "image_metadata.csv",
+      outputFile: outputFilePath,
       numWorkers: numWorkers || 1,
       verbose: verbose || false,
     })
@@ -45,12 +74,13 @@ export async function POST(request: NextRequest) {
         success: true,
         message: "Watcher started successfully",
         watchingPath: rootDir,
-        outputFile: outputFile || "image_metadata.csv",
+        outputFile: outputFilePath,
         watcherId: result.watcherId,
       })
     } else {
       return NextResponse.json(
         {
+          success: false,
           error: "Failed to start watcher",
           message: result.error,
         },
@@ -61,6 +91,7 @@ export async function POST(request: NextRequest) {
     console.error("Watch start error:", error)
     return NextResponse.json(
       {
+        success: false,
         error: "Failed to start watcher",
         message: error.message,
         stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
