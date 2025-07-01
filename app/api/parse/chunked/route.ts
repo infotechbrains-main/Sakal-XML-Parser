@@ -6,6 +6,7 @@ import { isRemotePath, scanRemoteDirectory, createTempDirectory, cleanupTempDire
 
 // Global state for chunked processing
 let shouldPause = false
+let shouldPauseBetweenChunks = false
 let currentProcessingState: any = null
 
 // Save processing state for resume capability
@@ -109,19 +110,6 @@ async function consolidateCSVFiles(finalOutputFile: string, totalChunks: number)
   await fs.writeFile(finalPath, consolidatedContent, "utf-8")
 }
 
-// Organize and move images by city
-async function organizeImagesByCity(records: any[], baseDestinationPath: string, verbose: boolean) {
-  const citiesProcessed = new Set<string>()
-
-  for (const record of records) {
-    if (record.city && record.imagePath && record.imageExists === "Yes") {
-      citiesProcessed.add(record.city)
-    }
-  }
-
-  return Array.from(citiesProcessed)
-}
-
 async function scanForXMLFiles(rootDir: string, progressCallback?: (message: string) => void): Promise<string[]> {
   // Check if this is a remote path
   if (await isRemotePath(rootDir)) {
@@ -167,19 +155,22 @@ export async function POST(request: NextRequest) {
   const {
     rootDir,
     outputFile = "image_metadata.csv",
-    outputFolder = "", // Add this line
+    outputFolder = "",
     numWorkers = 4,
     verbose = false,
     filterConfig = null,
     chunkSize = 100,
     pauseBetweenChunks = false,
     pauseDuration = 5,
-    organizeByCity = false,
   } = body
 
   if (!rootDir) {
     return new Response("Root directory is required", { status: 400 })
   }
+
+  // Reset pause states
+  shouldPause = false
+  shouldPauseBetweenChunks = pauseBetweenChunks
 
   // Create full output path
   const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
@@ -195,17 +186,15 @@ export async function POST(request: NextRequest) {
       controller.enqueue(encoder.encode(data))
 
       // Start chunked processing in background
-      // Pass fullOutputPath to processFilesInChunks
       processFilesInChunks(controller, encoder, {
         rootDir,
-        outputFile: fullOutputPath, // Use fullOutputPath here
+        outputFile: fullOutputPath,
         numWorkers,
         verbose,
         filterConfig,
         chunkSize,
         pauseBetweenChunks,
         pauseDuration,
-        organizeByCity,
       })
         .then(() => {
           if (!isControllerClosed) {
@@ -244,17 +233,8 @@ export async function POST(request: NextRequest) {
 }
 
 async function processFilesInChunks(controller: ReadableStreamDefaultController, encoder: TextEncoder, config: any) {
-  const {
-    rootDir,
-    outputFile,
-    numWorkers,
-    verbose,
-    filterConfig,
-    chunkSize,
-    pauseBetweenChunks,
-    pauseDuration,
-    organizeByCity,
-  } = config
+  const { rootDir, outputFile, numWorkers, verbose, filterConfig, chunkSize, pauseBetweenChunks, pauseDuration } =
+    config
 
   let isControllerClosed = false
   let tempDir: string | null = null
@@ -265,7 +245,6 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
   let totalFilteredCount = 0
   let totalMovedCount = 0
   const allErrors: string[] = []
-  const allCities = new Set<string>()
 
   const sendMessage = (type: string, data: any) => {
     if (isControllerClosed) return
@@ -309,6 +288,10 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
     const totalChunks = Math.ceil(xmlFiles.length / chunkSize)
     sendMessage("log", { message: `Processing in ${totalChunks} chunks of ${chunkSize} files each` })
 
+    if (pauseBetweenChunks) {
+      sendMessage("log", { message: `Pause between chunks enabled: ${pauseDuration} seconds` })
+    }
+
     // Handle remote files if needed
     if (await isRemotePath(rootDir)) {
       sendMessage("log", { message: "Detected remote path, downloading files..." })
@@ -335,15 +318,7 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
 
       try {
         // Process this chunk
-        const chunkResult = await processChunk(
-          chunkFiles,
-          rootDir,
-          numWorkers,
-          verbose,
-          filterConfig,
-          organizeByCity,
-          sendMessage,
-        )
+        const chunkResult = await processChunk(chunkFiles, rootDir, numWorkers, verbose, filterConfig, sendMessage)
 
         // Accumulate results
         allRecords.push(...chunkResult.csvData)
@@ -353,7 +328,6 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
         totalFilteredCount += chunkResult.filteredFiles
         totalMovedCount += chunkResult.movedFiles
         allErrors.push(...chunkResult.errors)
-        chunkResult.cities.forEach((city: string) => allCities.add(city))
 
         // Save chunk results
         const chunkFileName = `${outputFile.replace(".csv", "")}_chunk_${chunkNumber}.csv`
@@ -379,10 +353,44 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
           totalChunks,
         })
 
-        // Pause between chunks if requested
-        if (pauseBetweenChunks && chunkNumber < totalChunks) {
+        // Pause between chunks if requested and not the last chunk
+        if (pauseBetweenChunks && chunkNumber < totalChunks && !shouldPause) {
           sendMessage("log", { message: `Pausing for ${pauseDuration} seconds before next chunk...` })
-          await new Promise((resolve) => setTimeout(resolve, pauseDuration * 1000))
+          sendMessage("pause_start", {
+            duration: pauseDuration,
+            chunkCompleted: chunkNumber,
+            nextChunk: chunkNumber + 1,
+          })
+
+          // Wait for the specified duration
+          await new Promise((resolve) => {
+            const startTime = Date.now()
+            const checkPause = () => {
+              if (shouldPause) {
+                sendMessage("log", { message: "Processing paused by user during chunk break" })
+                resolve(void 0)
+                return
+              }
+
+              const elapsed = Date.now() - startTime
+              if (elapsed >= pauseDuration * 1000) {
+                resolve(void 0)
+                return
+              }
+
+              // Send countdown update every second
+              const remaining = Math.ceil((pauseDuration * 1000 - elapsed) / 1000)
+              if (elapsed % 1000 < 100) {
+                // Send update roughly every second
+                sendMessage("pause_countdown", { remaining })
+              }
+
+              setTimeout(checkPause, 100)
+            }
+            checkPause()
+          })
+
+          sendMessage("pause_end", { message: "Resuming processing..." })
         }
       } catch (error) {
         sendMessage("log", {
@@ -401,13 +409,6 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
     sendMessage("log", { message: "Consolidating chunk results into final CSV..." })
     await consolidateCSVFiles(outputFile, totalChunks)
 
-    // Organize by city if requested
-    if (organizeByCity && allCities.size > 0) {
-      sendMessage("log", { message: `Organizing results by ${allCities.size} cities...` })
-      const citiesProcessed = await organizeImagesByCity(allRecords, path.dirname(outputFile), verbose)
-      sendMessage("log", { message: `Organized images for cities: ${citiesProcessed.join(", ")}` })
-    }
-
     // Send final results
     sendMessage("complete", {
       stats: {
@@ -419,11 +420,9 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
         filteredFiles: totalFilteredCount,
         movedFiles: totalMovedCount,
         chunksProcessed: totalChunks,
-        citiesFound: allCities.size,
       },
       outputFile: path.basename(outputFile),
       errors: allErrors.slice(0, 10),
-      cities: Array.from(allCities).slice(0, 20),
     })
 
     sendMessage("log", { message: "Chunked processing completed successfully!" })
@@ -454,12 +453,10 @@ async function processChunk(
   numWorkers: number,
   verbose: boolean,
   filterConfig: any,
-  organizeByCity: boolean,
   sendMessage: (type: string, data: any) => void,
 ): Promise<any> {
   const csvData: any[] = []
   const errors: string[] = []
-  const cities = new Set<string>()
   let processedFiles = 0
   let successfulFiles = 0
   let errorFiles = 0
@@ -481,7 +478,6 @@ async function processChunk(
           filteredFiles,
           movedFiles,
           csvData,
-          cities,
           errors,
         })
       }
@@ -511,11 +507,6 @@ async function processChunk(
           if (result.record) {
             csvData.push(result.record)
             successfulFiles++
-
-            // Extract city information
-            if (result.record.city) {
-              cities.add(result.record.city)
-            }
           }
           if (result.passedFilter && result.record) {
             filteredFiles++
@@ -570,7 +561,6 @@ async function processChunk(
         filteredFiles: 0,
         movedFiles: 0,
         csvData: [],
-        cities: new Set(),
         errors: [],
       })
     }
