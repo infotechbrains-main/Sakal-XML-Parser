@@ -56,6 +56,13 @@ function extractCData(element) {
   return ""
 }
 
+// Helper function to check if file is an image
+function isImageFile(fileName) {
+  const imageExtensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".svg"]
+  const ext = path.extname(fileName).toLowerCase()
+  return imageExtensions.includes(ext)
+}
+
 // Helper function to list directory contents for debugging
 async function listDirectoryContents(dirPath, verbose, workerId) {
   try {
@@ -75,7 +82,7 @@ async function listDirectoryContents(dirPath, verbose, workerId) {
   }
 }
 
-// Helper function to find image with fuzzy matching
+// Helper function to find image with fuzzy matching - IMPROVED TO ONLY MATCH IMAGES
 async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerId) {
   try {
     const files = await fs.readdir(dirPath)
@@ -84,8 +91,15 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
       console.log(`[Worker ${workerId}] Looking for "${targetFileName}" in directory with ${files.length} files`)
     }
 
-    // First try exact match (case sensitive)
-    const exactMatch = files.find((file) => file === targetFileName)
+    // Filter to only image files
+    const imageFiles = files.filter((file) => isImageFile(file))
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Found ${imageFiles.length} image files out of ${files.length} total files`)
+    }
+
+    // First try exact match (case sensitive) - only among image files
+    const exactMatch = imageFiles.find((file) => file === targetFileName)
     if (exactMatch) {
       const fullPath = path.join(dirPath, exactMatch)
       const stats = await fs.stat(fullPath)
@@ -100,8 +114,8 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
       }
     }
 
-    // Try case insensitive match
-    const caseInsensitiveMatch = files.find((file) => file.toLowerCase() === targetFileName.toLowerCase())
+    // Try case insensitive match - only among image files
+    const caseInsensitiveMatch = imageFiles.find((file) => file.toLowerCase() === targetFileName.toLowerCase())
     if (caseInsensitiveMatch) {
       const fullPath = path.join(dirPath, caseInsensitiveMatch)
       const stats = await fs.stat(fullPath)
@@ -116,9 +130,9 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
       }
     }
 
-    // Try partial match (contains the base name)
+    // Try partial match (contains the base name) - only among image files
     const baseName = path.basename(targetFileName, path.extname(targetFileName))
-    const partialMatch = files.find((file) => {
+    const partialMatch = imageFiles.find((file) => {
       const fileBaseName = path.basename(file, path.extname(file))
       return fileBaseName.includes(baseName) || baseName.includes(fileBaseName)
     })
@@ -138,13 +152,13 @@ async function findImageWithFuzzyMatch(dirPath, targetFileName, verbose, workerI
     }
 
     if (verbose) {
-      console.log(`[Worker ${workerId}] No match found for "${targetFileName}" in ${dirPath}`)
-      console.log(`[Worker ${workerId}] Available files:`)
-      files.slice(0, 10).forEach((file, index) => {
+      console.log(`[Worker ${workerId}] No image match found for "${targetFileName}" in ${dirPath}`)
+      console.log(`[Worker ${workerId}] Available image files:`)
+      imageFiles.slice(0, 10).forEach((file, index) => {
         console.log(`[Worker ${workerId}]   ${index + 1}. "${file}"`)
       })
-      if (files.length > 10) {
-        console.log(`[Worker ${workerId}]   ... and ${files.length - 10} more files`)
+      if (imageFiles.length > 10) {
+        console.log(`[Worker ${workerId}]   ... and ${imageFiles.length - 10} more image files`)
       }
     }
 
@@ -532,6 +546,14 @@ async function moveImageUniversal(
       console.log(`  - Image filename: ${fileName}`)
     }
 
+    // Validate that we're moving an actual image file, not XML
+    if (!isImageFile(imagePath)) {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Skipping move: ${imagePath} is not an image file`)
+      }
+      return false
+    }
+
     // Handle remote images - download first
     if (isRemotePath(imagePath)) {
       if (verbose) {
@@ -566,6 +588,14 @@ async function moveImageUniversal(
       if (verbose) {
         console.log(`[Worker ${workerId}] Found local image at: ${sourceImagePath}`)
       }
+    }
+
+    // Double-check that the source is an image file
+    if (!isImageFile(sourceImagePath)) {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Skipping move: source ${sourceImagePath} is not an image file`)
+      }
+      return false
     }
 
     // Determine destination path
