@@ -273,14 +273,6 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
     })
   }
 
-  // Handle process signals for graceful shutdown
-  process.on("SIGINT", () => gracefulShutdown("SIGINT received"))
-  process.on("SIGTERM", () => gracefulShutdown("SIGTERM received"))
-  process.on("uncaughtException", (error) => {
-    console.error("Uncaught Exception:", error)
-    gracefulShutdown(`Uncaught exception: ${error.message}`)
-  })
-
   try {
     sendMessage("log", { message: "Checking if path is remote or local..." })
 
@@ -435,12 +427,15 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
           message: `  Folder structure: ${filterConfig.moveFolderStructureOption === "replicate" ? "Replicate source structure" : "Single folder"}`,
         })
       }
+    } else {
+      sendMessage("log", { message: "No filters enabled - processing all files" })
     }
 
     const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
 
     try {
       await fs.access(workerScriptPath)
+      sendMessage("log", { message: `Worker script found: ${workerScriptPath}` })
     } catch (e) {
       sendMessage("error", { message: "Worker script not found" })
       return
@@ -470,7 +465,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       }
 
       const checkCompletion = () => {
-        if ((fileIndex >= xmlFiles.length && activeWorkers.size === 0) || isShuttingDown) {
+        if ((fileIndex >= filesToProcess.length && activeWorkers.size === 0) || isShuttingDown) {
           cleanup()
           resolveAllFiles()
         }
@@ -479,11 +474,11 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
       const launchWorkerIfNeeded = () => {
         while (
           activeWorkers.size < numWorkers &&
-          fileIndex < xmlFiles.length &&
+          fileIndex < filesToProcess.length &&
           !isControllerClosed &&
           !isShuttingDown
         ) {
-          const currentFile = xmlFiles[fileIndex++]
+          const currentFile = filesToProcess[fileIndex++]
           const workerId = workersLaunched++
 
           // Get the original remote URL for this file
@@ -552,12 +547,12 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             }
 
             // Send progress update every 10 files or significant milestones
-            if (processedCount - lastProgressReport >= 10 || processedCount === xmlFiles.length) {
-              const percentage = Math.round((processedCount / xmlFiles.length) * 100)
+            if (processedCount - lastProgressReport >= 10 || processedCount === filesToProcess.length) {
+              const percentage = Math.round((processedCount / filesToProcess.length) * 100)
 
               sendMessage("progress", {
                 processed: processedCount,
-                total: xmlFiles.length,
+                total: filesToProcess.length,
                 successful: successCount,
                 filtered: filteredCount,
                 moved: movedCount,
@@ -566,7 +561,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
               })
 
               sendMessage("log", {
-                message: `Progress: ${processedCount}/${xmlFiles.length} files processed (${percentage}%)`,
+                message: `Progress: ${processedCount}/${filesToProcess.length} files processed (${percentage}%)`,
               })
 
               lastProgressReport = processedCount
@@ -575,7 +570,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             activeWorkers.delete(worker)
             worker.terminate().catch((err) => console.error(`Error terminating worker ${workerId}:`, err))
 
-            if (fileIndex < xmlFiles.length && !isControllerClosed && !isShuttingDown) {
+            if (fileIndex < filesToProcess.length && !isControllerClosed && !isShuttingDown) {
               launchWorkerIfNeeded()
             } else {
               checkCompletion()
@@ -588,7 +583,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
             sendMessage("log", { message: `Worker error for ${path.basename(currentFile)}: ${err.message}` })
             activeWorkers.delete(worker)
 
-            if (fileIndex < xmlFiles.length && !isControllerClosed && !isShuttingDown) {
+            if (fileIndex < filesToProcess.length && !isControllerClosed && !isShuttingDown) {
               launchWorkerIfNeeded()
             } else {
               checkCompletion()
@@ -616,7 +611,7 @@ async function processFiles(controller: ReadableStreamDefaultController, encoder
 
       launchWorkerIfNeeded()
 
-      if (xmlFiles.length === 0) {
+      if (filesToProcess.length === 0) {
         clearInterval(checkInterval)
         resolveAllFiles()
       }

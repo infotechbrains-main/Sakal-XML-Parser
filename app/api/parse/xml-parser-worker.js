@@ -2,7 +2,6 @@ const { parentPort, workerData } = require("worker_threads")
 const fs = require("fs/promises")
 const path = require("path")
 const { parseStringPromise } = require("xml2js")
-const fetch = require("node-fetch") // Ensure fetch is imported
 
 // Helper function to check if a path is remote
 function isRemotePath(filePath) {
@@ -131,25 +130,6 @@ function areFilenamesRelated(xmlFileName, imageFileName) {
   }
 }
 
-// Helper function to list directory contents for debugging
-async function listDirectoryContents(dirPath, verbose, workerId) {
-  try {
-    const files = await fs.readdir(dirPath)
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Directory contents of ${dirPath}:`)
-      files.forEach((file, index) => {
-        console.log(`[Worker ${workerId}]   ${index + 1}. "${file}"`)
-      })
-    }
-    return files
-  } catch (error) {
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Cannot read directory ${dirPath}: ${error.message}`)
-    }
-    return []
-  }
-}
-
 // Helper function to find image with enhanced matching logic
 async function findImageWithEnhancedMatch(dirPath, targetFileName, verbose, workerId) {
   try {
@@ -250,36 +230,14 @@ async function findImageWithEnhancedMatch(dirPath, targetFileName, verbose, work
       }
     }
 
-    // Try basic partial match as fallback
-    const baseName = path.basename(targetFileName, path.extname(targetFileName))
-    const partialMatch = imageFiles.find((file) => {
-      const fileBaseName = path.basename(file, path.extname(file))
-      return fileBaseName.includes(baseName.substring(0, 10)) || baseName.includes(fileBaseName.substring(0, 10))
-    })
-
-    if (partialMatch) {
-      const fullPath = path.join(dirPath, partialMatch)
-      const stats = await fs.stat(fullPath)
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Found partial match: "${partialMatch}" for "${targetFileName}"`)
-      }
-      return {
-        exists: true,
-        size: stats.size,
-        path: fullPath,
-        matchType: "partial",
-        fileName: partialMatch,
-      }
-    }
-
     if (verbose) {
       console.log(`[Worker ${workerId}] No image match found for "${targetFileName}" in ${dirPath}`)
       console.log(`[Worker ${workerId}] Available image files:`)
-      imageFiles.slice(0, 10).forEach((file, index) => {
+      imageFiles.slice(0, 5).forEach((file, index) => {
         console.log(`[Worker ${workerId}]   ${index + 1}. "${file}"`)
       })
-      if (imageFiles.length > 10) {
-        console.log(`[Worker ${workerId}]   ... and ${imageFiles.length - 10} more image files`)
+      if (imageFiles.length > 5) {
+        console.log(`[Worker ${workerId}]   ... and ${imageFiles.length - 5} more image files`)
       }
     }
 
@@ -301,39 +259,6 @@ async function findImageWithEnhancedMatch(dirPath, targetFileName, verbose, work
       matchType: "error",
       fileName: targetFileName,
     }
-  }
-}
-
-// Download remote image file
-async function downloadRemoteImage(imageUrl, tempDir, verbose, workerId) {
-  try {
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Downloading remote image: ${imageUrl}`)
-    }
-
-    const response = await fetch(imageUrl)
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-    }
-
-    const fileName = path.basename(new URL(imageUrl).pathname)
-    const localPath = path.join(tempDir, fileName)
-
-    const arrayBuffer = await response.arrayBuffer()
-    const buffer = Buffer.from(arrayBuffer)
-
-    await fs.writeFile(localPath, buffer)
-
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Downloaded image to: ${localPath}`)
-    }
-
-    return localPath
-  } catch (error) {
-    if (verbose) {
-      console.error(`[Worker ${workerId}] Error downloading image ${imageUrl}:`, error.message)
-    }
-    throw error
   }
 }
 
@@ -431,6 +356,8 @@ async function checkLocalImage(imagePath, verbose, workerId) {
 // Check if remote image exists and get its size
 async function checkRemoteImage(imageUrl, verbose, workerId) {
   try {
+    // Use dynamic import for fetch in Node.js
+    const fetch = (await import("node-fetch")).default
     const response = await fetch(imageUrl, { method: "HEAD" })
     if (response.ok) {
       const contentLength = response.headers.get("content-length")
@@ -493,14 +420,10 @@ function passesFilter(record, filterConfig) {
 
   if (workerData.verbose) {
     console.log(`[Worker ${workerData.workerId}] Checking filters for image: ${record.imageHref}`)
-    console.log(`[Worker ${workerData.workerId}] Filter config enabled: ${filterConfig.enabled}`)
   }
 
   const applyTextFilter = (fieldValue, filter, fieldName) => {
     if (!filter || !filter.operator) {
-      if (workerData.verbose) {
-        console.log(`[Worker ${workerData.workerId}] No ${fieldName} filter configured`)
-      }
       return true
     }
 
@@ -510,10 +433,6 @@ function passesFilter(record, filterConfig) {
     const filterVal = String(filter.value || "")
       .toLowerCase()
       .trim()
-
-    if (workerData.verbose) {
-      console.log(`[Worker ${workerData.workerId}] ${fieldName} filter: "${val}" ${filter.operator} "${filterVal}"`)
-    }
 
     let result = true
     switch (filter.operator) {
@@ -545,14 +464,10 @@ function passesFilter(record, filterConfig) {
         result = true
     }
 
-    if (workerData.verbose) {
-      console.log(`[Worker ${workerData.workerId}] ${fieldName} filter result: ${result}`)
-    }
-
     return result
   }
 
-  // File type filter - check first to avoid unnecessary processing
+  // File type filter
   if (filterConfig.allowedFileTypes && filterConfig.allowedFileTypes.length > 0) {
     const imageFileName = record.imageHref || ""
     if (imageFileName) {
@@ -561,35 +476,20 @@ function passesFilter(record, filterConfig) {
         (allowedType) => allowedType.toLowerCase() === fileExtension,
       )
 
-      if (workerData.verbose) {
-        console.log(
-          `[Worker ${workerData.workerId}] File type filter: .${fileExtension} in [${filterConfig.allowedFileTypes.join(", ")}] = ${isAllowedType}`,
-        )
-      }
-
       if (!isAllowedType) {
         if (workerData.verbose) {
           console.log(
-            `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file type .${fileExtension} not in allowed types [${filterConfig.allowedFileTypes.map((t) => `.${t}`).join(", ")}]`,
+            `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file type .${fileExtension} not allowed`,
           )
         }
         return false
       }
-    } else {
-      if (workerData.verbose) {
-        console.log(`[Worker ${workerData.workerId}] Image filtered out: no image filename found`)
-      }
-      return false
     }
   }
 
   // Image dimension filters
   const imageWidth = Number.parseInt(record.imageWidth) || 0
   const imageHeight = Number.parseInt(record.imageHeight) || 0
-
-  if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] Image dimensions: ${imageWidth}x${imageHeight}`)
-  }
 
   if (filterConfig.minWidth && imageWidth < filterConfig.minWidth) {
     if (workerData.verbose) {
@@ -608,87 +508,45 @@ function passesFilter(record, filterConfig) {
     return false
   }
 
-  // File size filters - handle comma-separated numbers
+  // File size filters
   let fileSizeBytes = record.actualFileSize || 0
   if (!fileSizeBytes && record.imageSize) {
-    // Handle comma-separated numbers like "7,871,228"
     const cleanSize = String(record.imageSize).replace(/,/g, "")
     fileSizeBytes = Number.parseInt(cleanSize) || 0
   }
 
-  const sizeSource = record.actualFileSize ? "filesystem" : "XML"
-  const verbose = workerData.verbose
-  const workerId = workerData.workerId
-
-  if (verbose) {
-    console.log(`[Worker ${workerId}] File size check for ${record.imageHref}:`)
-    console.log(`  - Size source: ${sizeSource}`)
-    console.log(`  - File size: ${fileSizeBytes} bytes (${Math.round((fileSizeBytes / 1024 / 1024) * 100) / 100}MB)`)
-  }
-
-  if (filterConfig.minFileSize) {
-    if (verbose) {
-      console.log(
-        `  - Min file size filter: ${filterConfig.minFileSize} bytes (${Math.round(filterConfig.minFileSize / 1024)}KB)`,
-      )
-    }
-    if (fileSizeBytes < filterConfig.minFileSize) {
-      if (verbose) {
-        console.log(
-          `[Worker ${workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round(fileSizeBytes / 1024)}KB) < ${filterConfig.minFileSize} bytes (${Math.round(filterConfig.minFileSize / 1024)}KB)`,
-        )
-      }
-      return false
-    }
-  }
-
-  if (filterConfig.maxFileSize) {
-    if (verbose) {
-      console.log(
-        `  - Max file size filter: ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
-      )
-    }
-    if (fileSizeBytes > filterConfig.maxFileSize) {
-      if (verbose) {
-        console.log(
-          `[Worker ${workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} bytes (${Math.round((fileSizeBytes / 1024 / 1024) * 100) / 100}MB) > ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
-        )
-      }
-      return false
-    }
-  }
-
-  // Text filters with enhanced logging
-  if (!applyTextFilter(record.creditline, filterConfig.creditLine, "creditLine")) {
+  if (filterConfig.minFileSize && fileSizeBytes < filterConfig.minFileSize) {
     if (workerData.verbose) {
       console.log(
-        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: creditLine filter failed. Value: "${record.creditline}", Filter: ${JSON.stringify(filterConfig.creditLine)}`,
+        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} < ${filterConfig.minFileSize}`,
       )
     }
+    return false
+  }
+
+  if (filterConfig.maxFileSize && fileSizeBytes > filterConfig.maxFileSize) {
+    if (workerData.verbose) {
+      console.log(
+        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} > ${filterConfig.maxFileSize}`,
+      )
+    }
+    return false
+  }
+
+  // Text filters
+  if (!applyTextFilter(record.creditline, filterConfig.creditLine, "creditLine")) {
     return false
   }
   if (!applyTextFilter(record.copyrightLine, filterConfig.copyright, "copyright")) {
-    if (workerData.verbose) {
-      console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: copyright filter failed`)
-    }
     return false
   }
   if (!applyTextFilter(record.usageType, filterConfig.usageType, "usageType")) {
-    if (workerData.verbose) {
-      console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: usageType filter failed`)
-    }
     return false
   }
   if (!applyTextFilter(record.rightsHolder, filterConfig.rightsHolder, "rightsHolder")) {
-    if (workerData.verbose) {
-      console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: rightsHolder filter failed`)
-    }
     return false
   }
   if (!applyTextFilter(record.location, filterConfig.location, "location")) {
-    if (workerData.verbose) {
-      console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: location filter failed`)
-    }
     return false
   }
 
@@ -715,7 +573,7 @@ async function moveImageUniversal(
       return false
     }
 
-    let sourceImagePath = ""
+    const sourceImagePath = imagePath
     const fileName = imageFileName || path.basename(imagePath)
 
     if (verbose) {
@@ -726,7 +584,7 @@ async function moveImageUniversal(
       console.log(`  - Image filename: ${fileName}`)
     }
 
-    // Validate that we're moving an actual image file, not XML
+    // Validate that we're moving an actual image file
     if (!isImageFile(imagePath)) {
       if (verbose) {
         console.log(`[Worker ${workerId}] Skipping move: ${imagePath} is not an image file`)
@@ -734,48 +592,19 @@ async function moveImageUniversal(
       return false
     }
 
-    // Handle remote images - download first
-    if (isRemotePath(imagePath)) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Preparing to move remote image: ${imagePath}`)
-      }
-
-      // Create temp directory for remote image download
-      const tempImageDir = path.join(originalRootDirForScan, "temp_images")
-      await fs.mkdir(tempImageDir, { recursive: true })
-
-      // Download the remote image
-      sourceImagePath = await downloadRemoteImage(imagePath, tempImageDir, verbose, workerId)
-
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Downloaded remote image for moving: ${sourceImagePath}`)
-      }
-    } else {
-      // Handle local images - find the actual file first
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Preparing to move local image: ${imagePath}`)
-      }
-
-      // Use the improved image checker to find the actual file
-      const imageInfo = await checkLocalImage(imagePath, verbose, workerId)
-
-      if (!imageInfo.exists) {
-        if (verbose) console.log(`[Worker ${workerId}] Local image file does not exist: ${imagePath}`)
+    // For local files, verify the source exists
+    if (!isRemotePath(imagePath)) {
+      try {
+        await fs.access(sourceImagePath)
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Verified source image exists: ${sourceImagePath}`)
+        }
+      } catch (error) {
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Source image does not exist: ${sourceImagePath}`)
+        }
         return false
       }
-
-      sourceImagePath = imageInfo.path
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Found local image at: ${sourceImagePath}`)
-      }
-    }
-
-    // Double-check that the source is an image file
-    if (!isImageFile(sourceImagePath)) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Skipping move: source ${sourceImagePath} is not an image file`)
-      }
-      return false
     }
 
     // Determine destination path
@@ -787,23 +616,13 @@ async function moveImageUniversal(
       let relativePathFromRoot = ""
 
       if (originalRemoteStructure) {
-        // Use the original remote structure for path calculation
         relativePathFromRoot = path.join(
           originalRemoteStructure.city || "unknown",
           originalRemoteStructure.year || "unknown",
           originalRemoteStructure.month || "unknown",
           "media",
         )
-      } else if (isRemotePath(imagePath)) {
-        // For remote files, extract relative path from URL
-        try {
-          const imageUrl = new URL(imagePath)
-          const rootUrl = new URL(originalRootDirForScan)
-          relativePathFromRoot = path.dirname(imageUrl.pathname.replace(rootUrl.pathname, ""))
-        } catch (error) {
-          relativePathFromRoot = "remote_images"
-        }
-      } else {
+      } else if (!isRemotePath(imagePath)) {
         // For local files, use standard path relative calculation
         try {
           relativePathFromRoot = path.relative(originalRootDirForScan, path.dirname(sourceImagePath))
@@ -853,95 +672,22 @@ async function moveImageUniversal(
       console.log(`[Worker ${workerId}] Successfully moved image: ${sourceImagePath} -> ${finalDestPath}`)
     }
 
-    // Clean up temporary file if it was a remote download
-    if (isRemotePath(imagePath) && sourceImagePath !== imagePath) {
-      try {
-        await fs.unlink(sourceImagePath)
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Cleaned up temporary file: ${sourceImagePath}`)
-        }
-      } catch (cleanupError) {
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Warning: Could not clean up temp file: ${cleanupError.message}`)
-        }
-      }
-    }
-
     return true
   } catch (error) {
     if (verbose) {
       console.error(`[Worker ${workerId}] Error moving image ${imagePath}:`, error.message)
-      console.error(`[Worker ${workerId}] Stack trace:`, error.stack)
     }
     return false
   }
 }
 
-// Construct image path based on original remote URL and folder structure
-function constructRemoteImagePath(originalRemoteXmlUrl, imageHref, verbose, workerId) {
-  if (!imageHref || !originalRemoteXmlUrl) return ""
-
-  try {
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Constructing remote image path:`)
-      console.log(`  - Original XML URL: ${originalRemoteXmlUrl}`)
-      console.log(`  - Image filename: ${imageHref}`)
-    }
-
-    // Parse the original remote XML URL
-    const xmlUrl = new URL(originalRemoteXmlUrl)
-
-    // Extract path components
-    // Expected: /photoapp/charitra/2006/11/processed/file.xml
-    // Want: /photoapp/charitra/2006/11/media/image.jpg
-    const pathParts = xmlUrl.pathname.split("/").filter((part) => part.length > 0)
-
-    if (verbose) {
-      console.log(`  - Path parts: ${JSON.stringify(pathParts)}`)
-    }
-
-    // Find the 'processed' folder and replace with 'media'
-    const processedIndex = pathParts.findIndex((part) => part.toLowerCase() === "processed")
-    if (processedIndex !== -1) {
-      pathParts[processedIndex] = "media"
-      // Remove the XML filename (last part)
-      pathParts.pop()
-    } else {
-      // If no 'processed' folder found, assume the structure and build media path
-      // Remove the last part (XML filename) and add 'media'
-      pathParts.pop()
-      pathParts.push("media")
-    }
-
-    // Construct the image URL
-    const imagePath = "/" + pathParts.join("/") + "/" + imageHref
-    const imageUrl = `${xmlUrl.protocol}//${xmlUrl.host}${imagePath}`
-
-    if (verbose) {
-      console.log(`  - Constructed image URL: ${imageUrl}`)
-    }
-
-    return imageUrl
-  } catch (error) {
-    if (verbose) {
-      console.error(`[Worker ${workerId}] Error constructing remote image path:`, error.message)
-    }
-    return ""
-  }
-}
-
-// Construct image path based on XML path (works for both local and remote)
+// Construct image path based on XML path
 function constructImagePath(xmlFilePath, imageHref, isRemote, originalRemoteXmlUrl, verbose, workerId) {
   if (!imageHref) return ""
 
-  if (isRemote && originalRemoteXmlUrl) {
-    // For remote files: use the original remote URL to construct image path
-    return constructRemoteImagePath(originalRemoteXmlUrl, imageHref, verbose, workerId)
-  } else if (!isRemote) {
-    // For local files: try multiple possible paths
+  if (!isRemote) {
+    // For local files: try media directory at same level as processed
     const xmlDir = path.dirname(xmlFilePath)
-
-    // Try media directory at same level as processed
     const mediaDir = path.join(path.dirname(xmlDir), "media")
     const mediaPath = path.join(mediaDir, imageHref)
 
@@ -958,41 +704,6 @@ function constructImagePath(xmlFilePath, imageHref, isRemote, originalRemoteXmlU
   return ""
 }
 
-// Extract folder structure from remote URL
-function extractRemoteStructure(remoteXmlUrl, verbose, workerId) {
-  try {
-    const url = new URL(remoteXmlUrl)
-    const pathParts = url.pathname.split("/").filter((part) => part.length > 0)
-
-    // Expected structure: /photoapp/charitra/2006/11/processed/file.xml
-    // Extract: city, year, month
-    let city = "",
-      year = "",
-      month = ""
-
-    // Look for year pattern (4 digits)
-    const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
-    if (yearIndex !== -1 && yearIndex > 0) {
-      city = pathParts[yearIndex - 1]
-      year = pathParts[yearIndex]
-      if (yearIndex + 1 < pathParts.length && /^\d{1,2}$/.test(pathParts[yearIndex + 1])) {
-        month = pathParts[yearIndex + 1]
-      }
-    }
-
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Extracted remote structure: city=${city}, year=${year}, month=${month}`)
-    }
-
-    return { city, year, month }
-  } catch (error) {
-    if (verbose) {
-      console.error(`[Worker ${workerId}] Error extracting remote structure:`, error.message)
-    }
-    return { city: "", year: "", month: "" }
-  }
-}
-
 // Process a single XML file
 async function processXmlFileInWorker(
   xmlFilePath,
@@ -1006,10 +717,6 @@ async function processXmlFileInWorker(
   try {
     if (verbose) {
       console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
-      console.log(`[Worker ${workerId}] Mode: ${isRemote ? "Remote" : "Local"}`)
-      if (originalRemoteXmlUrl) {
-        console.log(`[Worker ${workerId}] Original remote URL: ${originalRemoteXmlUrl}`)
-      }
     }
 
     const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
@@ -1018,36 +725,17 @@ async function processXmlFileInWorker(
       mergeAttrs: true,
     })
 
-    // Extract folder structure from original remote URL or local path
+    // Extract folder structure from local path
     let city = "",
       year = "",
       month = ""
-    let remoteStructure = null
-
-    if (isRemote && originalRemoteXmlUrl) {
-      remoteStructure = extractRemoteStructure(originalRemoteXmlUrl, verbose, workerId)
-      city = remoteStructure.city
-      year = remoteStructure.year
-      month = remoteStructure.month
-    } else {
-      // For local files, extract from path
-      const pathParts = xmlFilePath.split(path.sep)
-      const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
-      if (yearIndex !== -1) {
-        year = pathParts[yearIndex]
-        if (yearIndex > 0) city = pathParts[yearIndex - 1]
-        if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
-          month = pathParts[yearIndex + 1]
-        }
-      }
-
-      for (let i = 0; i < pathParts.length; i++) {
-        if (pathParts[i].toLowerCase() === "images" && i + 3 < pathParts.length) {
-          city = pathParts[i + 1]
-          year = pathParts[i + 2]
-          month = pathParts[i + 3]
-          break
-        }
+    const pathParts = xmlFilePath.split(path.sep)
+    const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
+    if (yearIndex !== -1) {
+      year = pathParts[yearIndex]
+      if (yearIndex > 0) city = pathParts[yearIndex - 1]
+      if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
+        month = pathParts[yearIndex + 1]
       }
     }
 
@@ -1195,7 +883,7 @@ async function processXmlFileInWorker(
       }
     }
 
-    // Universal image handling - works for both local and remote
+    // Image handling
     let imagePath = ""
     let imageExists = false
     let actualFileSize = 0
@@ -1203,19 +891,17 @@ async function processXmlFileInWorker(
     let matchInfo = {}
 
     if (imageHref) {
-      // Construct image path (local or remote)
       imagePath = constructImagePath(xmlFilePath, imageHref, isRemote, originalRemoteXmlUrl, verbose, workerId)
 
       if (verbose) {
         console.log(`[Worker ${workerId}] Constructed image path: ${imagePath}`)
       }
 
-      // Check image existence and get size (universal method)
       if (imagePath) {
         const imageInfo = await checkImageUniversal(imagePath, verbose, workerId)
         imageExists = imageInfo.exists
         actualFileSize = imageInfo.size
-        actualImagePath = imageInfo.path // This is the actual found path
+        actualImagePath = imageInfo.path
         matchInfo = {
           matchType: imageInfo.matchType,
           fileName: imageInfo.fileName,
@@ -1229,10 +915,6 @@ async function processXmlFileInWorker(
           console.log(`  - Size: ${actualFileSize} bytes`)
           console.log(`  - Found at: ${actualImagePath}`)
           console.log(`  - Match type: ${imageInfo.matchType}`)
-          if (imageInfo.confidence) {
-            console.log(`  - Confidence: ${imageInfo.confidence}`)
-            console.log(`  - Reason: ${imageInfo.reason}`)
-          }
         }
       }
     }
@@ -1270,22 +952,11 @@ async function processXmlFileInWorker(
       actualFileSize,
       imageHref,
       xmlPath: xmlFilePath,
-      imagePath: actualImagePath || imagePath, // Use actual found path
+      imagePath: actualImagePath || imagePath,
       imageExists: imageExists ? "Yes" : "No",
       creationDate,
       revisionDate,
       commentData,
-    }
-
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Extracted image metadata for ${path.basename(xmlFilePath)}:`)
-      console.log(`  - Image file: ${imageHref}`)
-      console.log(`  - Raw size from XML: "${imageSize}"`)
-      console.log(`  - Actual file size: ${actualFileSize} bytes`)
-      console.log(`  - Dimensions: ${imageWidth}x${imageHeight}`)
-      console.log(`  - Image exists: ${imageExists}`)
-      console.log(`  - Image path: ${actualImagePath || imagePath}`)
-      console.log(`  - Path type: ${isRemotePath(actualImagePath || imagePath) ? "Remote" : "Local"}`)
     }
 
     const passed = passesFilter(record, filterConfig)
@@ -1298,7 +969,7 @@ async function processXmlFileInWorker(
       return { record: null, passedFilter: false, imageMoved: false, workerId }
     }
 
-    // Universal image moving - handles both local and remote
+    // Image moving
     if (
       filterConfig?.enabled &&
       passed &&
@@ -1315,14 +986,14 @@ async function processXmlFileInWorker(
         }
 
         moved = await moveImageUniversal(
-          actualImagePath || imagePath, // Use the actual found path
+          actualImagePath || imagePath,
           filterConfig.moveDestinationPath,
           filterConfig.moveFolderStructureOption,
           originalRootDir,
           verbose,
           workerId,
           matchInfo.fileName || imageHref,
-          remoteStructure,
+          null,
         )
 
         if (verbose) {
@@ -1333,13 +1004,6 @@ async function processXmlFileInWorker(
           console.error(`[Worker ${workerId}] Error during image move:`, error.message)
         }
       }
-    } else if (verbose) {
-      console.log(`[Worker ${workerId}] Image move skipped:`)
-      console.log(`  - Filters enabled: ${filterConfig?.enabled}`)
-      console.log(`  - Passed filters: ${passed}`)
-      console.log(`  - Move images enabled: ${filterConfig?.moveImages}`)
-      console.log(`  - Destination path: ${filterConfig?.moveDestinationPath}`)
-      console.log(`  - Image exists: ${imageExists}`)
     }
 
     if (verbose) {
@@ -1369,13 +1033,6 @@ async function main() {
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Starting to process: ${path.basename(xmlFilePath)}`)
-      console.log(`[Worker ${workerId}] Processing mode: ${isRemote ? "Remote" : "Local"}`)
-      if (originalRemoteXmlUrl) {
-        console.log(`[Worker ${workerId}] Original remote XML URL: ${originalRemoteXmlUrl}`)
-      }
-      if (filterConfig?.enabled) {
-        console.log(`[Worker ${workerId}] Filter config:`, JSON.stringify(filterConfig, null, 2))
-      }
     }
 
     const result = await processXmlFileInWorker(
