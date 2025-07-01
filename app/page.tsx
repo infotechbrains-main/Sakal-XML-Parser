@@ -142,7 +142,7 @@ export default function Home() {
   // Watch mode
   const [watchMode, setWatchMode] = useState(false)
   const [watchInterval, setWatchInterval] = useState(30)
-  const [watchDirectory, setWatchDirectory] = useState("")
+  const [watchDirectory, setWatchDirectory] = useState("/Users/amangupta/Desktop/test-images")
   const [watchOutputFile, setWatchOutputFile] = useState("watched_images.csv")
   const [useFiltersForWatch, setUseFiltersForWatch] = useState(true)
   const [watcherStatus, setWatcherStatus] = useState<any>(null)
@@ -151,7 +151,7 @@ export default function Home() {
   const [downloadURL, setDownloadURL] = useState<string | null>(null)
   const [jobId, setJobId] = useState<string | null>(null)
 
-  // Add these state variables after the existing ones
+  // History - Initialize as empty array
   const [history, setHistory] = useState<ProcessingSession[]>([])
   const [canResume, setCanResume] = useState(false)
   const [resumeSession, setResumeSession] = useState<ProcessingSession | null>(null)
@@ -218,22 +218,28 @@ export default function Home() {
       const response = await fetch("/api/history")
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
+        console.error("History API error:", response.status)
+        setHistory([])
+        return
       }
 
       const contentType = response.headers.get("content-type")
       if (!contentType || !contentType.includes("application/json")) {
-        throw new Error("Response is not JSON")
+        console.error("History response is not JSON")
+        setHistory([])
+        return
       }
 
       const data = await response.json()
 
-      if (data.success) {
-        setHistory(data.history || [])
+      if (data.success && Array.isArray(data.history)) {
+        setHistory(data.history)
       } else {
-        console.error("API error:", data.error)
+        console.error("Invalid history data:", data)
         setHistory([])
-        addMessage("error", `Failed to load history: ${data.error}`)
+        if (data.error) {
+          addMessage("error", `Failed to load history: ${data.error}`)
+        }
       }
     } catch (error) {
       console.error("Failed to load history:", error)
@@ -962,51 +968,6 @@ export default function Home() {
                               </SelectContent>
                             </Select>
                             <Input
-                              value={filterConfig.creditLine?.value || ""}
-                              onChange={(e) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  creditLine: {
-                                    ...prev.creditLine,
-                                    operator: prev.creditLine?.operator || "like",
-                                    value: e.target.value,
-                                  },
-                                }))
-                              }
-                              placeholder="Filter value"
-                              disabled={!filterConfig.creditLine?.operator}
-                            />
-                          </div>
-                        </div>
-
-                        {/* Copyright Filter */}
-                        <div className="space-y-2">
-                          <Label htmlFor="copyrightOperator">Copyright</Label>
-                          <div className="grid grid-cols-2 gap-2">
-                            <Select
-                              value={filterConfig.copyright?.operator || ""}
-                              onValueChange={(value) =>
-                                setFilterConfig((prev) => ({
-                                  ...prev,
-                                  copyright: { ...prev.copyright, operator: value, value: prev.copyright?.value || "" },
-                                }))
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue placeholder="Select operator" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="like">Contains</SelectItem>
-                                <SelectItem value="notLike">Does not contain</SelectItem>
-                                <SelectItem value="equals">Equals</SelectItem>
-                                <SelectItem value="notEquals">Not equals</SelectItem>
-                                <SelectItem value="startsWith">Starts with</SelectItem>
-                                <SelectItem value="endsWith">Ends with</SelectItem>
-                                <SelectItem value="notBlank">Not blank</SelectItem>
-                                <SelectItem value="isBlank">Is blank</SelectItem>
-                              </SelectContent>
-                            </Select>
-                            <Input
                               value={filterConfig.copyright?.value || ""}
                               onChange={(e) =>
                                 setFilterConfig((prev) => ({
@@ -1427,8 +1388,12 @@ export default function Home() {
                         id="watchDirectory"
                         value={watchDirectory}
                         onChange={(e) => setWatchDirectory(e.target.value)}
-                        placeholder="/path/to/watch/directory"
+                        placeholder="/Users/amangupta/Desktop/test-images"
                       />
+                      <p className="text-xs text-gray-500">
+                        💡 <strong>Tip:</strong> Create directory first:{" "}
+                        <code>mkdir -p /Users/amangupta/Desktop/test-images</code>
+                      </p>
                     </div>
                     <div className="space-y-2">
                       <Label htmlFor="watchOutputFile">Output CSV File</Label>
@@ -1527,7 +1492,7 @@ export default function Home() {
 
                   <ScrollArea className="h-96">
                     <div className="space-y-3">
-                      {history.length === 0 ? (
+                      {!Array.isArray(history) || history.length === 0 ? (
                         <div className="text-center text-muted-foreground py-8">No processing history found</div>
                       ) : (
                         history.map((session) => (
