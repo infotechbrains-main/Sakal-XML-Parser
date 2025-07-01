@@ -13,16 +13,17 @@ export async function POST() {
     } else {
       return NextResponse.json(
         {
-          error: "Failed to stop watcher",
-          message: result.error,
+          success: false,
+          error: result.error,
         },
-        { status: 500 },
+        { status: 400 },
       )
     }
   } catch (error: any) {
-    console.error("Watch stop error:", error)
+    console.error("Error stopping watcher:", error)
     return NextResponse.json(
       {
+        success: false,
         error: "Failed to stop watcher",
         message: error.message,
       },
