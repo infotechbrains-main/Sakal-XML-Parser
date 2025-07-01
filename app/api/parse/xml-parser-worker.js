@@ -63,67 +63,93 @@ function isImageFile(fileName) {
   return imageExtensions.includes(ext)
 }
 
-// Simplified image path construction - just look in media folder
-function constructImagePath(xmlFilePath, imageHref, verbose, workerId) {
-  if (!imageHref) return ""
+// Enhanced image path finder - tries multiple possible locations
+async function findImagePath(xmlFilePath, imageHref, verbose, workerId) {
+  if (!imageHref) return null
 
-  // Get the directory containing the XML file
   const xmlDir = path.dirname(xmlFilePath)
-
-  // Look for media folder at the same level as the processed folder
   const parentDir = path.dirname(xmlDir)
-  const mediaDir = path.join(parentDir, "media")
-  const imagePath = path.join(mediaDir, imageHref)
+
+  // List of possible image locations to try
+  const possiblePaths = [
+    // Standard media folder at same level as processed
+    path.join(parentDir, "media", imageHref),
+    // Media folder inside the same directory as XML
+    path.join(xmlDir, "media", imageHref),
+    // Images folder at same level as processed
+    path.join(parentDir, "images", imageHref),
+    // Images folder inside the same directory as XML
+    path.join(xmlDir, "images", imageHref),
+    // Same directory as XML file
+    path.join(xmlDir, imageHref),
+    // Parent directory
+    path.join(parentDir, imageHref),
+    // One level up from parent
+    path.join(path.dirname(parentDir), "media", imageHref),
+    path.join(path.dirname(parentDir), "images", imageHref),
+  ]
 
   if (verbose) {
-    console.log(`[Worker ${workerId}] Constructing image path:`)
-    console.log(`  - XML file: ${xmlFilePath}`)
-    console.log(`  - XML directory: ${xmlDir}`)
-    console.log(`  - Parent directory: ${parentDir}`)
-    console.log(`  - Media directory: ${mediaDir}`)
-    console.log(`  - Image filename: ${imageHref}`)
-    console.log(`  - Full image path: ${imagePath}`)
+    console.log(`[Worker ${workerId}] Searching for image: ${imageHref}`)
+    console.log(`[Worker ${workerId}] XML file: ${xmlFilePath}`)
+    console.log(`[Worker ${workerId}] Trying ${possiblePaths.length} possible locations...`)
   }
 
-  return imagePath
-}
+  // Try each possible path
+  for (let i = 0; i < possiblePaths.length; i++) {
+    const testPath = possiblePaths[i]
+    try {
+      await fs.access(testPath)
+      const stats = await fs.stat(testPath)
 
-// Simple image checker - just check if the file exists
-async function checkImageExists(imagePath, verbose, workerId) {
-  try {
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Checking if image exists: ${imagePath}`)
-    }
+      if (verbose) {
+        console.log(`[Worker ${workerId}] ✓ Found image at location ${i + 1}: ${testPath}`)
+        console.log(`[Worker ${workerId}] Image size: ${stats.size} bytes`)
+      }
 
-    await fs.access(imagePath)
-    const stats = await fs.stat(imagePath)
+      return {
+        exists: true,
+        size: stats.size,
+        path: testPath,
+        fileName: path.basename(testPath),
+        foundAt: `location_${i + 1}`,
+      }
+    } catch (error) {
+      if (verbose && i < 3) {
+        // Only log first few attempts to avoid spam
+        console.log(`[Worker ${workerId}] ✗ Not found at location ${i + 1}: ${testPath}`)
+      }
+    }
+  }
 
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Image found: ${imagePath}, size: ${stats.size} bytes`)
+  if (verbose) {
+    console.log(`[Worker ${workerId}] ✗ Image not found in any of the ${possiblePaths.length} locations`)
+    console.log(`[Worker ${workerId}] Searched locations:`)
+    possiblePaths.slice(0, 5).forEach((p, i) => {
+      console.log(`[Worker ${workerId}]   ${i + 1}. ${p}`)
+    })
+    if (possiblePaths.length > 5) {
+      console.log(`[Worker ${workerId}]   ... and ${possiblePaths.length - 5} more locations`)
     }
+  }
 
-    return {
-      exists: true,
-      size: stats.size,
-      path: imagePath,
-      fileName: path.basename(imagePath),
-    }
-  } catch (error) {
-    if (verbose) {
-      console.log(`[Worker ${workerId}] Image not found: ${imagePath}`)
-    }
-    return {
-      exists: false,
-      size: 0,
-      path: imagePath,
-      fileName: path.basename(imagePath),
-    }
+  return {
+    exists: false,
+    size: 0,
+    path: possiblePaths[0], // Return the first attempted path as default
+    fileName: imageHref,
+    foundAt: "not_found",
   }
 }
 
-// Check if image passes filter criteria
+// Check if image passes filter criteria - FIXED VERSION
 function passesFilter(record, filterConfig) {
-  if (!filterConfig?.enabled) {
+  // Debug log the filter config received
+  if (workerData.verbose) {
+    console.log(`[Worker ${workerData.workerId}] Filter config received:`, JSON.stringify(filterConfig, null, 2))
+  }
+
+  if (!filterConfig || !filterConfig.enabled) {
     if (workerData.verbose) {
       console.log(`[Worker ${workerData.workerId}] Filters disabled - image ${record.imageHref} passes by default`)
     }
@@ -131,7 +157,7 @@ function passesFilter(record, filterConfig) {
   }
 
   if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] Checking filters for image: ${record.imageHref}`)
+    console.log(`[Worker ${workerData.workerId}] ✓ Filters are ENABLED - checking image: ${record.imageHref}`)
   }
 
   const applyTextFilter = (fieldValue, filter, fieldName) => {
@@ -179,19 +205,25 @@ function passesFilter(record, filterConfig) {
     return result
   }
 
-  // File type filter
-  if (filterConfig.allowedFileTypes && filterConfig.allowedFileTypes.length > 0) {
+  // File type filter - check allowedFileTypes OR fileTypes
+  const allowedTypes = filterConfig.allowedFileTypes || filterConfig.fileTypes || []
+  if (allowedTypes && allowedTypes.length > 0) {
     const imageFileName = record.imageHref || ""
     if (imageFileName) {
       const fileExtension = imageFileName.split(".").pop()?.toLowerCase() || ""
-      const isAllowedType = filterConfig.allowedFileTypes.some(
-        (allowedType) => allowedType.toLowerCase() === fileExtension,
-      )
+      const isAllowedType = allowedTypes.some((allowedType) => allowedType.toLowerCase() === fileExtension)
+
+      if (workerData.verbose) {
+        console.log(`[Worker ${workerData.workerId}] File type check:`)
+        console.log(`  - Image extension: .${fileExtension}`)
+        console.log(`  - Allowed types: [${allowedTypes.join(", ")}]`)
+        console.log(`  - Is allowed: ${isAllowedType}`)
+      }
 
       if (!isAllowedType) {
         if (workerData.verbose) {
           console.log(
-            `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file type .${fileExtension} not allowed`,
+            `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file type .${fileExtension} not in allowed types`,
           )
         }
         return false
@@ -203,10 +235,17 @@ function passesFilter(record, filterConfig) {
   const imageWidth = Number.parseInt(record.imageWidth) || 0
   const imageHeight = Number.parseInt(record.imageHeight) || 0
 
+  if (workerData.verbose) {
+    console.log(`[Worker ${workerData.workerId}] Dimension check:`)
+    console.log(`  - Image dimensions: ${imageWidth}x${imageHeight}`)
+    console.log(`  - Min width filter: ${filterConfig.minWidth || "none"}`)
+    console.log(`  - Min height filter: ${filterConfig.minHeight || "none"}`)
+  }
+
   if (filterConfig.minWidth && imageWidth < filterConfig.minWidth) {
     if (workerData.verbose) {
       console.log(
-        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: width ${imageWidth} < ${filterConfig.minWidth}`,
+        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: width ${imageWidth} < ${filterConfig.minWidth}`,
       )
     }
     return false
@@ -214,7 +253,7 @@ function passesFilter(record, filterConfig) {
   if (filterConfig.minHeight && imageHeight < filterConfig.minHeight) {
     if (workerData.verbose) {
       console.log(
-        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: height ${imageHeight} < ${filterConfig.minHeight}`,
+        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: height ${imageHeight} < ${filterConfig.minHeight}`,
       )
     }
     return false
@@ -227,10 +266,17 @@ function passesFilter(record, filterConfig) {
     fileSizeBytes = Number.parseInt(cleanSize) || 0
   }
 
+  if (workerData.verbose) {
+    console.log(`[Worker ${workerData.workerId}] File size check:`)
+    console.log(`  - Actual file size: ${fileSizeBytes} bytes`)
+    console.log(`  - Min size filter: ${filterConfig.minFileSize || "none"}`)
+    console.log(`  - Max size filter: ${filterConfig.maxFileSize || "none"}`)
+  }
+
   if (filterConfig.minFileSize && fileSizeBytes < filterConfig.minFileSize) {
     if (workerData.verbose) {
       console.log(
-        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} < ${filterConfig.minFileSize}`,
+        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file size ${fileSizeBytes} < ${filterConfig.minFileSize}`,
       )
     }
     return false
@@ -239,7 +285,7 @@ function passesFilter(record, filterConfig) {
   if (filterConfig.maxFileSize && fileSizeBytes > filterConfig.maxFileSize) {
     if (workerData.verbose) {
       console.log(
-        `[Worker ${workerData.workerId}] Image ${record.imageHref} filtered out: file size ${fileSizeBytes} > ${filterConfig.maxFileSize}`,
+        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file size ${fileSizeBytes} > ${filterConfig.maxFileSize}`,
       )
     }
     return false
@@ -263,7 +309,7 @@ function passesFilter(record, filterConfig) {
   }
 
   if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] Image ${record.imageHref} passed all filters`)
+    console.log(`[Worker ${workerData.workerId}] ✓ Image ${record.imageHref} passed all filters`)
   }
   return true
 }
@@ -298,11 +344,11 @@ async function moveImage(
     try {
       await fs.access(sourceImagePath)
       if (verbose) {
-        console.log(`[Worker ${workerId}] Verified source image exists: ${sourceImagePath}`)
+        console.log(`[Worker ${workerId}] ✓ Verified source image exists: ${sourceImagePath}`)
       }
     } catch (error) {
       if (verbose) {
-        console.log(`[Worker ${workerId}] Source image does not exist: ${sourceImagePath}`)
+        console.log(`[Worker ${workerId}] ✗ Source image does not exist: ${sourceImagePath}`)
       }
       return false
     }
@@ -356,7 +402,7 @@ async function moveImage(
     // Create destination directory
     await fs.mkdir(finalDestDir, { recursive: true })
     if (verbose) {
-      console.log(`[Worker ${workerId}] Created destination directory: ${finalDestDir}`)
+      console.log(`[Worker ${workerId}] ✓ Created destination directory: ${finalDestDir}`)
     }
 
     // Check if destination file already exists
@@ -380,13 +426,13 @@ async function moveImage(
     await fs.copyFile(sourceImagePath, finalDestPath)
 
     if (verbose) {
-      console.log(`[Worker ${workerId}] Successfully moved image: ${sourceImagePath} -> ${finalDestPath}`)
+      console.log(`[Worker ${workerId}] ✓ Successfully moved image: ${sourceImagePath} -> ${finalDestPath}`)
     }
 
     return true
   } catch (error) {
     if (verbose) {
-      console.error(`[Worker ${workerId}] Error moving image ${sourceImagePath}:`, error.message)
+      console.error(`[Worker ${workerId}] ✗ Error moving image ${sourceImagePath}:`, error.message)
       console.error(`[Worker ${workerId}] Stack trace:`, error.stack)
     }
     return false
@@ -406,6 +452,7 @@ async function processXmlFileInWorker(
   try {
     if (verbose) {
       console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
+      console.log(`[Worker ${workerId}] Filter config:`, JSON.stringify(filterConfig, null, 2))
     }
 
     const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
@@ -575,28 +622,25 @@ async function processXmlFileInWorker(
       }
     }
 
-    // Simple image handling - just construct path and check if exists
+    // Enhanced image finding - tries multiple locations
     let imagePath = ""
     let imageExists = false
     let actualFileSize = 0
+    let imageInfo = null
 
     if (imageHref) {
-      imagePath = constructImagePath(xmlFilePath, imageHref, verbose, workerId)
+      imageInfo = await findImagePath(xmlFilePath, imageHref, verbose, workerId)
+      imageExists = imageInfo.exists
+      actualFileSize = imageInfo.size
+      imagePath = imageInfo.path
 
       if (verbose) {
-        console.log(`[Worker ${workerId}] Constructed image path: ${imagePath}`)
-      }
-
-      if (imagePath) {
-        const imageInfo = await checkImageExists(imagePath, verbose, workerId)
-        imageExists = imageInfo.exists
-        actualFileSize = imageInfo.size
-
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Image check result:`)
-          console.log(`  - Exists: ${imageExists}`)
-          console.log(`  - Size: ${actualFileSize} bytes`)
-          console.log(`  - Path: ${imagePath}`)
+        console.log(`[Worker ${workerId}] Image search result:`)
+        console.log(`  - Exists: ${imageExists}`)
+        console.log(`  - Size: ${actualFileSize} bytes`)
+        console.log(`  - Path: ${imagePath}`)
+        if (imageInfo.foundAt) {
+          console.log(`  - Found at: ${imageInfo.foundAt}`)
         }
       }
     }
@@ -644,23 +688,29 @@ async function processXmlFileInWorker(
     const passed = passesFilter(record, filterConfig)
     let moved = false
 
-    if (filterConfig?.enabled && !passed) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] File ${path.basename(xmlFilePath)} did not pass filters`)
-      }
-      return { record: null, passedFilter: false, imageMoved: false, workerId }
-    }
-
-    // Image moving - only if filters are enabled, image passed filters, and move is configured
-    if (
-      filterConfig?.enabled &&
-      passed &&
+    // Determine if we should move the image
+    const shouldMoveImage =
       filterConfig?.moveImages &&
       filterConfig?.moveDestinationPath &&
       imageExists &&
       imageHref &&
-      imagePath
-    ) {
+      imagePath &&
+      // Move if filters are disabled (move all images)
+      (!filterConfig?.enabled ||
+        // Or move if filters are enabled and image passed
+        (filterConfig?.enabled && passed))
+
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Image move decision:`)
+      console.log(`  - Move images enabled: ${filterConfig?.moveImages}`)
+      console.log(`  - Destination path set: ${!!filterConfig?.moveDestinationPath}`)
+      console.log(`  - Image exists: ${imageExists}`)
+      console.log(`  - Filters enabled: ${filterConfig?.enabled}`)
+      console.log(`  - Passed filters: ${passed}`)
+      console.log(`  - Should move: ${shouldMoveImage}`)
+    }
+
+    if (shouldMoveImage) {
       try {
         if (verbose) {
           console.log(`[Worker ${workerId}] Attempting to move image: ${imagePath}`)
@@ -688,24 +738,23 @@ async function processXmlFileInWorker(
           console.error(`[Worker ${workerId}] Error during image move:`, error.message)
         }
       }
-    } else if (verbose) {
-      console.log(`[Worker ${workerId}] Image move skipped:`)
-      console.log(`  - Filters enabled: ${filterConfig?.enabled}`)
-      console.log(`  - Passed filters: ${passed}`)
-      console.log(`  - Move images enabled: ${filterConfig?.moveImages}`)
-      console.log(`  - Destination path: ${filterConfig?.moveDestinationPath}`)
-      console.log(`  - Image exists: ${imageExists}`)
-      console.log(`  - Image href: ${imageHref}`)
-      console.log(`  - Image path: ${imagePath}`)
     }
+
+    // Return record based on filter results
+    const shouldReturnRecord = !filterConfig?.enabled || passed
 
     if (verbose) {
       console.log(
-        `[Worker ${workerId}] File ${path.basename(xmlFilePath)} processed successfully. Passed filter: ${passed}, Image moved: ${moved}`,
+        `[Worker ${workerId}] File ${path.basename(xmlFilePath)} processed successfully. Passed filter: ${passed}, Image moved: ${moved}, Record included: ${shouldReturnRecord}`,
       )
     }
 
-    return { record: passed ? record : null, passedFilter: passed, imageMoved: moved, workerId }
+    return {
+      record: shouldReturnRecord ? record : null,
+      passedFilter: passed,
+      imageMoved: moved,
+      workerId,
+    }
   } catch (err) {
     console.error(`[Worker ${workerId}] Error processing ${xmlFilePath}:`, err.message)
     if (verbose) {
@@ -726,11 +775,14 @@ async function main() {
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Starting to process: ${path.basename(xmlFilePath)}`)
+      console.log(`[Worker ${workerId}] Filter config received:`, JSON.stringify(filterConfig, null, 2))
       if (filterConfig?.enabled) {
-        console.log(`[Worker ${workerId}] Filters enabled`)
-        if (filterConfig.moveImages) {
-          console.log(`[Worker ${workerId}] Image moving enabled to: ${filterConfig.moveDestinationPath}`)
-        }
+        console.log(`[Worker ${workerId}] ✓ Filters are ENABLED`)
+      } else {
+        console.log(`[Worker ${workerId}] Filters are disabled`)
+      }
+      if (filterConfig?.moveImages) {
+        console.log(`[Worker ${workerId}] Image moving enabled to: ${filterConfig.moveDestinationPath}`)
       }
     }
 
