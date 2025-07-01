@@ -5,141 +5,162 @@ export interface ProcessingSession {
   id: string
   startTime: string
   endTime?: string
-  status: "running" | "paused" | "completed" | "failed" | "interrupted"
+  status: "running" | "completed" | "failed" | "paused" | "interrupted"
   config: {
     rootDir: string
     outputFile: string
     numWorkers: number
+    verbose: boolean
+    filterConfig: any
     processingMode: string
-    filterConfig?: any
-    chunkSize?: number
   }
   progress: {
     totalFiles: number
     processedFiles: number
     successCount: number
     errorCount: number
-    filteredCount: number
-    movedCount: number
-    currentFileIndex: number
-    processedFilesList: string[]
-    remainingFiles: string[]
+    filteredCount?: number
+    movedCount?: number
+    currentFileIndex?: number
+    processedFilesList?: string[]
+    remainingFiles?: string[]
   }
   results?: {
     outputPath: string
-    stats: any
-    errors: string[]
+    stats?: {
+      totalFiles: number
+      processedFiles: number
+      successfulFiles: number
+      errorFiles: number
+      recordsWritten: number
+      filteredFiles: number
+      movedFiles: number
+    }
+    errors?: string[]
   }
   resumeData?: {
     lastProcessedFile: string
     partialResults: any[]
-    chunkIndex?: number
   }
 }
 
-const HISTORY_FILE = path.join(process.cwd(), "processing_history.json")
-const CURRENT_SESSION_FILE = path.join(process.cwd(), "current_session.json")
-
 export class ProcessingHistory {
-  static async loadHistory(): Promise<ProcessingSession[]> {
+  private static historyFile = path.join(process.cwd(), "data", "processing_history.json")
+  private static currentSessionFile = path.join(process.cwd(), "data", "current_session.json")
+  private static dataDir = path.join(process.cwd(), "data")
+
+  private static async ensureDataDir() {
     try {
-      const data = await fs.readFile(HISTORY_FILE, "utf-8")
-      const parsed = JSON.parse(data)
-      return Array.isArray(parsed) ? parsed : []
+      await fs.mkdir(this.dataDir, { recursive: true })
     } catch (error) {
-      // File doesn't exist or is corrupted, return empty array
-      console.log("History file not found or corrupted, starting fresh")
-      return []
+      console.error("Failed to create data directory:", error)
     }
   }
 
-  static async saveHistory(sessions: ProcessingSession[]): Promise<void> {
+  private static async safeReadFile(filePath: string): Promise<any> {
     try {
-      // Ensure directory exists
-      const dir = path.dirname(HISTORY_FILE)
-      await fs.mkdir(dir, { recursive: true }).catch(() => {})
-
-      await fs.writeFile(HISTORY_FILE, JSON.stringify(sessions, null, 2))
+      const content = await fs.readFile(filePath, "utf-8")
+      return JSON.parse(content)
     } catch (error) {
-      console.error("Error saving history:", error)
-      throw error
-    }
-  }
-
-  static async addSession(session: ProcessingSession): Promise<void> {
-    const history = await this.loadHistory()
-    history.unshift(session) // Add to beginning
-
-    // Keep only last 50 sessions
-    if (history.length > 50) {
-      history.splice(50)
-    }
-
-    await this.saveHistory(history)
-  }
-
-  static async updateSession(sessionId: string, updates: Partial<ProcessingSession>): Promise<void> {
-    const history = await this.loadHistory()
-    const sessionIndex = history.findIndex((s) => s.id === sessionId)
-
-    if (sessionIndex !== -1) {
-      history[sessionIndex] = { ...history[sessionIndex], ...updates }
-      await this.saveHistory(history)
-    }
-  }
-
-  static async getCurrentSession(): Promise<ProcessingSession | null> {
-    try {
-      const data = await fs.readFile(CURRENT_SESSION_FILE, "utf-8")
-      return JSON.parse(data)
-    } catch (error) {
-      // File doesn't exist, that's fine
       return null
     }
   }
 
-  static async saveCurrentSession(session: ProcessingSession): Promise<void> {
+  private static async safeWriteFile(filePath: string, data: any): Promise<boolean> {
     try {
-      // Ensure directory exists
-      const dir = path.dirname(CURRENT_SESSION_FILE)
-      await fs.mkdir(dir, { recursive: true }).catch(() => {})
+      await this.ensureDataDir()
 
-      await fs.writeFile(CURRENT_SESSION_FILE, JSON.stringify(session, null, 2))
-    } catch (error) {
-      console.error("Error saving current session:", error)
-      throw error
-    }
-  }
+      // Create backup if file exists
+      try {
+        await fs.access(filePath)
+        const backupPath = `${filePath}.backup`
+        await fs.copyFile(filePath, backupPath)
+      } catch {
+        // File doesn't exist, no backup needed
+      }
 
-  static async clearCurrentSession(): Promise<void> {
-    try {
-      await fs.unlink(CURRENT_SESSION_FILE)
+      await fs.writeFile(filePath, JSON.stringify(data, null, 2))
+      return true
     } catch (error) {
-      // File doesn't exist, that's fine
-    }
-  }
-
-  static async deleteSession(sessionId: string): Promise<void> {
-    try {
-      const history = await this.loadHistory()
-      const filteredHistory = history.filter((s) => s.id !== sessionId)
-      await this.saveHistory(filteredHistory)
-    } catch (error) {
-      console.error("Error deleting session:", error)
-      throw error
-    }
-  }
-
-  static async clearHistory(): Promise<void> {
-    try {
-      await this.saveHistory([])
-    } catch (error) {
-      console.error("Error clearing history:", error)
-      throw error
+      console.error(`Failed to write file ${filePath}:`, error)
+      return false
     }
   }
 
   static generateSessionId(): string {
     return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  }
+
+  static async getAllSessions(): Promise<ProcessingSession[]> {
+    const data = await this.safeReadFile(this.historyFile)
+    return data?.sessions || []
+  }
+
+  static async addSession(session: ProcessingSession): Promise<boolean> {
+    const sessions = await this.getAllSessions()
+    sessions.unshift(session) // Add to beginning
+
+    // Keep only last 100 sessions
+    const trimmedSessions = sessions.slice(0, 100)
+
+    return await this.safeWriteFile(this.historyFile, { sessions: trimmedSessions })
+  }
+
+  static async updateSession(sessionId: string, updates: Partial<ProcessingSession>): Promise<boolean> {
+    const sessions = await this.getAllSessions()
+    const sessionIndex = sessions.findIndex((s) => s.id === sessionId)
+
+    if (sessionIndex === -1) return false
+
+    sessions[sessionIndex] = { ...sessions[sessionIndex], ...updates }
+    return await this.safeWriteFile(this.historyFile, { sessions })
+  }
+
+  static async deleteSession(sessionId: string): Promise<boolean> {
+    const sessions = await this.getAllSessions()
+    const filteredSessions = sessions.filter((s) => s.id !== sessionId)
+    return await this.safeWriteFile(this.historyFile, { sessions: filteredSessions })
+  }
+
+  static async clearHistory(): Promise<boolean> {
+    return await this.safeWriteFile(this.historyFile, { sessions: [] })
+  }
+
+  static async getCurrentSession(): Promise<ProcessingSession | null> {
+    return await this.safeReadFile(this.currentSessionFile)
+  }
+
+  static async saveCurrentSession(session: ProcessingSession | null): Promise<boolean> {
+    if (session === null) {
+      try {
+        await fs.unlink(this.currentSessionFile)
+        return true
+      } catch {
+        return true // File doesn't exist, that's fine
+      }
+    }
+    return await this.safeWriteFile(this.currentSessionFile, session)
+  }
+
+  static async clearCurrentSession(): Promise<boolean> {
+    try {
+      await fs.unlink(this.currentSessionFile)
+      return true
+    } catch {
+      return true // File doesn't exist, that's fine
+    }
+  }
+
+  static async getStorageInfo() {
+    const sessions = await this.getAllSessions()
+    const currentSession = await this.getCurrentSession()
+
+    return {
+      totalSessions: sessions.length,
+      hasCurrentSession: currentSession !== null,
+      dataDirectory: this.dataDir,
+      historyFile: this.historyFile,
+      currentSessionFile: this.currentSessionFile,
+    }
   }
 }
