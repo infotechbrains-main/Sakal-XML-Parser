@@ -346,6 +346,11 @@ export default function Home() {
       case "error":
         addMessage("error", data.message)
         break
+      case "paused":
+        setIsPaused(true)
+        setIsRunning(false)
+        addMessage("system", data.message)
+        break
       case "progress":
         setProgress(data.percentage || 0)
         if (data.stats) {
@@ -559,11 +564,44 @@ export default function Home() {
 
   const pauseProcessing = async () => {
     try {
-      await fetch("/api/parse/pause", { method: "POST" })
-      setIsPaused(true)
-      addMessage("system", "Processing paused")
+      const response = await fetch("/api/parse/pause", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "pause", jobId }),
+      })
+
+      if (response.ok) {
+        const result = await response.json()
+        setIsPaused(true)
+        addMessage("system", "Pause request sent - processing will stop gracefully")
+      } else {
+        throw new Error("Failed to send pause request")
+      }
     } catch (error) {
       addMessage("error", "Failed to pause processing")
+      console.error("Pause error:", error)
+    }
+  }
+
+  const stopProcessing = async () => {
+    try {
+      const response = await fetch("/api/parse/pause", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "stop", jobId }),
+      })
+
+      if (response.ok) {
+        const result = await response.json()
+        setIsRunning(false)
+        setIsPaused(false)
+        addMessage("system", "Stop request sent - processing will terminate")
+      } else {
+        throw new Error("Failed to send stop request")
+      }
+    } catch (error) {
+      addMessage("error", "Failed to stop processing")
+      console.error("Stop error:", error)
     }
   }
 
@@ -577,14 +615,17 @@ export default function Home() {
     }
   }
 
-  const stopProcessing = async () => {
+  const stopWatching = async () => {
     try {
-      await fetch("/api/parse/pause", { method: "POST" })
-      setIsRunning(false)
-      setIsPaused(false)
-      addMessage("system", "Processing stopped")
-    } catch (error) {
-      addMessage("error", "Failed to stop processing")
+      const response = await fetch("/api/watch/stop", {
+        method: "POST",
+      })
+      const result = await response.json()
+      addMessage("system", `🛑 Watcher stopped`)
+      setWatchMode(false)
+      setWatcherStatus(null)
+    } catch (error: any) {
+      addMessage("error", `❌ Error stopping watcher: ${error.message}`)
     }
   }
 
@@ -642,20 +683,6 @@ export default function Home() {
     } catch (error: any) {
       addMessage("error", `❌ Error starting watcher: ${error.message}`)
       setWatchMode(false)
-    }
-  }
-
-  const stopWatching = async () => {
-    try {
-      const response = await fetch("/api/watch/stop", {
-        method: "POST",
-      })
-      const result = await response.json()
-      addMessage("system", `🛑 Watcher stopped`)
-      setWatchMode(false)
-      setWatcherStatus(null)
-    } catch (error: any) {
-      addMessage("error", `❌ Error stopping watcher: ${error.message}`)
     }
   }
 

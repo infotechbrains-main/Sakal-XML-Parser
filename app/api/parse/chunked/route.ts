@@ -3,11 +3,12 @@ import fs from "fs/promises"
 import path from "path"
 import { Worker } from "worker_threads"
 import { isRemotePath, scanRemoteDirectory, createTempDirectory, cleanupTempDirectory } from "@/lib/remote-file-handler"
+import { getPauseState, resetPauseState } from "../pause/route"
 
-// Global state for chunked processing
+// Global state for chunked processing - use imported pause state instead
+let currentProcessingState: any = null
 let shouldPause = false
 let shouldPauseBetweenChunks = false
-let currentProcessingState: any = null
 
 // Save processing state for resume capability
 async function saveProcessingState(state: any) {
@@ -300,7 +301,19 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
     }
 
     // Process each chunk
-    for (let chunkIndex = 0; chunkIndex < totalChunks && !shouldPause; chunkIndex++) {
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      // Check for pause/stop requests
+      const pauseState = getPauseState()
+      if (pauseState.shouldPause) {
+        sendMessage("log", { message: "Processing paused by user request" })
+        sendMessage("paused", {
+          message: "Processing has been paused",
+          chunkNumber: chunkIndex + 1,
+          totalChunks,
+          canResume: true,
+        })
+        return
+      }
       const chunkNumber = chunkIndex + 1
       const startIndex = chunkIndex * chunkSize
       const endIndex = Math.min(startIndex + chunkSize, xmlFiles.length)
@@ -354,7 +367,7 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
         })
 
         // Pause between chunks if requested and not the last chunk
-        if (pauseBetweenChunks && chunkNumber < totalChunks && !shouldPause) {
+        if (pauseBetweenChunks && chunkNumber < totalChunks) {
           sendMessage("log", { message: `Pausing for ${pauseDuration} seconds before next chunk...` })
           sendMessage("pause_start", {
             duration: pauseDuration,
@@ -362,11 +375,12 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
             nextChunk: chunkNumber + 1,
           })
 
-          // Wait for the specified duration
+          // Wait for the specified duration with pause checking
           await new Promise((resolve) => {
             const startTime = Date.now()
             const checkPause = () => {
-              if (shouldPause) {
+              const pauseState = getPauseState()
+              if (pauseState.shouldPause) {
                 sendMessage("log", { message: "Processing paused by user during chunk break" })
                 resolve(void 0)
                 return
@@ -381,7 +395,6 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
               // Send countdown update every second
               const remaining = Math.ceil((pauseDuration * 1000 - elapsed) / 1000)
               if (elapsed % 1000 < 100) {
-                // Send update roughly every second
                 sendMessage("pause_countdown", { remaining })
               }
 
@@ -441,8 +454,9 @@ async function processFilesInChunks(controller: ReadableStreamDefaultController,
       }
     }
 
-    // Clear processing state
+    // Clear processing state and reset pause state
     await clearProcessingState()
+    resetPauseState()
     isControllerClosed = true
   }
 }
