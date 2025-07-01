@@ -154,6 +154,22 @@ export default function Home() {
 
   const ws = useRef<WebSocket | null>(null)
 
+  // Update filterConfig.enabled when filterEnabled changes
+  useEffect(() => {
+    setFilterConfig((prev) => ({
+      ...prev,
+      enabled: filterEnabled,
+    }))
+  }, [filterEnabled])
+
+  // Update allowedFileTypes when fileTypes changes
+  useEffect(() => {
+    setFilterConfig((prev) => ({
+      ...prev,
+      allowedFileTypes: prev.fileTypes,
+    }))
+  }, [filterConfig.fileTypes])
+
   useEffect(() => {
     if (ws.current) {
       ws.current.onopen = () => {
@@ -331,17 +347,31 @@ export default function Home() {
     })
 
     try {
+      // Prepare the final filter config
+      const finalFilterConfig = filterEnabled
+        ? {
+            ...filterConfig,
+            enabled: true,
+            allowedFileTypes: filterConfig.fileTypes, // Ensure this is set
+          }
+        : null
+
+      // Debug log the filter config being sent
+      console.log("Filter config being sent:", finalFilterConfig)
+
       const requestBody = {
         rootDir,
         outputFile,
         numWorkers,
         verbose,
-        filterConfig: filterEnabled ? filterConfig : null,
+        filterConfig: finalFilterConfig,
         chunkSize: processingMode === "chunked" ? chunkSize : undefined,
         pauseBetweenChunks: processingMode === "chunked" ? pauseBetweenChunks : undefined,
         pauseDuration: processingMode === "chunked" ? pauseDuration : undefined,
         organizeByCity: processingMode === "chunked" ? organizeByCity : undefined,
       }
+
+      console.log("Full request body:", requestBody)
 
       let endpoint = "/api/parse"
       if (processingMode === "stream" || processingMode === "chunked") {
@@ -681,6 +711,11 @@ export default function Home() {
                   <div className="flex items-center space-x-2">
                     <Switch id="filterEnabled" checked={filterEnabled} onCheckedChange={setFilterEnabled} />
                     <Label htmlFor="filterEnabled">Enable filtering</Label>
+                    {filterEnabled && (
+                      <Badge variant="outline" className="ml-2">
+                        Filters Active
+                      </Badge>
+                    )}
                   </div>
 
                   {filterEnabled && (
@@ -1199,6 +1234,11 @@ export default function Home() {
                             }
                           />
                           <Label htmlFor="moveImages">Move filtered images to destination</Label>
+                          {filterConfig.moveImages && (
+                            <Badge variant="outline" className="ml-2">
+                              Move Enabled
+                            </Badge>
+                          )}
                         </div>
 
                         {filterConfig.moveImages && (
@@ -1643,7 +1683,7 @@ export default function Home() {
                 <div className="text-sm">
                   <span className="font-medium">File Types:</span>
                   <div className="flex flex-wrap gap-1 mt-1">
-                    {filterConfig.allowedFileTypes?.map((type) => (
+                    {filterConfig.fileTypes?.map((type) => (
                       <Badge key={type} variant="secondary" className="text-xs">
                         {type}
                       </Badge>
