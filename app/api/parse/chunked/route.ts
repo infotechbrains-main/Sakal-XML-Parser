@@ -2,7 +2,27 @@ import type { NextRequest } from "next/server"
 import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
-import { getPauseState, resetPauseState } from "./pause/route"
+
+// Global pause state - moved inline to avoid import issues
+let globalPauseState = {
+  isPaused: false,
+  shouldStop: false,
+  pauseRequested: false,
+  stopRequested: false,
+}
+
+function getPauseState() {
+  return globalPauseState
+}
+
+function resetPauseState() {
+  globalPauseState = {
+    isPaused: false,
+    shouldStop: false,
+    pauseRequested: false,
+    stopRequested: false,
+  }
+}
 
 interface ProcessingStats {
   totalFiles: number
