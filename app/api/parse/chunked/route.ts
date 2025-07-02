@@ -3,6 +3,7 @@ import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
 import { getPauseState } from "../pause/route"
+import { PersistentHistory } from "@/lib/persistent-history"
 
 interface ProcessingStats {
   totalFiles: number
@@ -22,11 +23,15 @@ interface WorkerResult {
   workerId: number
 }
 
+const history = new PersistentHistory()
+
 export async function POST(request: NextRequest) {
   const encoder = new TextEncoder()
 
   const stream = new ReadableStream({
     async start(controller) {
+      let sessionId: string | null = null
+
       try {
         const body = await request.json()
         const {
@@ -40,6 +45,9 @@ export async function POST(request: NextRequest) {
           verbose = false,
           filterConfig = null,
         } = body
+
+        // Create session ID
+        sessionId = `chunked_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
         const sendMessage = (type: string, message: any) => {
           try {
@@ -59,6 +67,7 @@ export async function POST(request: NextRequest) {
 
         if (verbose) {
           console.log(`[Chunked API] Configuration:`)
+          console.log(`  - Session ID: ${sessionId}`)
           console.log(`  - Root Directory: ${rootDir}`)
           console.log(`  - Output File: ${outputFile}`)
           console.log(`  - Output Folder: ${outputFolder || "current directory"}`)
@@ -89,6 +98,39 @@ export async function POST(request: NextRequest) {
           movedFiles: 0,
         }
 
+        // Determine output path
+        const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
+
+        // Create initial session record
+        const session = {
+          id: sessionId,
+          startTime: new Date().toISOString(),
+          status: "running" as const,
+          config: {
+            rootDir,
+            outputFile,
+            numWorkers,
+            verbose,
+            filterConfig,
+            processingMode: "chunked",
+          },
+          progress: {
+            totalFiles: stats.totalFiles,
+            processedFiles: 0,
+            successCount: 0,
+            errorCount: 0,
+            processedFilesList: [] as string[],
+          },
+        }
+
+        // Save initial session
+        await history.addSession(session)
+        await history.setCurrentSession(session)
+
+        if (verbose) {
+          console.log(`[Chunked API] Created session: ${sessionId}`)
+        }
+
         // Calculate chunks
         const chunks = []
         for (let i = 0; i < xmlFiles.length; i += chunkSize) {
@@ -103,9 +145,6 @@ export async function POST(request: NextRequest) {
             console.log(`[Chunked API] Will pause ${pauseDuration}s between each chunk`)
           }
         }
-
-        // Determine output path
-        const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
 
         // Ensure output directory exists
         if (outputFolder) {
@@ -164,6 +203,8 @@ export async function POST(request: NextRequest) {
         }
 
         // Process chunks
+        let wasInterrupted = false
+
         for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
           const currentChunkNumber = chunkIndex + 1
 
@@ -177,6 +218,7 @@ export async function POST(request: NextRequest) {
             if (verbose) {
               console.log(`[Chunked API] Stop requested, terminating processing`)
             }
+            wasInterrupted = true
             sendMessage("shutdown", {
               reason: "Processing stopped by user",
               stats,
@@ -191,6 +233,17 @@ export async function POST(request: NextRequest) {
             }
             sendMessage("paused", "Processing paused - waiting for resume...")
 
+            // Update session status to paused
+            await history.updateSession(sessionId, {
+              status: "paused",
+              progress: {
+                totalFiles: stats.totalFiles,
+                processedFiles: stats.processedFiles,
+                successCount: stats.successfulFiles,
+                errorCount: stats.errorFiles,
+              },
+            })
+
             // Wait for resume
             while (getPauseState().isPaused && !getPauseState().shouldStop) {
               await new Promise((resolve) => setTimeout(resolve, 1000))
@@ -200,6 +253,7 @@ export async function POST(request: NextRequest) {
               if (verbose) {
                 console.log(`[Chunked API] Stop requested while paused, terminating processing`)
               }
+              wasInterrupted = true
               sendMessage("shutdown", {
                 reason: "Processing stopped while paused",
                 stats,
@@ -207,6 +261,11 @@ export async function POST(request: NextRequest) {
               })
               break
             }
+
+            // Update session status back to running
+            await history.updateSession(sessionId, {
+              status: "running",
+            })
 
             if (verbose) {
               console.log(`[Chunked API] Processing resumed`)
@@ -269,6 +328,18 @@ export async function POST(request: NextRequest) {
                   stats.movedFiles++
                 }
               }
+
+              // Update session progress periodically
+              if (stats.processedFiles % 50 === 0 || stats.processedFiles === stats.totalFiles) {
+                await history.updateSession(sessionId, {
+                  progress: {
+                    totalFiles: stats.totalFiles,
+                    processedFiles: stats.processedFiles,
+                    successCount: stats.successfulFiles,
+                    errorCount: stats.errorFiles,
+                  },
+                })
+              }
             } catch (error) {
               const errorMsg = `Batch processing error: ${error instanceof Error ? error.message : "Unknown error"}`
               if (verbose) {
@@ -285,6 +356,7 @@ export async function POST(request: NextRequest) {
               if (verbose) {
                 console.log(`[Chunked API] Stop requested during batch processing, terminating`)
               }
+              wasInterrupted = true
               sendMessage("shutdown", {
                 reason: "Processing stopped during batch processing",
                 stats,
@@ -361,6 +433,7 @@ export async function POST(request: NextRequest) {
                 if (verbose) {
                   console.log(`[Chunked API] Stop requested during chunk pause countdown, terminating`)
                 }
+                wasInterrupted = true
                 sendMessage("shutdown", {
                   reason: "Processing stopped during chunk pause",
                   stats,
@@ -385,6 +458,7 @@ export async function POST(request: NextRequest) {
                   if (verbose) {
                     console.log(`[Chunked API] Stop requested while paused during countdown, terminating`)
                   }
+                  wasInterrupted = true
                   sendMessage("shutdown", {
                     reason: "Processing stopped while paused during countdown",
                     stats,
@@ -422,15 +496,37 @@ export async function POST(request: NextRequest) {
           }
         }
 
+        // Update final session status
+        const finalStatus = wasInterrupted ? "interrupted" : "completed"
+        const endTime = new Date().toISOString()
+
+        await history.updateSession(sessionId, {
+          status: finalStatus,
+          endTime,
+          progress: {
+            totalFiles: stats.totalFiles,
+            processedFiles: stats.processedFiles,
+            successCount: stats.successfulFiles,
+            errorCount: stats.errorFiles,
+          },
+          results: {
+            outputPath,
+          },
+        })
+
+        // Clear current session
+        await history.setCurrentSession(null)
+
         // Send completion message
         const finalPauseState = getPauseState()
-        if (!finalPauseState.shouldStop) {
+        if (!finalPauseState.shouldStop && !wasInterrupted) {
           const completionMessage = `Chunked processing completed! Processed ${stats.processedFiles} files, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`
 
           if (verbose) {
             console.log(`[Chunked API] ${completionMessage}`)
             console.log(`[Chunked API] Final stats:`, stats)
             console.log(`[Chunked API] Output file: ${outputPath}`)
+            console.log(`[Chunked API] Session ${sessionId} completed successfully`)
           }
 
           sendMessage("complete", {
@@ -442,6 +538,15 @@ export async function POST(request: NextRequest) {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
         console.error("[Chunked API] Fatal error:", errorMessage)
+
+        // Update session with error status
+        if (sessionId) {
+          await history.updateSession(sessionId, {
+            status: "failed",
+            endTime: new Date().toISOString(),
+          })
+          await history.setCurrentSession(null)
+        }
 
         try {
           const data = JSON.stringify({
