@@ -138,7 +138,7 @@ export default function Home() {
     errorCount: 0,
   })
 
-  // Chunked processing - REMOVED organizeByCity
+  // Chunked processing
   const [chunkSize, setChunkSize] = useState(100)
   const [pauseBetweenChunks, setPauseBetweenChunks] = useState(false)
   const [pauseDuration, setPauseDuration] = useState(5)
@@ -172,7 +172,7 @@ export default function Home() {
   const [processingStartTime, setProcessingStartTime] = useState<string | null>(null)
   const [processingEndTime, setProcessingEndTime] = useState<string | null>(null)
 
-  // History - Initialize as empty array
+  // History - Initialize as empty array and add proper error handling
   const [history, setHistory] = useState<ProcessingSession[]>([])
   const [canResume, setCanResume] = useState(false)
   const [resumeSession, setResumeSession] = useState<ProcessingSession | null>(null)
@@ -279,12 +279,17 @@ export default function Home() {
 
       const data = await response.json()
 
-      if (data.success && Array.isArray(data.history)) {
+      // Fix: Ensure we always set an array
+      if (Array.isArray(data)) {
+        setHistory(data)
+      } else if (data && Array.isArray(data.history)) {
+        setHistory(data.history)
+      } else if (data && data.success && Array.isArray(data.history)) {
         setHistory(data.history)
       } else {
         console.error("Invalid history data:", data)
         setHistory([])
-        if (data.error) {
+        if (data && data.error) {
           addMessage("error", `Failed to load history: ${data.error}`)
         }
       }
@@ -466,14 +471,15 @@ export default function Home() {
         chunkSize: processingMode === "chunked" ? chunkSize : undefined,
         pauseBetweenChunks: processingMode === "chunked" ? pauseBetweenChunks : undefined,
         pauseDuration: processingMode === "chunked" ? pauseDuration : undefined,
-        // REMOVED organizeByCity parameter
       }
 
       console.log("Full request body:", requestBody)
 
       let endpoint = "/api/parse"
-      if (processingMode === "stream" || processingMode === "chunked") {
+      if (processingMode === "stream") {
         endpoint = "/api/parse/stream"
+      } else if (processingMode === "chunked") {
+        endpoint = "/api/parse/chunked"
       }
 
       const response = await fetch(endpoint, {
@@ -1490,7 +1496,7 @@ export default function Home() {
               </Card>
             </TabsContent>
 
-            {/* Chunked Processing - REMOVED organizeByCity */}
+            {/* Chunked Processing */}
             <TabsContent value="chunked" className="space-y-4">
               <Card>
                 <CardHeader>

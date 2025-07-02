@@ -1,224 +1,305 @@
 import type { NextRequest } from "next/server"
-import fs from "fs/promises"
+import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
-import { isRemotePath, scanRemoteDirectory, createTempDirectory, cleanupTempDirectory } from "@/lib/remote-file-handler"
-import { getPauseState, resetPauseState } from "../pause/route"
+import { getPauseState, resetPauseState } from "./pause/route"
 
-// Global state for chunked processing - use imported pause state instead
-let currentProcessingState: any = null
-let shouldPause = false
-let shouldPauseBetweenChunks = false
-
-// Save processing state for resume capability
-async function saveProcessingState(state: any) {
-  try {
-    const statePath = path.join(process.cwd(), "processing_state.json")
-    await fs.writeFile(statePath, JSON.stringify(state, null, 2))
-    currentProcessingState = state
-    console.log("Processing state saved")
-  } catch (error) {
-    console.error("Error saving processing state:", error)
-  }
+interface ProcessingStats {
+  totalFiles: number
+  processedFiles: number
+  successfulFiles: number
+  errorFiles: number
+  recordsWritten: number
+  filteredFiles: number
+  movedFiles: number
 }
 
-// Load processing state
-async function loadProcessingState() {
-  try {
-    const statePath = path.join(process.cwd(), "processing_state.json")
-    const stateContent = await fs.readFile(statePath, "utf-8")
-    return JSON.parse(stateContent)
-  } catch (error) {
-    return null
-  }
-}
-
-// Clear processing state
-async function clearProcessingState() {
-  const statePath = path.join(process.cwd(), "processing_state.json")
-  try {
-    await fs.unlink(statePath)
-  } catch (error) {
-    // File doesn't exist, that's fine
-  }
-  currentProcessingState = null
-}
-
-// Save chunk results to CSV
-async function saveChunkCSV(csvData: any[], filename: string, includeHeader: boolean) {
-  if (!csvData || csvData.length === 0) return
-
-  const csvPath = path.join(process.cwd(), filename)
-  let csvContent = ""
-
-  if (includeHeader && csvData.length > 0) {
-    // Add header row
-    const headers = Object.keys(csvData[0])
-    csvContent += headers.join(",") + "\n"
-  }
-
-  // Add data rows
-  csvData.forEach((row) => {
-    const values = Object.values(row).map((value) => {
-      const stringValue = String(value || "")
-      // Escape quotes and wrap in quotes if contains comma or quote
-      if (stringValue.includes(",") || stringValue.includes('"') || stringValue.includes("\n")) {
-        return `"${stringValue.replace(/"/g, '""')}"`
-      }
-      return stringValue
-    })
-    csvContent += values.join(",") + "\n"
-  })
-
-  await fs.writeFile(csvPath, csvContent, "utf-8")
-}
-
-// Consolidate all chunk CSVs into final CSV file
-async function consolidateCSVFiles(finalOutputFile: string, totalChunks: number) {
-  const finalPath = path.join(process.cwd(), finalOutputFile)
-  let consolidatedContent = ""
-  let headerWritten = false
-
-  for (let i = 1; i <= totalChunks; i++) {
-    const chunkFile = `${finalOutputFile.replace(".csv", "")}_chunk_${i}.csv`
-    const chunkPath = path.join(process.cwd(), chunkFile)
-
-    try {
-      const chunkContent = await fs.readFile(chunkPath, "utf-8")
-      const lines = chunkContent.split("\n").filter((line) => line.trim())
-
-      if (lines.length > 0) {
-        if (!headerWritten && i === 1) {
-          // Include header from first chunk
-          consolidatedContent += lines.join("\n") + "\n"
-          headerWritten = true
-        } else {
-          // Skip header for subsequent chunks
-          const dataLines = lines.slice(1)
-          if (dataLines.length > 0) {
-            consolidatedContent += dataLines.join("\n") + "\n"
-          }
-        }
-      }
-
-      // Clean up chunk file
-      await fs.unlink(chunkPath)
-    } catch (error) {
-      console.error(`Error processing chunk file ${chunkFile}:`, error)
-    }
-  }
-
-  await fs.writeFile(finalPath, consolidatedContent, "utf-8")
-}
-
-async function scanForXMLFiles(rootDir: string, progressCallback?: (message: string) => void): Promise<string[]> {
-  // Check if this is a remote path
-  if (await isRemotePath(rootDir)) {
-    console.log(`Scanning remote directory: ${rootDir}`)
-    progressCallback?.(`Scanning remote directory: ${rootDir}`)
-
-    const remoteFiles = await scanRemoteDirectory(rootDir, (message) => {
-      console.log(`Remote scan: ${message}`)
-      progressCallback?.(message)
-    })
-
-    // Return the URLs of the remote XML files
-    return remoteFiles.map((file) => file.url)
-  }
-
-  // Local file system scanning
-  const xmlFiles: string[] = []
-
-  async function scanDirectory(dir: string) {
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true })
-
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name)
-
-        if (entry.isDirectory()) {
-          await scanDirectory(fullPath)
-        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
-          xmlFiles.push(fullPath)
-        }
-      }
-    } catch (error) {
-      console.error(`Error scanning directory ${dir}:`, error)
-    }
-  }
-
-  await scanDirectory(rootDir)
-  return xmlFiles
+interface WorkerResult {
+  success: boolean
+  data?: any
+  error?: string
+  filtered?: boolean
+  moved?: boolean
 }
 
 export async function POST(request: NextRequest) {
-  const body = await request.json()
-  const {
-    rootDir,
-    outputFile = "image_metadata.csv",
-    outputFolder = "",
-    numWorkers = 4,
-    verbose = false,
-    filterConfig = null,
-    chunkSize = 100,
-    pauseBetweenChunks = false,
-    pauseDuration = 5,
-  } = body
-
-  if (!rootDir) {
-    return new Response("Root directory is required", { status: 400 })
-  }
-
-  // Reset pause states
-  shouldPause = false
-  shouldPauseBetweenChunks = pauseBetweenChunks
-
-  // Create full output path
-  const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
-
-  // Create SSE response
   const encoder = new TextEncoder()
-  let isControllerClosed = false
 
   const stream = new ReadableStream({
-    start(controller) {
-      // Send initial message
-      const data = `data: ${JSON.stringify({ type: "start", message: "Starting chunked XML processing..." })}\n\n`
-      controller.enqueue(encoder.encode(data))
+    async start(controller) {
+      try {
+        const body = await request.json()
+        const {
+          rootDir,
+          outputFile = "image_metadata.csv",
+          outputFolder = "",
+          numWorkers = 4,
+          chunkSize = 100,
+          pauseBetweenChunks = 0,
+          verbose = false,
+          filterConfig = null,
+        } = body
 
-      // Start chunked processing in background
-      processFilesInChunks(controller, encoder, {
-        rootDir,
-        outputFile: fullOutputPath,
-        numWorkers,
-        verbose,
-        filterConfig,
-        chunkSize,
-        pauseBetweenChunks,
-        pauseDuration,
-      })
-        .then(() => {
-          if (!isControllerClosed) {
-            isControllerClosed = true
-            controller.close()
+        // Reset pause state at start
+        resetPauseState()
+
+        const sendMessage = (type: string, message: any) => {
+          const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
+          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+        }
+
+        sendMessage("start", "Starting chunked processing...")
+
+        // Find all XML files
+        const xmlFiles = await findXMLFiles(rootDir)
+
+        if (xmlFiles.length === 0) {
+          sendMessage("error", "No XML files found in the specified directory")
+          controller.close()
+          return
+        }
+
+        const stats: ProcessingStats = {
+          totalFiles: xmlFiles.length,
+          processedFiles: 0,
+          successfulFiles: 0,
+          errorFiles: 0,
+          recordsWritten: 0,
+          filteredFiles: 0,
+          movedFiles: 0,
+        }
+
+        // Calculate chunks
+        const chunks = []
+        for (let i = 0; i < xmlFiles.length; i += chunkSize) {
+          chunks.push(xmlFiles.slice(i, i + chunkSize))
+        }
+
+        sendMessage("log", `Processing ${xmlFiles.length} files in ${chunks.length} chunks of ${chunkSize}`)
+
+        // Determine output path
+        const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
+
+        // Ensure output directory exists
+        if (outputFolder) {
+          await fs.mkdir(outputFolder, { recursive: true })
+        }
+
+        // Initialize CSV file with headers
+        const headers =
+          [
+            "filename",
+            "filepath",
+            "filesize",
+            "width",
+            "height",
+            "format",
+            "colorspace",
+            "compression",
+            "quality",
+            "orientation",
+            "resolution",
+            "created",
+            "modified",
+            "camera_make",
+            "camera_model",
+            "lens_model",
+            "focal_length",
+            "aperture",
+            "shutter_speed",
+            "iso",
+            "flash",
+            "gps_latitude",
+            "gps_longitude",
+            "gps_altitude",
+            "keywords",
+            "description",
+            "title",
+            "subject",
+            "creator",
+            "copyright",
+            "usage_terms",
+            "credit_line",
+            "source",
+            "instructions",
+            "category",
+            "supplemental_categories",
+            "urgency",
+            "location",
+            "city",
+            "state",
+            "country",
+            "headline",
+            "caption",
+          ].join(",") + "\n"
+
+        await fs.writeFile(outputPath, headers, "utf8")
+
+        // Process chunks
+        for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+          // Check for pause/stop
+          const pauseState = getPauseState()
+          if (pauseState.shouldStop) {
+            sendMessage("shutdown", {
+              reason: "Processing stopped by user",
+              stats,
+              outputFile: outputPath,
+            })
+            break
           }
-        })
-        .catch((error) => {
-          if (!isControllerClosed) {
-            const errorData = `data: ${JSON.stringify({
-              type: "error",
-              message: `Chunked processing failed: ${error.message}`,
-            })}\n\n`
-            controller.enqueue(encoder.encode(errorData))
-            isControllerClosed = true
-            controller.close()
+
+          if (pauseState.isPaused) {
+            sendMessage("paused", "Processing paused - waiting for resume...")
+
+            // Wait for resume
+            while (getPauseState().isPaused && !getPauseState().shouldStop) {
+              await new Promise((resolve) => setTimeout(resolve, 1000))
+            }
+
+            if (getPauseState().shouldStop) {
+              sendMessage("shutdown", {
+                reason: "Processing stopped while paused",
+                stats,
+                outputFile: outputPath,
+              })
+              break
+            }
+
+            sendMessage("log", "Processing resumed")
           }
+
+          const chunk = chunks[chunkIndex]
+          sendMessage("chunk_start", {
+            chunkNumber: chunkIndex + 1,
+            totalChunks: chunks.length,
+            chunkSize: chunk.length,
+          })
+
+          // Process chunk
+          const activeWorkers = new Set<Worker>()
+          const batchSize = Math.min(numWorkers, chunk.length)
+
+          for (let i = 0; i < chunk.length; i += batchSize) {
+            const batch = chunk.slice(i, i + batchSize)
+            const batchPromises = batch.map((xmlFile) => processFile(xmlFile, filterConfig, verbose, activeWorkers))
+
+            try {
+              const batchResults = await Promise.all(batchPromises)
+
+              for (const result of batchResults) {
+                stats.processedFiles++
+
+                if (result.success && result.data) {
+                  stats.successfulFiles++
+                  stats.recordsWritten++
+
+                  // Append to CSV file
+                  const csvLine =
+                    Object.values(result.data)
+                      .map((value) =>
+                        typeof value === "string" && value.includes(",")
+                          ? `"${value.replace(/"/g, '""')}"`
+                          : value || "",
+                      )
+                      .join(",") + "\n"
+
+                  await fs.appendFile(outputPath, csvLine, "utf8")
+                } else {
+                  stats.errorFiles++
+                  if (verbose && result.error) {
+                    sendMessage("log", `Error processing file: ${result.error}`)
+                  }
+                }
+
+                if (result.filtered) {
+                  stats.filteredFiles++
+                }
+
+                if (result.moved) {
+                  stats.movedFiles++
+                }
+              }
+            } catch (error) {
+              sendMessage(
+                "error",
+                `Batch processing error: ${error instanceof Error ? error.message : "Unknown error"}`,
+              )
+              stats.errorFiles += batch.length
+              stats.processedFiles += batch.length
+            }
+          }
+
+          // Cleanup workers
+          for (const worker of activeWorkers) {
+            worker.terminate()
+          }
+
+          sendMessage("chunk_complete", {
+            chunkNumber: chunkIndex + 1,
+            totalChunks: chunks.length,
+          })
+
+          // Send progress update
+          const percentage = Math.round((stats.processedFiles / stats.totalFiles) * 100)
+          sendMessage("progress", {
+            percentage,
+            total: stats.totalFiles,
+            processed: stats.processedFiles,
+            successful: stats.successfulFiles,
+            errors: stats.errorFiles,
+            filtered: stats.filteredFiles,
+            moved: stats.movedFiles,
+          })
+
+          // Pause between chunks if configured
+          if (pauseBetweenChunks > 0 && chunkIndex < chunks.length - 1) {
+            sendMessage("pause_start", {
+              duration: pauseBetweenChunks,
+              message: `Pausing for ${pauseBetweenChunks} seconds before next chunk...`,
+            })
+
+            for (let countdown = pauseBetweenChunks; countdown > 0; countdown--) {
+              sendMessage("pause_countdown", {
+                remaining: countdown,
+                message: `Resuming in ${countdown} seconds...`,
+              })
+              await new Promise((resolve) => setTimeout(resolve, 1000))
+
+              // Check for stop during pause
+              if (getPauseState().shouldStop) {
+                sendMessage("shutdown", {
+                  reason: "Processing stopped during chunk pause",
+                  stats,
+                  outputFile: outputPath,
+                })
+                controller.close()
+                return
+              }
+            }
+
+            sendMessage("pause_end", "Resuming processing...")
+          }
+        }
+
+        // Send completion message
+        if (!getPauseState().shouldStop) {
+          sendMessage("complete", {
+            stats,
+            outputFile: outputPath,
+            message: `Chunked processing completed! Processed ${stats.processedFiles} files, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`,
+          })
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error"
+        const data = JSON.stringify({
+          type: "error",
+          message: `Chunked processing error: ${errorMessage}`,
+          timestamp: new Date().toISOString(),
         })
-    },
-    cancel() {
-      isControllerClosed = true
-      shouldPause = true
-      console.log("Chunked stream cancelled - initiating graceful shutdown")
+        controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+      } finally {
+        controller.close()
+      }
     },
   })
 
@@ -227,364 +308,73 @@ export async function POST(request: NextRequest) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Cache-Control",
     },
   })
 }
 
-async function processFilesInChunks(controller: ReadableStreamDefaultController, encoder: TextEncoder, config: any) {
-  const { rootDir, outputFile, numWorkers, verbose, filterConfig, chunkSize, pauseBetweenChunks, pauseDuration } =
-    config
-
-  let isControllerClosed = false
-  let tempDir: string | null = null
-  const allRecords: any[] = []
-  let totalProcessedCount = 0
-  let totalSuccessCount = 0
-  let totalErrorCount = 0
-  let totalFilteredCount = 0
-  let totalMovedCount = 0
-  const allErrors: string[] = []
-
-  const sendMessage = (type: string, data: any) => {
-    if (isControllerClosed) return
-    try {
-      const message = `data: ${JSON.stringify({ type, ...data })}\n\n`
-      controller.enqueue(encoder.encode(message))
-    } catch (error) {
-      console.error("Error sending SSE message:", error)
-      isControllerClosed = true
-    }
-  }
-
-  // Ensure output directory exists
-  const outputDir = path.dirname(outputFile)
-  if (outputDir !== "." && outputDir !== "") {
-    try {
-      await fs.mkdir(outputDir, { recursive: true })
-      sendMessage("log", { message: `Created output directory: ${outputDir}` })
-    } catch (error) {
-      sendMessage("error", { message: `Failed to create output directory: ${outputDir}` })
+async function processFile(
+  xmlFile: string,
+  filterConfig: any,
+  verbose: boolean,
+  activeWorkers: Set<Worker>,
+): Promise<WorkerResult> {
+  return new Promise((resolve) => {
+    // Check for pause/stop before creating worker
+    const pauseState = getPauseState()
+    if (pauseState.shouldStop) {
+      resolve({ success: false, error: "Processing stopped by user" })
       return
     }
-  }
+
+    const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"))
+    activeWorkers.add(worker)
+
+    const timeout = setTimeout(() => {
+      worker.terminate()
+      activeWorkers.delete(worker)
+      resolve({ success: false, error: "Worker timeout" })
+    }, 30000) // 30 second timeout
+
+    worker.on("message", (result: WorkerResult) => {
+      clearTimeout(timeout)
+      activeWorkers.delete(worker)
+      worker.terminate()
+      resolve(result)
+    })
+
+    worker.on("error", (error) => {
+      clearTimeout(timeout)
+      activeWorkers.delete(worker)
+      resolve({ success: false, error: error.message })
+    })
+
+    worker.postMessage({
+      xmlFile,
+      filterConfig,
+      verbose,
+    })
+  })
+}
+
+async function findXMLFiles(dir: string): Promise<string[]> {
+  const xmlFiles: string[] = []
 
   try {
-    sendMessage("log", { message: "Scanning for XML files..." })
+    const entries = await fs.readdir(dir, { withFileTypes: true })
 
-    // Scan for all XML files
-    const xmlFiles = await scanForXMLFiles(rootDir, (message) => {
-      sendMessage("log", { message })
-    })
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name)
 
-    if (xmlFiles.length === 0) {
-      sendMessage("error", { message: "No XML files found in the specified directory" })
-      return
-    }
-
-    sendMessage("log", { message: `Found ${xmlFiles.length} XML files` })
-
-    // Calculate chunks
-    const totalChunks = Math.ceil(xmlFiles.length / chunkSize)
-    sendMessage("log", { message: `Processing in ${totalChunks} chunks of ${chunkSize} files each` })
-
-    if (pauseBetweenChunks) {
-      sendMessage("log", { message: `Pause between chunks enabled: ${pauseDuration} seconds` })
-    }
-
-    // Handle remote files if needed
-    if (await isRemotePath(rootDir)) {
-      sendMessage("log", { message: "Detected remote path, downloading files..." })
-      tempDir = await createTempDirectory()
-      // Download logic would go here - simplified for now
-    }
-
-    // Process each chunk
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-      // Check for pause/stop requests
-      const pauseState = getPauseState()
-      if (pauseState.shouldPause) {
-        sendMessage("log", { message: "Processing paused by user request" })
-        sendMessage("paused", {
-          message: "Processing has been paused",
-          chunkNumber: chunkIndex + 1,
-          totalChunks,
-          canResume: true,
-        })
-        return
-      }
-      const chunkNumber = chunkIndex + 1
-      const startIndex = chunkIndex * chunkSize
-      const endIndex = Math.min(startIndex + chunkSize, xmlFiles.length)
-      const chunkFiles = xmlFiles.slice(startIndex, endIndex)
-
-      sendMessage("chunk_start", {
-        chunkNumber,
-        totalChunks,
-        filesInChunk: chunkFiles.length,
-      })
-
-      sendMessage("log", {
-        message: `Processing chunk ${chunkNumber}/${totalChunks} (${chunkFiles.length} files)`,
-      })
-
-      try {
-        // Process this chunk
-        const chunkResult = await processChunk(chunkFiles, rootDir, numWorkers, verbose, filterConfig, sendMessage)
-
-        // Accumulate results
-        allRecords.push(...chunkResult.csvData)
-        totalProcessedCount += chunkResult.processedFiles
-        totalSuccessCount += chunkResult.successfulFiles
-        totalErrorCount += chunkResult.errorFiles
-        totalFilteredCount += chunkResult.filteredFiles
-        totalMovedCount += chunkResult.movedFiles
-        allErrors.push(...chunkResult.errors)
-
-        // Save chunk results
-        const chunkFileName = `${outputFile.replace(".csv", "")}_chunk_${chunkNumber}.csv`
-        await saveChunkCSV(chunkResult.csvData, chunkFileName, true)
-
-        sendMessage("chunk_complete", {
-          chunkNumber,
-          totalChunks,
-          recordsInChunk: chunkResult.csvData.length,
-        })
-
-        // Send progress update
-        const overallProgress = Math.round((chunkNumber / totalChunks) * 100)
-        sendMessage("progress", {
-          processed: totalProcessedCount,
-          total: xmlFiles.length,
-          successful: totalSuccessCount,
-          filtered: totalFilteredCount,
-          moved: totalMovedCount,
-          errors: totalErrorCount,
-          percentage: overallProgress,
-          currentChunk: chunkNumber,
-          totalChunks,
-        })
-
-        // Pause between chunks if requested and not the last chunk
-        if (pauseBetweenChunks && chunkNumber < totalChunks) {
-          sendMessage("log", { message: `Pausing for ${pauseDuration} seconds before next chunk...` })
-          sendMessage("pause_start", {
-            duration: pauseDuration,
-            chunkCompleted: chunkNumber,
-            nextChunk: chunkNumber + 1,
-          })
-
-          // Wait for the specified duration with pause checking
-          await new Promise((resolve) => {
-            const startTime = Date.now()
-            const checkPause = () => {
-              const pauseState = getPauseState()
-              if (pauseState.shouldPause) {
-                sendMessage("log", { message: "Processing paused by user during chunk break" })
-                resolve(void 0)
-                return
-              }
-
-              const elapsed = Date.now() - startTime
-              if (elapsed >= pauseDuration * 1000) {
-                resolve(void 0)
-                return
-              }
-
-              // Send countdown update every second
-              const remaining = Math.ceil((pauseDuration * 1000 - elapsed) / 1000)
-              if (elapsed % 1000 < 100) {
-                sendMessage("pause_countdown", { remaining })
-              }
-
-              setTimeout(checkPause, 100)
-            }
-            checkPause()
-          })
-
-          sendMessage("pause_end", { message: "Resuming processing..." })
-        }
-      } catch (error) {
-        sendMessage("log", {
-          message: `Error processing chunk ${chunkNumber}: ${error instanceof Error ? error.message : "Unknown error"}`,
-        })
-        totalErrorCount++
+      if (entry.isDirectory()) {
+        const subFiles = await findXMLFiles(fullPath)
+        xmlFiles.push(...subFiles)
+      } else if (entry.isFile() && path.extname(entry.name).toLowerCase() === ".xml") {
+        xmlFiles.push(fullPath)
       }
     }
-
-    if (shouldPause) {
-      sendMessage("log", { message: "Processing paused by user" })
-      return
-    }
-
-    // Consolidate all chunk files into final output
-    sendMessage("log", { message: "Consolidating chunk results into final CSV..." })
-    await consolidateCSVFiles(outputFile, totalChunks)
-
-    // Send final results
-    sendMessage("complete", {
-      stats: {
-        totalFiles: xmlFiles.length,
-        processedFiles: totalProcessedCount,
-        successfulFiles: totalSuccessCount,
-        errorFiles: totalErrorCount,
-        recordsWritten: allRecords.length,
-        filteredFiles: totalFilteredCount,
-        movedFiles: totalMovedCount,
-        chunksProcessed: totalChunks,
-      },
-      outputFile: path.basename(outputFile),
-      errors: allErrors.slice(0, 10),
-    })
-
-    sendMessage("log", { message: "Chunked processing completed successfully!" })
   } catch (error) {
-    sendMessage("error", {
-      message: `Chunked processing failed: ${error instanceof Error ? error.message : "Unknown error"}`,
-    })
-  } finally {
-    // Clean up temporary directory if it was created
-    if (tempDir) {
-      try {
-        await cleanupTempDirectory(tempDir)
-        sendMessage("log", { message: "Cleaned up temporary files" })
-      } catch (error) {
-        console.error("Error cleaning up temporary directory:", error)
-      }
-    }
-
-    // Clear processing state and reset pause state
-    await clearProcessingState()
-    resetPauseState()
-    isControllerClosed = true
+    console.error(`Error reading directory ${dir}:`, error)
   }
-}
 
-async function processChunk(
-  files: string[],
-  rootDir: string,
-  numWorkers: number,
-  verbose: boolean,
-  filterConfig: any,
-  sendMessage: (type: string, data: any) => void,
-): Promise<any> {
-  const csvData: any[] = []
-  const errors: string[] = []
-  let processedFiles = 0
-  let successfulFiles = 0
-  let errorFiles = 0
-  let filteredFiles = 0
-  let movedFiles = 0
-
-  const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
-
-  return new Promise((resolve, reject) => {
-    let fileIndex = 0
-    const activeWorkers = new Set<Worker>()
-
-    const checkCompletion = () => {
-      if (fileIndex >= files.length && activeWorkers.size === 0) {
-        resolve({
-          processedFiles,
-          successfulFiles,
-          errorFiles,
-          filteredFiles,
-          movedFiles,
-          csvData,
-          errors,
-        })
-      }
-    }
-
-    const launchWorkerIfNeeded = () => {
-      while (activeWorkers.size < numWorkers && fileIndex < files.length) {
-        const currentFile = files[fileIndex++]
-        const workerId = Date.now() + Math.random()
-
-        const worker = new Worker(workerScriptPath, {
-          workerData: {
-            xmlFilePath: currentFile,
-            filterConfig,
-            originalRootDir: rootDir,
-            workerId,
-            verbose,
-            isRemote: false, // Simplified for chunked processing
-            originalRemoteXmlUrl: null,
-          },
-        })
-        activeWorkers.add(worker)
-
-        worker.on("message", (result: any) => {
-          processedFiles++
-
-          if (result.record) {
-            csvData.push(result.record)
-            successfulFiles++
-          }
-          if (result.passedFilter && result.record) {
-            filteredFiles++
-          }
-          if (result.imageMoved) {
-            movedFiles++
-          }
-          if (result.error) {
-            errorFiles++
-            errors.push(`Error in ${path.basename(currentFile)}: ${result.error}`)
-          }
-
-          activeWorkers.delete(worker)
-          worker.terminate().catch((err) => console.error(`Error terminating worker ${workerId}:`, err))
-
-          if (fileIndex < files.length) {
-            launchWorkerIfNeeded()
-          } else {
-            checkCompletion()
-          }
-        })
-
-        worker.on("error", (err) => {
-          errorFiles++
-          errors.push(`Worker error for ${path.basename(currentFile)}: ${err.message}`)
-          activeWorkers.delete(worker)
-
-          if (fileIndex < files.length) {
-            launchWorkerIfNeeded()
-          } else {
-            checkCompletion()
-          }
-        })
-
-        worker.on("exit", (code) => {
-          activeWorkers.delete(worker)
-          if (code !== 0) {
-            sendMessage("log", { message: `Worker exited with code ${code} for ${path.basename(currentFile)}` })
-          }
-          checkCompletion()
-        })
-      }
-    }
-
-    launchWorkerIfNeeded()
-
-    if (files.length === 0) {
-      resolve({
-        processedFiles: 0,
-        successfulFiles: 0,
-        errorFiles: 0,
-        filteredFiles: 0,
-        movedFiles: 0,
-        csvData: [],
-        errors: [],
-      })
-    }
-  })
-}
-
-// Pause endpoint
-export async function PUT(request: NextRequest) {
-  shouldPause = true
-  return new Response(JSON.stringify({ message: "Pause request received" }), {
-    headers: { "Content-Type": "application/json" },
-  })
+  return xmlFiles
 }
