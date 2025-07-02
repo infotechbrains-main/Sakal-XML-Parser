@@ -27,10 +27,38 @@ const history = new PersistentHistory()
 
 export async function POST(request: NextRequest) {
   const encoder = new TextEncoder()
+  let controllerClosed = false
 
   const stream = new ReadableStream({
     async start(controller) {
       let sessionId: string | null = null
+
+      const safeCloseController = () => {
+        if (!controllerClosed) {
+          try {
+            controller.close()
+            controllerClosed = true
+            console.log("[Stream API] Controller closed safely")
+          } catch (error) {
+            console.error("[Stream API] Error closing controller:", error)
+          }
+        }
+      }
+
+      const sendMessage = (type: string, message: any) => {
+        if (controllerClosed) {
+          console.log(`[Stream API] Skipping message (controller closed): ${type}`)
+          return
+        }
+
+        try {
+          const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
+          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+          console.log(`[Stream API] Sent message: ${type} - ${JSON.stringify(message)}`)
+        } catch (error) {
+          console.error("[Stream API] Error sending message:", error)
+        }
+      }
 
       try {
         const body = await request.json()
@@ -48,19 +76,6 @@ export async function POST(request: NextRequest) {
 
         // Create session ID
         sessionId = `stream_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-
-        const sendMessage = (type: string, message: any) => {
-          try {
-            const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
-            controller.enqueue(encoder.encode(`data: ${data}\n\n`))
-
-            if (verbose) {
-              console.log(`[Stream API] ${type.toUpperCase()}: ${JSON.stringify(message)}`)
-            }
-          } catch (error) {
-            console.error("Error sending message:", error)
-          }
-        }
 
         sendMessage("start", "Starting stream processing...")
 
@@ -80,7 +95,7 @@ export async function POST(request: NextRequest) {
 
         if (xmlFiles.length === 0) {
           sendMessage("error", "No XML files found in the specified directory")
-          controller.close()
+          safeCloseController()
           return
         }
 
@@ -94,7 +109,7 @@ export async function POST(request: NextRequest) {
           movedFiles: 0,
         }
 
-        // Determine output path - FIXED: Use full path including output folder
+        // Determine output path
         const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
 
         // Create initial session record
@@ -104,7 +119,7 @@ export async function POST(request: NextRequest) {
           status: "running" as const,
           config: {
             rootDir,
-            outputFile: outputPath, // Store full path in session
+            outputFile: outputPath,
             numWorkers,
             verbose,
             filterConfig,
@@ -191,9 +206,9 @@ export async function POST(request: NextRequest) {
         let wasInterrupted = false
 
         for (let i = 0; i < xmlFiles.length; i += numWorkers) {
-          // Check for pause/stop - FIXED: Check more frequently
+          // Check for pause/stop before each batch
           const pauseState = getPauseState()
-          if (pauseState.shouldStop) {
+          if (pauseState.shouldStop || pauseState.stopRequested) {
             if (verbose) {
               console.log(`[Stream API] Stop requested, terminating processing`)
             }
@@ -202,15 +217,22 @@ export async function POST(request: NextRequest) {
               reason: "Processing stopped by user",
               stats,
               outputFile: outputPath,
+              canResume: true,
             })
             break
           }
 
-          if (pauseState.isPaused) {
+          if (pauseState.isPaused || pauseState.pauseRequested) {
             if (verbose) {
-              console.log(`[Stream API] Pause requested, waiting for resume`)
+              console.log(`[Stream API] Pause requested, saving state and pausing`)
             }
-            sendMessage("paused", "Processing paused - waiting for resume...")
+            wasInterrupted = true
+            sendMessage("paused", {
+              message: "Processing paused - state saved for resume",
+              stats,
+              outputFile: outputPath,
+              canResume: true,
+            })
 
             // Update session status to paused
             await history.updateSession(sessionId, {
@@ -223,36 +245,18 @@ export async function POST(request: NextRequest) {
               },
             })
 
-            // Wait for resume - FIXED: Check more frequently
-            while (getPauseState().isPaused && !getPauseState().shouldStop) {
-              await new Promise((resolve) => setTimeout(resolve, 500)) // Check every 500ms instead of 1000ms
-            }
-
-            if (getPauseState().shouldStop) {
-              if (verbose) {
-                console.log(`[Stream API] Stop requested while paused, terminating processing`)
-              }
-              wasInterrupted = true
-              sendMessage("shutdown", {
-                reason: "Processing stopped while paused",
-                stats,
-                outputFile: outputPath,
-              })
-              break
-            }
-
-            // Update session status back to running
-            await history.updateSession(sessionId, {
-              status: "running",
-            })
-
-            if (verbose) {
-              console.log(`[Stream API] Processing resumed`)
-            }
-            sendMessage("log", "Processing resumed")
+            break
           }
 
           const batch = xmlFiles.slice(i, i + numWorkers)
+
+          if (verbose) {
+            sendMessage(
+              "log",
+              `Processing batch ${Math.floor(i / numWorkers) + 1}: files ${i + 1}-${Math.min(i + numWorkers, xmlFiles.length)}`,
+            )
+          }
+
           const batchPromises = batch.map((xmlFile, index) =>
             processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, i + index + 1),
           )
@@ -260,6 +264,98 @@ export async function POST(request: NextRequest) {
           try {
             const batchResults = await Promise.all(batchPromises)
 
+            // Check for pause/stop during batch processing
+            const midProcessPauseState = getPauseState()
+            if (
+              midProcessPauseState.shouldStop ||
+              midProcessPauseState.stopRequested ||
+              midProcessPauseState.isPaused ||
+              midProcessPauseState.pauseRequested
+            ) {
+              if (verbose) {
+                console.log(`[Stream API] Pause/Stop requested during batch processing`)
+              }
+
+              // Cleanup workers
+              for (const worker of activeWorkers) {
+                try {
+                  worker.terminate()
+                } catch (error) {
+                  if (verbose) {
+                    console.error("[Stream API] Error terminating worker:", error)
+                  }
+                }
+              }
+              activeWorkers.clear()
+
+              // Process results we got before interruption
+              for (const result of batchResults) {
+                if (result) {
+                  stats.processedFiles++
+
+                  if (result.record) {
+                    stats.successfulFiles++
+                    stats.recordsWritten++
+
+                    // Append to CSV file
+                    const csvLine =
+                      Object.values(result.record)
+                        .map((value) =>
+                          typeof value === "string" &&
+                          (value.includes(",") || value.includes('"') || value.includes("\n"))
+                            ? `"${String(value).replace(/"/g, '""')}"`
+                            : value || "",
+                        )
+                        .join(",") + "\n"
+
+                    await fs.appendFile(outputPath, csvLine, "utf8")
+                  } else {
+                    stats.errorFiles++
+                  }
+
+                  if (!result.passedFilter) {
+                    stats.filteredFiles++
+                  }
+
+                  if (result.imageMoved) {
+                    stats.movedFiles++
+                  }
+                }
+              }
+
+              // Update session with current progress
+              await history.updateSession(sessionId, {
+                status:
+                  midProcessPauseState.shouldStop || midProcessPauseState.stopRequested ? "interrupted" : "paused",
+                progress: {
+                  totalFiles: stats.totalFiles,
+                  processedFiles: stats.processedFiles,
+                  successCount: stats.successfulFiles,
+                  errorCount: stats.errorFiles,
+                },
+              })
+
+              wasInterrupted = true
+              if (midProcessPauseState.shouldStop || midProcessPauseState.stopRequested) {
+                sendMessage("shutdown", {
+                  reason: "Processing stopped during batch",
+                  stats,
+                  outputFile: outputPath,
+                  canResume: true,
+                })
+              } else {
+                sendMessage("paused", {
+                  message: "Processing paused during batch - state saved",
+                  stats,
+                  outputFile: outputPath,
+                  canResume: true,
+                })
+              }
+
+              break
+            }
+
+            // Process results normally
             for (const result of batchResults) {
               stats.processedFiles++
 
@@ -278,6 +374,10 @@ export async function POST(request: NextRequest) {
                     .join(",") + "\n"
 
                 await fs.appendFile(outputPath, csvLine, "utf8")
+
+                if (verbose) {
+                  sendMessage("log", `Processed file: ${path.basename(result.record.xmlPath || "unknown")} - Success`)
+                }
               } else {
                 stats.errorFiles++
                 if (verbose && result.error) {
@@ -288,10 +388,16 @@ export async function POST(request: NextRequest) {
 
               if (!result.passedFilter) {
                 stats.filteredFiles++
+                if (verbose) {
+                  sendMessage("log", `File filtered out: ${result.workerId}`)
+                }
               }
 
               if (result.imageMoved) {
                 stats.movedFiles++
+                if (verbose) {
+                  sendMessage("log", `Image moved: ${result.workerId}`)
+                }
               }
             }
 
@@ -307,6 +413,18 @@ export async function POST(request: NextRequest) {
               })
             }
 
+            // Cleanup workers
+            for (const worker of activeWorkers) {
+              try {
+                worker.terminate()
+              } catch (error) {
+                if (verbose) {
+                  console.error("[Stream API] Error terminating worker:", error)
+                }
+              }
+            }
+            activeWorkers.clear()
+
             // Send progress update
             const percentage = Math.round((stats.processedFiles / stats.totalFiles) * 100)
             sendMessage("progress", {
@@ -317,6 +435,12 @@ export async function POST(request: NextRequest) {
               errors: stats.errorFiles,
               filtered: stats.filteredFiles,
               moved: stats.movedFiles,
+              stats: {
+                totalFiles: stats.totalFiles,
+                processedFiles: stats.processedFiles,
+                successCount: stats.successfulFiles,
+                errorCount: stats.errorFiles,
+              },
             })
 
             if (verbose) {
@@ -324,6 +448,40 @@ export async function POST(request: NextRequest) {
               console.log(
                 `[Stream API] Success: ${stats.successfulFiles}, Errors: ${stats.errorFiles}, Filtered: ${stats.filteredFiles}, Moved: ${stats.movedFiles}`,
               )
+              sendMessage(
+                "log",
+                `Progress: ${stats.processedFiles}/${stats.totalFiles} (${percentage}%) - Success: ${stats.successfulFiles}, Errors: ${stats.errorFiles}`,
+              )
+            }
+
+            // Check for pause/stop after each batch
+            const postBatchPauseState = getPauseState()
+            if (postBatchPauseState.shouldStop || postBatchPauseState.stopRequested) {
+              if (verbose) {
+                console.log(`[Stream API] Stop requested after batch, terminating processing`)
+              }
+              wasInterrupted = true
+              sendMessage("shutdown", {
+                reason: "Processing stopped after batch",
+                stats,
+                outputFile: outputPath,
+                canResume: true,
+              })
+              break
+            }
+
+            if (postBatchPauseState.isPaused || postBatchPauseState.pauseRequested) {
+              if (verbose) {
+                console.log(`[Stream API] Pause requested after batch`)
+              }
+              wasInterrupted = true
+              sendMessage("paused", {
+                message: "Processing paused after batch - state saved",
+                stats,
+                outputFile: outputPath,
+                canResume: true,
+              })
+              break
             }
           } catch (error) {
             const errorMsg = `Batch processing error: ${error instanceof Error ? error.message : "Unknown error"}`
@@ -333,45 +491,6 @@ export async function POST(request: NextRequest) {
             sendMessage("error", errorMsg)
             stats.errorFiles += batch.length
             stats.processedFiles += batch.length
-          }
-
-          // FIXED: Check pause/stop after each batch
-          const postBatchPauseState = getPauseState()
-          if (postBatchPauseState.shouldStop) {
-            if (verbose) {
-              console.log(`[Stream API] Stop requested after batch, terminating processing`)
-            }
-            wasInterrupted = true
-            sendMessage("shutdown", {
-              reason: "Processing stopped after batch",
-              stats,
-              outputFile: outputPath,
-            })
-            break
-          }
-
-          if (postBatchPauseState.isPaused) {
-            if (verbose) {
-              console.log(`[Stream API] Pause requested after batch`)
-            }
-            sendMessage("paused", "Processing paused after batch - waiting for resume...")
-
-            // Wait for resume
-            while (getPauseState().isPaused && !getPauseState().shouldStop) {
-              await new Promise((resolve) => setTimeout(resolve, 500))
-            }
-
-            if (getPauseState().shouldStop) {
-              wasInterrupted = true
-              sendMessage("shutdown", {
-                reason: "Processing stopped while paused after batch",
-                stats,
-                outputFile: outputPath,
-              })
-              break
-            }
-
-            sendMessage("log", "Processing resumed after batch")
           }
         }
 
@@ -438,22 +557,20 @@ export async function POST(request: NextRequest) {
           await history.setCurrentSession(null)
         }
 
-        try {
-          const data = JSON.stringify({
-            type: "error",
-            message: `Stream processing error: ${errorMessage}`,
-            timestamp: new Date().toISOString(),
-          })
-          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
-        } catch (encodeError) {
-          console.error("Error encoding error message:", encodeError)
+        if (!controllerClosed) {
+          try {
+            const data = JSON.stringify({
+              type: "error",
+              message: `Stream processing error: ${errorMessage}`,
+              timestamp: new Date().toISOString(),
+            })
+            controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+          } catch (encodeError) {
+            console.error("Error encoding error message:", encodeError)
+          }
         }
       } finally {
-        try {
-          controller.close()
-        } catch (closeError) {
-          console.error("Error closing controller:", closeError)
-        }
+        safeCloseController()
       }
     },
   })
@@ -478,7 +595,7 @@ async function processFile(
   return new Promise((resolve) => {
     // Check for pause/stop before creating worker
     const pauseState = getPauseState()
-    if (pauseState.shouldStop) {
+    if (pauseState.shouldStop || pauseState.stopRequested) {
       resolve({
         record: null,
         passedFilter: false,

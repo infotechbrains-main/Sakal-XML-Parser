@@ -370,6 +370,28 @@ export default function Home() {
     }
   }
 
+  const formatLogMessage = (message: any): string => {
+    if (typeof message === "string") {
+      return message
+    }
+
+    if (message && typeof message === "object") {
+      // Handle specific message types
+      if (message.message) {
+        return typeof message.message === "string" ? message.message : JSON.stringify(message.message)
+      }
+      if (message.reason) {
+        return message.reason
+      }
+      if (message.stats) {
+        return `Progress: ${message.stats.processedFiles}/${message.stats.totalFiles} files processed`
+      }
+      return JSON.stringify(message)
+    }
+
+    return String(message)
+  }
+
   const handleStreamMessage = (data: any) => {
     console.log(`[UI] Received stream message:`, data)
 
@@ -387,17 +409,22 @@ export default function Home() {
         setIsPaused(true)
         setIsRunning(false)
         setCanResume(true)
-        addMessage("system", data.message.message || data.message)
+        addMessage("system", formatLogMessage(data.message))
         break
       case "shutdown":
         setIsRunning(false)
         setCanResume(data.message.canResume || false)
-        addMessage("system", data.message.reason || data.message)
+        addMessage("system", formatLogMessage(data.message))
         break
       case "progress":
         setProgress(data.message.percentage || 0)
         if (data.message.stats) {
-          setStats(data.message.stats)
+          setStats({
+            totalFiles: data.message.stats.totalFiles || data.message.total || 0,
+            processedFiles: data.message.stats.processedFiles || data.message.processed || 0,
+            successCount: data.message.stats.successCount || data.message.successful || 0,
+            errorCount: data.message.stats.errorCount || data.message.errors || 0,
+          })
         }
         if (data.message.currentChunk) {
           setCurrentChunk(data.message.currentChunk)
@@ -455,7 +482,7 @@ export default function Home() {
         setJobId(data.message.jobId)
         break
       default:
-        addMessage("info", data.message)
+        addMessage("info", formatLogMessage(data.message))
         break
     }
   }
@@ -491,6 +518,7 @@ export default function Home() {
     setProcessingStartTime(new Date().toISOString())
     setProcessingEndTime(null)
     setCanResume(false)
+    setIsPaused(false)
     setStats({
       totalFiles: 0,
       processedFiles: 0,
@@ -748,6 +776,7 @@ export default function Home() {
       if (response.ok) {
         const result = await response.json()
         addMessage("system", "Pause request sent - processing will stop gracefully and save state")
+        console.log("[UI] Pause response:", result)
       } else {
         throw new Error("Failed to send pause request")
       }
@@ -774,6 +803,7 @@ export default function Home() {
       if (response.ok) {
         const result = await response.json()
         addMessage("system", "Stop request sent - processing will terminate and save state for resume")
+        console.log("[UI] Stop response:", result)
       } else {
         throw new Error("Failed to send stop request")
       }
@@ -1983,10 +2013,8 @@ export default function Home() {
                         {messages.map((message, index) => (
                           <div key={index} className="text-sm">
                             <span className="text-muted-foreground">{message.timestamp}</span>
-                            <span className="ml-2 font-medium">[{message.type}]</span>
-                            <span className="ml-2">
-                              {typeof message.message === "string" ? message.message : JSON.stringify(message.message)}
-                            </span>
+                            <span className="ml-2 font-medium">[{message.type.toUpperCase()}]</span>
+                            <span className="ml-2">{formatLogMessage(message.message)}</span>
                           </div>
                         ))}
                         <div ref={logsEndRef} />
@@ -2006,9 +2034,7 @@ export default function Home() {
                           <div key={index} className="text-sm text-red-600">
                             <span className="text-muted-foreground">{message.timestamp}</span>
                             <span className="ml-2 font-medium">[ERROR]</span>
-                            <span className="ml-2">
-                              {typeof message.message === "string" ? message.message : JSON.stringify(message.message)}
-                            </span>
+                            <span className="ml-2">{formatLogMessage(message.message)}</span>
                           </div>
                         ))}
                         <div ref={errorLogsEndRef} />
