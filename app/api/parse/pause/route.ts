@@ -1,25 +1,27 @@
 import { type NextRequest, NextResponse } from "next/server"
 
-// Global pause state
-let pauseState = {
+// Global pause state that all processing routes can access
+let globalPauseState = {
   isPaused: false,
   shouldStop: false,
   pauseRequested: false,
   stopRequested: false,
-  lastUpdated: new Date().toISOString(),
 }
 
 export function getPauseState() {
-  return { ...pauseState }
+  return globalPauseState
+}
+
+export function setPauseState(newState: Partial<typeof globalPauseState>) {
+  globalPauseState = { ...globalPauseState, ...newState }
 }
 
 export function resetPauseState() {
-  pauseState = {
+  globalPauseState = {
     isPaused: false,
     shouldStop: false,
     pauseRequested: false,
     stopRequested: false,
-    lastUpdated: new Date().toISOString(),
   }
 }
 
@@ -28,57 +30,54 @@ export async function POST(request: NextRequest) {
     const body = await request.json()
     const { action, jobId } = body
 
-    console.log(`[Pause API] Received action: ${action}${jobId ? ` for job: ${jobId}` : ""}`)
+    console.log(`[Pause API] Received ${action} request for job: ${jobId || "unknown"}`)
 
-    switch (action) {
-      case "pause":
-        pauseState.isPaused = true
-        pauseState.pauseRequested = true
-        pauseState.lastUpdated = new Date().toISOString()
-        console.log("[Pause API] Processing paused")
-        return NextResponse.json({
-          success: true,
-          message: "Processing paused",
-          state: pauseState,
-        })
+    if (action === "pause") {
+      globalPauseState.isPaused = true
+      globalPauseState.pauseRequested = true
+      console.log("[Pause API] Pause state set to true")
 
-      case "resume":
-        pauseState.isPaused = false
-        pauseState.pauseRequested = false
-        pauseState.lastUpdated = new Date().toISOString()
-        console.log("[Pause API] Processing resumed")
-        return NextResponse.json({
-          success: true,
-          message: "Processing resumed",
-          state: pauseState,
-        })
+      return NextResponse.json({
+        success: true,
+        message: "Pause request processed",
+        state: globalPauseState,
+      })
+    } else if (action === "stop") {
+      globalPauseState.shouldStop = true
+      globalPauseState.stopRequested = true
+      globalPauseState.isPaused = false // Clear pause when stopping
+      console.log("[Pause API] Stop state set to true")
 
-      case "stop":
-        pauseState.shouldStop = true
-        pauseState.stopRequested = true
-        pauseState.isPaused = false
-        pauseState.lastUpdated = new Date().toISOString()
-        console.log("[Pause API] Processing stopped")
-        return NextResponse.json({
-          success: true,
-          message: "Processing stopped",
-          state: pauseState,
-        })
+      return NextResponse.json({
+        success: true,
+        message: "Stop request processed",
+        state: globalPauseState,
+      })
+    } else if (action === "resume") {
+      globalPauseState.isPaused = false
+      globalPauseState.pauseRequested = false
+      console.log("[Pause API] Pause state cleared (resumed)")
 
-      default:
-        return NextResponse.json(
-          {
-            success: false,
-            error: `Unknown action: ${action}`,
-          },
-          { status: 400 },
-        )
+      return NextResponse.json({
+        success: true,
+        message: "Resume request processed",
+        state: globalPauseState,
+      })
+    } else {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Invalid action. Use 'pause', 'stop', or 'resume'",
+        },
+        { status: 400 },
+      )
     }
   } catch (error) {
     console.error("[Pause API] Error:", error)
     return NextResponse.json(
       {
         success: false,
+        message: "Failed to process pause/stop request",
         error: error instanceof Error ? error.message : "Unknown error",
       },
       { status: 500 },
@@ -89,6 +88,6 @@ export async function POST(request: NextRequest) {
 export async function GET() {
   return NextResponse.json({
     success: true,
-    state: pauseState,
+    state: globalPauseState,
   })
 }
