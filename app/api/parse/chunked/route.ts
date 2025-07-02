@@ -35,11 +35,11 @@ interface ProcessingStats {
 }
 
 interface WorkerResult {
-  success: boolean
-  data?: any
+  record: any
+  passedFilter: boolean
+  imageMoved: boolean
   error?: string
-  filtered?: boolean
-  moved?: boolean
+  workerId: number
 }
 
 export async function POST(request: NextRequest) {
@@ -64,8 +64,12 @@ export async function POST(request: NextRequest) {
         resetPauseState()
 
         const sendMessage = (type: string, message: any) => {
-          const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
-          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+          try {
+            const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
+            controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+          } catch (error) {
+            console.error("Error sending message:", error)
+          }
         }
 
         sendMessage("start", "Starting chunked processing...")
@@ -108,49 +112,43 @@ export async function POST(request: NextRequest) {
         // Initialize CSV file with headers
         const headers =
           [
-            "filename",
-            "filepath",
-            "filesize",
-            "width",
-            "height",
-            "format",
-            "colorspace",
-            "compression",
-            "quality",
-            "orientation",
-            "resolution",
-            "created",
-            "modified",
-            "camera_make",
-            "camera_model",
-            "lens_model",
-            "focal_length",
-            "aperture",
-            "shutter_speed",
-            "iso",
-            "flash",
-            "gps_latitude",
-            "gps_longitude",
-            "gps_altitude",
-            "keywords",
-            "description",
-            "title",
-            "subject",
-            "creator",
-            "copyright",
-            "usage_terms",
-            "credit_line",
-            "source",
-            "instructions",
-            "category",
-            "supplemental_categories",
-            "urgency",
-            "location",
             "city",
-            "state",
-            "country",
+            "year",
+            "month",
+            "newsItemId",
+            "dateId",
+            "providerId",
             "headline",
-            "caption",
+            "byline",
+            "dateline",
+            "creditline",
+            "copyrightLine",
+            "slugline",
+            "keywords",
+            "edition",
+            "location",
+            "country",
+            "city_meta",
+            "pageNumber",
+            "status",
+            "urgency",
+            "language",
+            "subject",
+            "processed",
+            "published",
+            "usageType",
+            "rightsHolder",
+            "imageWidth",
+            "imageHeight",
+            "imageSize",
+            "actualFileSize",
+            "imageHref",
+            "xmlPath",
+            "imagePath",
+            "imageExists",
+            "creationDate",
+            "revisionDate",
+            "commentData",
           ].join(",") + "\n"
 
         await fs.writeFile(outputPath, headers, "utf8")
@@ -201,7 +199,9 @@ export async function POST(request: NextRequest) {
 
           for (let i = 0; i < chunk.length; i += batchSize) {
             const batch = chunk.slice(i, i + batchSize)
-            const batchPromises = batch.map((xmlFile) => processFile(xmlFile, filterConfig, verbose, activeWorkers))
+            const batchPromises = batch.map((xmlFile, index) =>
+              processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, i + index + 1),
+            )
 
             try {
               const batchResults = await Promise.all(batchPromises)
@@ -209,16 +209,17 @@ export async function POST(request: NextRequest) {
               for (const result of batchResults) {
                 stats.processedFiles++
 
-                if (result.success && result.data) {
+                if (result.record) {
                   stats.successfulFiles++
                   stats.recordsWritten++
 
                   // Append to CSV file
                   const csvLine =
-                    Object.values(result.data)
+                    Object.values(result.record)
                       .map((value) =>
-                        typeof value === "string" && value.includes(",")
-                          ? `"${value.replace(/"/g, '""')}"`
+                        typeof value === "string" &&
+                        (value.includes(",") || value.includes('"') || value.includes("\n"))
+                          ? `"${String(value).replace(/"/g, '""')}"`
                           : value || "",
                       )
                       .join(",") + "\n"
@@ -231,11 +232,11 @@ export async function POST(request: NextRequest) {
                   }
                 }
 
-                if (result.filtered) {
+                if (!result.passedFilter) {
                   stats.filteredFiles++
                 }
 
-                if (result.moved) {
+                if (result.imageMoved) {
                   stats.movedFiles++
                 }
               }
@@ -251,8 +252,13 @@ export async function POST(request: NextRequest) {
 
           // Cleanup workers
           for (const worker of activeWorkers) {
-            worker.terminate()
+            try {
+              worker.terminate()
+            } catch (error) {
+              console.error("Error terminating worker:", error)
+            }
           }
+          activeWorkers.clear()
 
           sendMessage("chunk_complete", {
             chunkNumber: chunkIndex + 1,
@@ -311,14 +317,22 @@ export async function POST(request: NextRequest) {
         }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
-        const data = JSON.stringify({
-          type: "error",
-          message: `Chunked processing error: ${errorMessage}`,
-          timestamp: new Date().toISOString(),
-        })
-        controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+        try {
+          const data = JSON.stringify({
+            type: "error",
+            message: `Chunked processing error: ${errorMessage}`,
+            timestamp: new Date().toISOString(),
+          })
+          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+        } catch (encodeError) {
+          console.error("Error encoding error message:", encodeError)
+        }
       } finally {
-        controller.close()
+        try {
+          controller.close()
+        } catch (closeError) {
+          console.error("Error closing controller:", closeError)
+        }
       }
     },
   })
@@ -337,41 +351,105 @@ async function processFile(
   filterConfig: any,
   verbose: boolean,
   activeWorkers: Set<Worker>,
+  originalRootDir: string,
+  workerId: number,
 ): Promise<WorkerResult> {
   return new Promise((resolve) => {
     // Check for pause/stop before creating worker
     const pauseState = getPauseState()
     if (pauseState.shouldStop) {
-      resolve({ success: false, error: "Processing stopped by user" })
+      resolve({
+        record: null,
+        passedFilter: false,
+        imageMoved: false,
+        error: "Processing stopped by user",
+        workerId,
+      })
       return
     }
 
-    const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"))
+    const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"), {
+      workerData: {
+        xmlFilePath: xmlFile,
+        filterConfig: filterConfig,
+        originalRootDir: originalRootDir,
+        workerId: workerId,
+        verbose: verbose,
+        isRemote: false,
+        originalRemoteXmlUrl: null,
+        associatedImagePath: null,
+        isWatchMode: false,
+      },
+    })
+
     activeWorkers.add(worker)
 
     const timeout = setTimeout(() => {
-      worker.terminate()
-      activeWorkers.delete(worker)
-      resolve({ success: false, error: "Worker timeout" })
+      try {
+        worker.terminate()
+        activeWorkers.delete(worker)
+        resolve({
+          record: null,
+          passedFilter: false,
+          imageMoved: false,
+          error: "Worker timeout",
+          workerId,
+        })
+      } catch (error) {
+        console.error("Error during worker timeout:", error)
+      }
     }, 30000) // 30 second timeout
 
     worker.on("message", (result: WorkerResult) => {
-      clearTimeout(timeout)
-      activeWorkers.delete(worker)
-      worker.terminate()
-      resolve(result)
+      try {
+        clearTimeout(timeout)
+        activeWorkers.delete(worker)
+        worker.terminate()
+        resolve(result)
+      } catch (error) {
+        console.error("Error handling worker message:", error)
+        resolve({
+          record: null,
+          passedFilter: false,
+          imageMoved: false,
+          error: "Error handling worker result",
+          workerId,
+        })
+      }
     })
 
     worker.on("error", (error) => {
-      clearTimeout(timeout)
-      activeWorkers.delete(worker)
-      resolve({ success: false, error: error.message })
+      try {
+        clearTimeout(timeout)
+        activeWorkers.delete(worker)
+        resolve({
+          record: null,
+          passedFilter: false,
+          imageMoved: false,
+          error: error.message,
+          workerId,
+        })
+      } catch (handleError) {
+        console.error("Error handling worker error:", handleError)
+      }
     })
 
-    worker.postMessage({
-      xmlFile,
-      filterConfig,
-      verbose,
+    worker.on("exit", (code) => {
+      if (code !== 0) {
+        try {
+          clearTimeout(timeout)
+          activeWorkers.delete(worker)
+          resolve({
+            record: null,
+            passedFilter: false,
+            imageMoved: false,
+            error: `Worker exited with code ${code}`,
+            workerId,
+          })
+        } catch (error) {
+          console.error("Error handling worker exit:", error)
+        }
+      }
     })
   })
 }
