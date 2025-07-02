@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server"
 import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
-import { getPauseState } from "../pause/route"
+import { getPauseState, resetPauseState } from "./pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 
 interface ProcessingStats {
@@ -45,6 +45,9 @@ export async function POST(request: NextRequest) {
           verbose = false,
           filterConfig = null,
         } = body
+
+        // Reset pause state at the start of processing
+        resetPauseState()
 
         // Create session ID
         sessionId = `chunked_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
@@ -98,7 +101,7 @@ export async function POST(request: NextRequest) {
           movedFiles: 0,
         }
 
-        // Determine output path
+        // Determine output path - FIXED: Use full path including output folder
         const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
 
         // Create initial session record
@@ -108,7 +111,7 @@ export async function POST(request: NextRequest) {
           status: "running" as const,
           config: {
             rootDir,
-            outputFile,
+            outputFile: outputPath, // Store full path in session
             numWorkers,
             verbose,
             filterConfig,
@@ -129,6 +132,7 @@ export async function POST(request: NextRequest) {
 
         if (verbose) {
           console.log(`[Chunked API] Created session: ${sessionId}`)
+          console.log(`[Chunked API] Output path: ${outputPath}`)
         }
 
         // Calculate chunks
@@ -212,7 +216,7 @@ export async function POST(request: NextRequest) {
             console.log(`[Chunked API] Starting chunk ${currentChunkNumber}/${chunks.length}`)
           }
 
-          // Check for pause/stop using the global pause state
+          // Check for pause/stop using the global pause state - FIXED: Check more frequently
           const pauseState = getPauseState()
           if (pauseState.shouldStop) {
             if (verbose) {
@@ -244,9 +248,9 @@ export async function POST(request: NextRequest) {
               },
             })
 
-            // Wait for resume
+            // Wait for resume - FIXED: Check more frequently
             while (getPauseState().isPaused && !getPauseState().shouldStop) {
-              await new Promise((resolve) => setTimeout(resolve, 1000))
+              await new Promise((resolve) => setTimeout(resolve, 500)) // Check every 500ms instead of 1000ms
             }
 
             if (getPauseState().shouldStop) {
@@ -285,6 +289,69 @@ export async function POST(request: NextRequest) {
           const batchSize = Math.min(numWorkers, chunk.length)
 
           for (let i = 0; i < chunk.length; i += batchSize) {
+            // FIXED: Check pause/stop before each batch
+            const currentPauseState = getPauseState()
+            if (currentPauseState.shouldStop) {
+              if (verbose) {
+                console.log(`[Chunked API] Stop requested during batch processing, terminating`)
+              }
+              wasInterrupted = true
+              sendMessage("shutdown", {
+                reason: "Processing stopped during batch processing",
+                stats,
+                outputFile: outputPath,
+              })
+              // Cleanup workers
+              for (const worker of activeWorkers) {
+                try {
+                  worker.terminate()
+                } catch (error) {
+                  if (verbose) {
+                    console.error("[Chunked API] Error terminating worker:", error)
+                  }
+                }
+              }
+              activeWorkers.clear()
+              controller.close()
+              return
+            }
+
+            if (currentPauseState.isPaused) {
+              if (verbose) {
+                console.log(`[Chunked API] Pause requested during batch processing`)
+              }
+              sendMessage("paused", "Processing paused during batch - waiting for resume...")
+
+              // Wait for resume
+              while (getPauseState().isPaused && !getPauseState().shouldStop) {
+                await new Promise((resolve) => setTimeout(resolve, 500))
+              }
+
+              if (getPauseState().shouldStop) {
+                wasInterrupted = true
+                sendMessage("shutdown", {
+                  reason: "Processing stopped while paused during batch",
+                  stats,
+                  outputFile: outputPath,
+                })
+                // Cleanup workers
+                for (const worker of activeWorkers) {
+                  try {
+                    worker.terminate()
+                  } catch (error) {
+                    if (verbose) {
+                      console.error("[Chunked API] Error terminating worker:", error)
+                    }
+                  }
+                }
+                activeWorkers.clear()
+                controller.close()
+                return
+              }
+
+              sendMessage("log", "Processing resumed during batch")
+            }
+
             const batch = chunk.slice(i, i + batchSize)
             const batchPromises = batch.map((xmlFile, index) =>
               processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, i + index + 1),
@@ -349,33 +416,6 @@ export async function POST(request: NextRequest) {
               stats.errorFiles += batch.length
               stats.processedFiles += batch.length
             }
-
-            // Check for pause/stop during batch processing
-            const currentPauseState = getPauseState()
-            if (currentPauseState.shouldStop) {
-              if (verbose) {
-                console.log(`[Chunked API] Stop requested during batch processing, terminating`)
-              }
-              wasInterrupted = true
-              sendMessage("shutdown", {
-                reason: "Processing stopped during batch processing",
-                stats,
-                outputFile: outputPath,
-              })
-              // Cleanup workers
-              for (const worker of activeWorkers) {
-                try {
-                  worker.terminate()
-                } catch (error) {
-                  if (verbose) {
-                    console.error("[Chunked API] Error terminating worker:", error)
-                  }
-                }
-              }
-              activeWorkers.clear()
-              controller.close()
-              return
-            }
           }
 
           // Cleanup workers
@@ -427,7 +467,7 @@ export async function POST(request: NextRequest) {
             }
 
             for (let countdown = pauseDuration; countdown > 0; countdown--) {
-              // Check for stop/pause during countdown
+              // Check for stop/pause during countdown - FIXED: Check more frequently
               const countdownPauseState = getPauseState()
               if (countdownPauseState.shouldStop) {
                 if (verbose) {
@@ -451,7 +491,7 @@ export async function POST(request: NextRequest) {
 
                 // Wait for resume
                 while (getPauseState().isPaused && !getPauseState().shouldStop) {
-                  await new Promise((resolve) => setTimeout(resolve, 1000))
+                  await new Promise((resolve) => setTimeout(resolve, 500))
                 }
 
                 if (getPauseState().shouldStop) {

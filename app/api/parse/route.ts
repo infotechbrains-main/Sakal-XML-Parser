@@ -1,28 +1,72 @@
-import type { NextRequest } from "next/server"
-import { promises as fs } from "fs"
+import { type NextRequest, NextResponse } from "next/server"
+import fs from "fs/promises"
 import path from "path"
+import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
 import { PersistentHistory } from "@/lib/persistent-history"
 
-interface ProcessingStats {
-  totalFiles: number
-  processedFiles: number
-  successfulFiles: number
-  errorFiles: number
-  recordsWritten: number
-  filteredFiles: number
-  movedFiles: number
-}
-
-interface WorkerResult {
-  record: any
-  passedFilter: boolean
-  imageMoved: boolean
-  error?: string
-  workerId: number
-}
+export const CSV_HEADERS = [
+  { id: "city", title: "City" },
+  { id: "year", title: "Year" },
+  { id: "month", title: "Month" },
+  { id: "newsItemId", title: "News Item ID" },
+  { id: "dateId", title: "Date ID" },
+  { id: "providerId", title: "Provider ID" },
+  { id: "headline", title: "Headline" },
+  { id: "byline", title: "Byline" },
+  { id: "dateline", title: "Date Line" },
+  { id: "creditline", title: "Credit Line" },
+  { id: "copyrightLine", title: "Copyright Line" },
+  { id: "slugline", title: "Slug Line" },
+  { id: "keywords", title: "Keywords" },
+  { id: "edition", title: "Edition" },
+  { id: "location", title: "Location (AdminMeta)" },
+  { id: "country", title: "Country" },
+  { id: "city_meta", title: "City (Metadata)" },
+  { id: "pageNumber", title: "Page Number" },
+  { id: "status", title: "Status" },
+  { id: "urgency", title: "Urgency" },
+  { id: "language", title: "Language" },
+  { id: "subject", title: "Subject" },
+  { id: "processed", title: "Processed" },
+  { id: "published", title: "Published" },
+  { id: "usageType", title: "Usage Type" },
+  { id: "rightsHolder", title: "Rights Holder" },
+  { id: "imageWidth", title: "Image Width" },
+  { id: "imageHeight", title: "Image Height" },
+  { id: "imageSize", title: "Image Size (bytes from XML)" },
+  { id: "actualFileSize", title: "Actual File Size (bytes)" },
+  { id: "imageHref", title: "Image Href" },
+  { id: "xmlPath", title: "XML Path" },
+  { id: "imagePath", title: "Image Path" },
+  { id: "imageExists", title: "Image Exists" },
+  { id: "creationDate", title: "Creation Date" },
+  { id: "revisionDate", title: "Revision Date" },
+  { id: "commentData", title: "Comment Data" },
+]
 
 const history = new PersistentHistory()
+
+async function findXmlFilesManually(rootDir: string): Promise<string[]> {
+  const xmlFiles: string[] = []
+  async function traverse(dir: string) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          await traverse(fullPath)
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
+          xmlFiles.push(fullPath)
+        }
+      }
+    } catch (error) {
+      console.log(`Error traversing ${dir}:`, error)
+    }
+  }
+  await traverse(rootDir)
+  return xmlFiles
+}
 
 export async function POST(request: NextRequest) {
   let sessionId: string | null = null
@@ -41,42 +85,18 @@ export async function POST(request: NextRequest) {
     // Create session ID
     sessionId = `regular_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
-    if (verbose) {
-      console.log(`[Regular API] Configuration:`)
-      console.log(`  - Session ID: ${sessionId}`)
-      console.log(`  - Root Directory: ${rootDir}`)
-      console.log(`  - Output File: ${outputFile}`)
-      console.log(`  - Output Folder: ${outputFolder || "current directory"}`)
-      console.log(`  - Workers: ${numWorkers}`)
-      console.log(`  - Verbose: ${verbose}`)
-      console.log(`  - Filters Enabled: ${filterConfig?.enabled || false}`)
+    console.log("Received request:", { rootDir, outputFile, outputFolder, numWorkers, verbose, filterConfig })
+
+    if (!rootDir) {
+      return NextResponse.json({ error: "Root directory is required" }, { status: 400 })
+    }
+    if (filterConfig?.moveImages && !filterConfig?.moveDestinationPath) {
+      return NextResponse.json({ error: "Move destination path is required when moving images." }, { status: 400 })
     }
 
-    // Find all XML files
-    const xmlFiles = await findXMLFiles(rootDir)
-
-    if (xmlFiles.length === 0) {
-      return Response.json(
-        {
-          success: false,
-          message: "No XML files found in the specified directory",
-        },
-        { status: 400 },
-      )
-    }
-
-    const stats: ProcessingStats = {
-      totalFiles: xmlFiles.length,
-      processedFiles: 0,
-      successfulFiles: 0,
-      errorFiles: 0,
-      recordsWritten: 0,
-      filteredFiles: 0,
-      movedFiles: 0,
-    }
-
-    // Determine output path
-    const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
+    // Create full output path - FIXED: Use full path including output folder
+    const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
+    const outputPath = path.resolve(fullOutputPath)
 
     // Create initial session record
     const session = {
@@ -85,14 +105,14 @@ export async function POST(request: NextRequest) {
       status: "running" as const,
       config: {
         rootDir,
-        outputFile,
+        outputFile: outputPath, // Store full path in session
         numWorkers,
         verbose,
         filterConfig,
         processingMode: "regular",
       },
       progress: {
-        totalFiles: stats.totalFiles,
+        totalFiles: 0,
         processedFiles: 0,
         successCount: 0,
         errorCount: 0,
@@ -100,174 +120,225 @@ export async function POST(request: NextRequest) {
       },
     }
 
-    // Save initial session
+    // Ensure output directory exists
+    if (outputFolder) {
+      try {
+        await fs.mkdir(outputFolder, { recursive: true })
+        console.log(`Created output directory: ${outputFolder}`)
+      } catch (error) {
+        console.error("Error creating output directory:", error)
+        return NextResponse.json({ error: `Failed to create output directory: ${outputFolder}` }, { status: 400 })
+      }
+    }
+
+    console.log("Output path:", outputPath)
+
+    console.log("Searching for XML files...")
+    const xmlFiles = await findXmlFilesManually(rootDir)
+    console.log(`Found ${xmlFiles.length} XML files`)
+
+    if (xmlFiles.length === 0) {
+      try {
+        const dirContents = await fs.readdir(rootDir, { recursive: true })
+        const allFiles = dirContents.map((f) => f.toString())
+        const xmlInDir = allFiles.filter((file) => file.toLowerCase().endsWith(".xml"))
+        const sampleFiles = allFiles.slice(0, 20)
+
+        return NextResponse.json(
+          {
+            error: "No XML files found",
+            message: `Searched in: ${rootDir}`,
+            debug: {
+              totalFiles: allFiles.length,
+              xmlFiles: xmlInDir.length,
+              sampleFiles: sampleFiles,
+              xmlFilesFound: xmlInDir.slice(0, 10),
+            },
+          },
+          { status: 404 },
+        )
+      } catch (dirError) {
+        return NextResponse.json(
+          {
+            error: "Directory read error",
+            message: `Could not read directory: ${rootDir}`,
+          },
+          { status: 404 },
+        )
+      }
+    }
+
+    // Update session with total files and save
+    session.progress.totalFiles = xmlFiles.length
     await history.addSession(session)
     await history.setCurrentSession(session)
 
     if (verbose) {
       console.log(`[Regular API] Created session: ${sessionId}`)
-      console.log(`[Regular API] Processing ${xmlFiles.length} files with ${numWorkers} workers`)
+      console.log(`[Regular API] Output path: ${outputPath}`)
     }
 
-    // Ensure output directory exists
-    if (outputFolder) {
-      await fs.mkdir(outputFolder, { recursive: true })
-      if (verbose) {
-        console.log(`[Regular API] Created output directory: ${outputFolder}`)
+    const allRecords: any[] = []
+    let processedCount = 0
+    let successCount = 0
+    let errorCount = 0
+    let filteredCount = 0
+    let movedCount = 0
+    const errors: string[] = []
+    const activeWorkers = new Set<Worker>()
+
+    console.log(`Starting to process ${xmlFiles.length} XML files with ${numWorkers} worker(s)`)
+    if (filterConfig?.enabled) {
+      console.log("Filtering enabled:", filterConfig)
+
+      // Log filter details for debugging
+      if (filterConfig.minWidth || filterConfig.minHeight) {
+        console.log(`Image size filter: min ${filterConfig.minWidth || 0}x${filterConfig.minHeight || 0} pixels`)
+      }
+      if (filterConfig.minFileSize) {
+        console.log(
+          `Min file size filter: ${filterConfig.minFileSize} bytes (${Math.round((filterConfig.minFileSize / 1024 / 1024) * 100) / 100}MB)`,
+        )
+      }
+      if (filterConfig.maxFileSize) {
+        console.log(
+          `Max file size filter: ${filterConfig.maxFileSize} bytes (${Math.round((filterConfig.maxFileSize / 1024 / 1024) * 100) / 100}MB)`,
+        )
       }
     }
 
-    // Initialize CSV file with headers
-    const headers =
-      [
-        "city",
-        "year",
-        "month",
-        "newsItemId",
-        "dateId",
-        "providerId",
-        "headline",
-        "byline",
-        "dateline",
-        "creditline",
-        "copyrightLine",
-        "slugline",
-        "keywords",
-        "edition",
-        "location",
-        "country",
-        "city_meta",
-        "pageNumber",
-        "status",
-        "urgency",
-        "language",
-        "subject",
-        "processed",
-        "published",
-        "usageType",
-        "rightsHolder",
-        "imageWidth",
-        "imageHeight",
-        "imageSize",
-        "actualFileSize",
-        "imageHref",
-        "xmlPath",
-        "imagePath",
-        "imageExists",
-        "creationDate",
-        "revisionDate",
-        "commentData",
-      ].join(",") + "\n"
-
-    await fs.writeFile(outputPath, headers, "utf8")
-
-    if (verbose) {
-      console.log(`[Regular API] Initialized CSV file: ${outputPath}`)
+    const workerScriptPath = path.resolve(process.cwd(), "./app/api/parse/xml-parser-worker.js")
+    try {
+      await fs.access(workerScriptPath)
+    } catch (e) {
+      console.error("Worker script not found at:", workerScriptPath)
+      return NextResponse.json({ error: "Worker script misconfiguration." }, { status: 500 })
     }
 
-    // Process files in batches
-    const activeWorkers = new Set<Worker>()
-    const errors: string[] = []
+    await new Promise<void>((resolveAllFiles) => {
+      let fileIndex = 0
+      let workersLaunched = 0
+      let lastProgressReport = 0
 
-    for (let i = 0; i < xmlFiles.length; i += numWorkers) {
-      const batch = xmlFiles.slice(i, i + numWorkers)
-      const batchPromises = batch.map((xmlFile, index) =>
-        processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, i + index + 1),
-      )
+      const launchWorkerIfNeeded = () => {
+        while (activeWorkers.size < numWorkers && fileIndex < xmlFiles.length) {
+          const currentFile = xmlFiles[fileIndex++]
+          const workerId = workersLaunched++
 
-      try {
-        const batchResults = await Promise.all(batchPromises)
-
-        for (const result of batchResults) {
-          stats.processedFiles++
-
-          if (result.record) {
-            stats.successfulFiles++
-            stats.recordsWritten++
-
-            // Append to CSV file
-            const csvLine =
-              Object.values(result.record)
-                .map((value) =>
-                  typeof value === "string" && (value.includes(",") || value.includes('"') || value.includes("\n"))
-                    ? `"${String(value).replace(/"/g, '""')}"`
-                    : value || "",
-                )
-                .join(",") + "\n"
-
-            await fs.appendFile(outputPath, csvLine, "utf8")
-          } else {
-            stats.errorFiles++
-            if (result.error) {
-              errors.push(result.error)
-              if (verbose) {
-                console.log(`[Regular API] Error processing file: ${result.error}`)
-              }
-            }
-          }
-
-          if (!result.passedFilter) {
-            stats.filteredFiles++
-          }
-
-          if (result.imageMoved) {
-            stats.movedFiles++
-          }
-        }
-
-        // Update session progress periodically
-        if (stats.processedFiles % 50 === 0 || stats.processedFiles === stats.totalFiles) {
-          await history.updateSession(sessionId, {
-            progress: {
-              totalFiles: stats.totalFiles,
-              processedFiles: stats.processedFiles,
-              successCount: stats.successfulFiles,
-              errorCount: stats.errorFiles,
+          const worker = new Worker(workerScriptPath, {
+            workerData: {
+              xmlFilePath: currentFile,
+              filterConfig,
+              originalRootDir: rootDir,
+              workerId,
+              verbose,
             },
           })
-        }
+          activeWorkers.add(worker)
 
-        if (verbose) {
-          const percentage = Math.round((stats.processedFiles / stats.totalFiles) * 100)
-          console.log(`[Regular API] Progress: ${stats.processedFiles}/${stats.totalFiles} (${percentage}%)`)
-          console.log(
-            `[Regular API] Success: ${stats.successfulFiles}, Errors: ${stats.errorFiles}, Filtered: ${stats.filteredFiles}, Moved: ${stats.movedFiles}`,
-          )
-        }
-      } catch (error) {
-        const errorMsg = `Batch processing error: ${error instanceof Error ? error.message : "Unknown error"}`
-        if (verbose) {
-          console.error(`[Regular API] ${errorMsg}`)
-        }
-        errors.push(errorMsg)
-        stats.errorFiles += batch.length
-        stats.processedFiles += batch.length
-      }
-    }
+          if (verbose) console.log(`[Main] Worker ${workerId} started for ${path.basename(currentFile)}`)
 
-    // Cleanup workers
-    for (const worker of activeWorkers) {
-      try {
-        worker.terminate()
-      } catch (error) {
-        if (verbose) {
-          console.error("[Regular API] Error terminating worker:", error)
+          worker.on("message", (result: any) => {
+            processedCount++
+            if (result.record) {
+              allRecords.push(result.record)
+              successCount++
+            }
+            if (result.passedFilter && result.record) {
+              filteredCount++
+            }
+            if (result.imageMoved) {
+              movedCount++
+            }
+            if (result.error) {
+              errorCount++
+              errors.push(`Error in ${path.basename(currentFile)} (Worker ${result.workerId}): ${result.error}`)
+            }
+
+            // Progress reporting every 100 files or every 10% of total files
+            const progressInterval = Math.max(100, Math.floor(xmlFiles.length / 10))
+            if (processedCount - lastProgressReport >= progressInterval || processedCount === xmlFiles.length) {
+              const progressPercent = Math.round((processedCount / xmlFiles.length) * 100)
+              console.log(`[Main] Progress: ${processedCount}/${xmlFiles.length} files processed (${progressPercent}%)`)
+              console.log(
+                `[Main] Current stats: ${successCount} successful, ${filteredCount} filtered, ${movedCount} moved, ${errorCount} errors`,
+              )
+              lastProgressReport = processedCount
+
+              // Update session progress
+              history.updateSession(sessionId, {
+                progress: {
+                  totalFiles: xmlFiles.length,
+                  processedFiles: processedCount,
+                  successCount: successCount,
+                  errorCount: errorCount,
+                },
+              })
+            }
+
+            activeWorkers.delete(worker)
+            worker.terminate().catch((err) => console.error(`Error terminating worker ${workerId}:`, err))
+
+            if (fileIndex < xmlFiles.length) {
+              launchWorkerIfNeeded()
+            } else if (activeWorkers.size === 0) {
+              resolveAllFiles()
+            }
+          })
+
+          worker.on("error", (err) => {
+            console.error(`[Main] Worker ${workerId} for ${path.basename(currentFile)} errored:`, err)
+            errorCount++
+            errors.push(`Worker error for ${path.basename(currentFile)}: ${err.message}`)
+            activeWorkers.delete(worker)
+
+            if (fileIndex < xmlFiles.length) {
+              launchWorkerIfNeeded()
+            } else if (activeWorkers.size === 0) {
+              resolveAllFiles()
+            }
+          })
+
+          worker.on("exit", (code) => {
+            activeWorkers.delete(worker)
+            if (code !== 0 && verbose) {
+              console.warn(`[Main] Worker ${workerId} for ${path.basename(currentFile)} exited with code ${code}`)
+            }
+            if (fileIndex >= xmlFiles.length && activeWorkers.size === 0) {
+              resolveAllFiles()
+            }
+          })
         }
       }
+      launchWorkerIfNeeded()
+      if (xmlFiles.length === 0) resolveAllFiles()
+    })
+
+    console.log(
+      `Processing complete. ${successCount} successful, ${errorCount} errors, ${filteredCount} passed filter, ${movedCount} moved.`,
+    )
+
+    if (allRecords.length > 0) {
+      const csvWriterInstance = createObjectCsvWriter({
+        path: outputPath,
+        header: CSV_HEADERS,
+      })
+      await csvWriterInstance.writeRecords(allRecords)
+      console.log(`CSV file written to: ${outputPath}`)
+    } else {
+      console.log("No records to write to CSV")
     }
-    activeWorkers.clear()
 
     // Update final session status
     const endTime = new Date().toISOString()
-
     await history.updateSession(sessionId, {
       status: "completed",
       endTime,
       progress: {
-        totalFiles: stats.totalFiles,
-        processedFiles: stats.processedFiles,
-        successCount: stats.successfulFiles,
-        errorCount: stats.errorFiles,
+        totalFiles: xmlFiles.length,
+        processedFiles: processedCount,
+        successCount: successCount,
+        errorCount: errorCount,
       },
       results: {
         outputPath,
@@ -277,26 +348,27 @@ export async function POST(request: NextRequest) {
     // Clear current session
     await history.setCurrentSession(null)
 
-    const completionMessage = `Regular processing completed! Processed ${stats.processedFiles} files, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`
-
     if (verbose) {
-      console.log(`[Regular API] ${completionMessage}`)
-      console.log(`[Regular API] Final stats:`, stats)
-      console.log(`[Regular API] Output file: ${outputPath}`)
       console.log(`[Regular API] Session ${sessionId} completed successfully`)
+      console.log(`[Regular API] Output file: ${outputPath}`)
     }
 
-    return Response.json({
+    return NextResponse.json({
       success: true,
-      message: completionMessage,
-      stats,
-      outputFile: outputPath,
-      errors: errors.slice(-10), // Return last 10 errors
-      downloadURL: `/api/download?file=${encodeURIComponent(outputPath)}`,
+      stats: {
+        totalFiles: xmlFiles.length,
+        processedFiles: processedCount,
+        successfulFiles: successCount,
+        errorFiles: errorCount,
+        recordsWritten: allRecords.length,
+        filteredFiles: filteredCount,
+        movedFiles: movedCount,
+      },
+      outputFile: path.basename(outputPath),
+      errors: verbose ? errors : errors.slice(0, 10),
     })
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "Unknown error"
-    console.error("[Regular API] Fatal error:", errorMessage)
+    console.error("Error in parse API:", error)
 
     // Update session with error status
     if (sessionId) {
@@ -307,152 +379,12 @@ export async function POST(request: NextRequest) {
       await history.setCurrentSession(null)
     }
 
-    return Response.json(
+    return NextResponse.json(
       {
-        success: false,
-        message: `Regular processing error: ${errorMessage}`,
+        error: "Internal server error",
+        message: error instanceof Error ? error.message : "Unknown error",
       },
       { status: 500 },
     )
   }
-}
-
-async function processFile(
-  xmlFile: string,
-  filterConfig: any,
-  verbose: boolean,
-  activeWorkers: Set<Worker>,
-  originalRootDir: string,
-  workerId: number,
-): Promise<WorkerResult> {
-  return new Promise((resolve) => {
-    if (verbose) {
-      console.log(`[Regular API] Creating worker ${workerId} for file: ${path.basename(xmlFile)}`)
-    }
-
-    const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"), {
-      workerData: {
-        xmlFilePath: xmlFile,
-        filterConfig: filterConfig,
-        originalRootDir: originalRootDir,
-        workerId: workerId,
-        verbose: verbose,
-        isRemote: false,
-        originalRemoteXmlUrl: null,
-        associatedImagePath: null,
-        isWatchMode: false,
-      },
-    })
-
-    activeWorkers.add(worker)
-
-    const timeout = setTimeout(() => {
-      try {
-        if (verbose) {
-          console.log(`[Regular API] Worker ${workerId} timed out after 30 seconds`)
-        }
-        worker.terminate()
-        activeWorkers.delete(worker)
-        resolve({
-          record: null,
-          passedFilter: false,
-          imageMoved: false,
-          error: "Worker timeout",
-          workerId,
-        })
-      } catch (error) {
-        console.error("Error during worker timeout:", error)
-      }
-    }, 30000) // 30 second timeout
-
-    worker.on("message", (result: WorkerResult) => {
-      try {
-        clearTimeout(timeout)
-        activeWorkers.delete(worker)
-        worker.terminate()
-
-        if (verbose) {
-          console.log(`[Regular API] Worker ${workerId} completed successfully`)
-        }
-
-        resolve(result)
-      } catch (error) {
-        console.error("Error handling worker message:", error)
-        resolve({
-          record: null,
-          passedFilter: false,
-          imageMoved: false,
-          error: "Error handling worker result",
-          workerId,
-        })
-      }
-    })
-
-    worker.on("error", (error) => {
-      try {
-        clearTimeout(timeout)
-        activeWorkers.delete(worker)
-
-        if (verbose) {
-          console.error(`[Regular API] Worker ${workerId} error:`, error.message)
-        }
-
-        resolve({
-          record: null,
-          passedFilter: false,
-          imageMoved: false,
-          error: error.message,
-          workerId,
-        })
-      } catch (handleError) {
-        console.error("Error handling worker error:", handleError)
-      }
-    })
-
-    worker.on("exit", (code) => {
-      if (code !== 0) {
-        try {
-          clearTimeout(timeout)
-          activeWorkers.delete(worker)
-
-          if (verbose) {
-            console.log(`[Regular API] Worker ${workerId} exited with code ${code}`)
-          }
-
-          resolve({
-            record: null,
-            passedFilter: false,
-            imageMoved: false,
-            error: `Worker exited with code ${code}`,
-            workerId,
-          })
-        } catch (error) {
-          console.error("Error handling worker exit:", error)
-        }
-      }
-    })
-  })
-}
-
-async function findXMLFiles(dir: string): Promise<string[]> {
-  const xmlFiles: string[] = []
-
-  try {
-    const entries = await fs.readdir(dir, { withFileTypes: true })
-
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name)
-
-      if (entry.isDirectory()) {
-        const subFiles = await findXMLFiles(fullPath)
-        xmlFiles.push(...subFiles)
-      } else if (entry.isFile() && path.extname(entry.name).toLowerCase() === ".xml") {
-        xmlFiles.push(fullPath)
-      }
-    }
-  } catch (error) {
-    console.error(`Error reading directory ${dir}:`, error)
-  }
-
-  return xmlFiles
 }

@@ -804,7 +804,7 @@ export default function Home() {
     <div className="container mx-auto p-6 max-w-7xl">
       <Toaster />
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-3xl font-bold">Sakal XML Parser</h1>
+        <h1 className="text-3xl font-bold">XML to CSV Converter</h1>
         <div className="flex items-center space-x-2">
           <Badge variant={isRunning ? "default" : "secondary"}>{isRunning ? "Processing" : "Ready"}</Badge>
           {isPaused && <Badge variant="outline">Paused</Badge>}

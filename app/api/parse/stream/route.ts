@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server"
 import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
-import { getPauseState } from "../pause/route"
+import { getPauseState, resetPauseState } from "./pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 
 interface ProcessingStats {
@@ -42,6 +42,9 @@ export async function POST(request: NextRequest) {
           verbose = false,
           filterConfig = null,
         } = body
+
+        // Reset pause state at the start of processing
+        resetPauseState()
 
         // Create session ID
         sessionId = `stream_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
@@ -91,7 +94,7 @@ export async function POST(request: NextRequest) {
           movedFiles: 0,
         }
 
-        // Determine output path
+        // Determine output path - FIXED: Use full path including output folder
         const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
 
         // Create initial session record
@@ -101,7 +104,7 @@ export async function POST(request: NextRequest) {
           status: "running" as const,
           config: {
             rootDir,
-            outputFile,
+            outputFile: outputPath, // Store full path in session
             numWorkers,
             verbose,
             filterConfig,
@@ -122,6 +125,7 @@ export async function POST(request: NextRequest) {
 
         if (verbose) {
           console.log(`[Stream API] Created session: ${sessionId}`)
+          console.log(`[Stream API] Output path: ${outputPath}`)
         }
 
         sendMessage("log", `Processing ${xmlFiles.length} files with ${numWorkers} workers`)
@@ -187,7 +191,7 @@ export async function POST(request: NextRequest) {
         let wasInterrupted = false
 
         for (let i = 0; i < xmlFiles.length; i += numWorkers) {
-          // Check for pause/stop
+          // Check for pause/stop - FIXED: Check more frequently
           const pauseState = getPauseState()
           if (pauseState.shouldStop) {
             if (verbose) {
@@ -219,9 +223,9 @@ export async function POST(request: NextRequest) {
               },
             })
 
-            // Wait for resume
+            // Wait for resume - FIXED: Check more frequently
             while (getPauseState().isPaused && !getPauseState().shouldStop) {
-              await new Promise((resolve) => setTimeout(resolve, 1000))
+              await new Promise((resolve) => setTimeout(resolve, 500)) // Check every 500ms instead of 1000ms
             }
 
             if (getPauseState().shouldStop) {
@@ -329,6 +333,45 @@ export async function POST(request: NextRequest) {
             sendMessage("error", errorMsg)
             stats.errorFiles += batch.length
             stats.processedFiles += batch.length
+          }
+
+          // FIXED: Check pause/stop after each batch
+          const postBatchPauseState = getPauseState()
+          if (postBatchPauseState.shouldStop) {
+            if (verbose) {
+              console.log(`[Stream API] Stop requested after batch, terminating processing`)
+            }
+            wasInterrupted = true
+            sendMessage("shutdown", {
+              reason: "Processing stopped after batch",
+              stats,
+              outputFile: outputPath,
+            })
+            break
+          }
+
+          if (postBatchPauseState.isPaused) {
+            if (verbose) {
+              console.log(`[Stream API] Pause requested after batch`)
+            }
+            sendMessage("paused", "Processing paused after batch - waiting for resume...")
+
+            // Wait for resume
+            while (getPauseState().isPaused && !getPauseState().shouldStop) {
+              await new Promise((resolve) => setTimeout(resolve, 500))
+            }
+
+            if (getPauseState().shouldStop) {
+              wasInterrupted = true
+              sendMessage("shutdown", {
+                reason: "Processing stopped while paused after batch",
+                stats,
+                outputFile: outputPath,
+              })
+              break
+            }
+
+            sendMessage("log", "Processing resumed after batch")
           }
         }
 
