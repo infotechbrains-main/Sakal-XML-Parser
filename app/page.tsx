@@ -130,6 +130,7 @@ export default function Home() {
   const [errorMessages, setErrorMessages] = useState<Message[]>([])
   const [isRunning, setIsRunning] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
+  const [canResume, setCanResume] = useState(false)
   const [progress, setProgress] = useState(0)
   const [stats, setStats] = useState<ProcessingStats>({
     totalFiles: 0,
@@ -174,7 +175,6 @@ export default function Home() {
 
   // History - Initialize as empty array and add proper error handling
   const [history, setHistory] = useState<ProcessingSession[]>([])
-  const [canResume, setCanResume] = useState(false)
   const [resumeSession, setResumeSession] = useState<ProcessingSession | null>(null)
   const [showResumeDialog, setShowResumeDialog] = useState(false)
 
@@ -302,6 +302,21 @@ export default function Home() {
 
   const checkResumeStatus = async () => {
     try {
+      // Check pause state for resume capability
+      const pauseResponse = await fetch("/api/parse/pause")
+      if (pauseResponse.ok) {
+        const pauseData = await pauseResponse.json()
+        if (pauseData.success && pauseData.state) {
+          const canResumeFromPause = pauseData.state.isPaused || pauseData.state.shouldStop
+          setCanResume(canResumeFromPause)
+          setIsPaused(pauseData.state.isPaused)
+
+          if (canResumeFromPause) {
+            addMessage("system", "Previous processing session can be resumed")
+          }
+        }
+      }
+
       const response = await fetch("/api/resume")
 
       if (!response.ok) {
@@ -318,7 +333,6 @@ export default function Home() {
       const data = await response.json()
 
       if (data.success) {
-        setCanResume(data.canResume)
         if (data.canResume && data.session) {
           setResumeSession(data.session)
           setShowResumeDialog(true)
@@ -354,7 +368,13 @@ export default function Home() {
       case "paused":
         setIsPaused(true)
         setIsRunning(false)
-        addMessage("system", data.message)
+        setCanResume(true)
+        addMessage("system", data.message.message || data.message)
+        break
+      case "shutdown":
+        setIsRunning(false)
+        setCanResume(data.message.canResume || false)
+        addMessage("system", data.message.reason || data.message)
         break
       case "progress":
         setProgress(data.message.percentage || 0)
@@ -395,6 +415,8 @@ export default function Home() {
           endTime: new Date().toISOString(),
         })
 
+        setIsRunning(false)
+        setCanResume(false)
         addMessage("success", "Processing completed successfully!")
         setActiveTab("results") // Auto-switch to results tab
         break
@@ -438,6 +460,7 @@ export default function Home() {
     setProcessingResults(null)
     setProcessingStartTime(new Date().toISOString())
     setProcessingEndTime(null)
+    setCanResume(false)
     setStats({
       totalFiles: 0,
       processedFiles: 0,
@@ -569,18 +592,109 @@ export default function Home() {
     }
   }
 
+  const resumeProcessing = async () => {
+    if (processingMode !== "chunked") {
+      addMessage("error", "Resume is only available for chunked processing mode")
+      return
+    }
+
+    setIsRunning(true)
+    setCanResume(false)
+    setIsPaused(false)
+    setActiveTab("logs")
+
+    try {
+      const requestBody = {
+        rootDir,
+        outputFile,
+        outputFolder,
+        numWorkers,
+        verbose,
+        filterConfig: filterEnabled ? { ...filterConfig, enabled: true } : null,
+        chunkSize,
+        pauseBetweenChunks,
+        pauseDuration,
+        resumeFromState: true,
+      }
+
+      const response = await fetch("/api/resume-chunked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
+
+      // Handle streaming response
+      const reader = response.body?.getReader()
+      if (!reader) {
+        throw new Error("No response body")
+      }
+
+      const textDecoder = new TextDecoder()
+      let partialData = ""
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        partialData += textDecoder.decode(value)
+
+        let completeLines
+        if (partialData.includes("\n")) {
+          completeLines = partialData.split("\n")
+          partialData = completeLines.pop() || ""
+        } else {
+          completeLines = []
+        }
+
+        for (const line of completeLines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(line.slice(6))
+              handleStreamMessage(data)
+            } catch (e) {
+              console.error("Error parsing SSE data:", e)
+            }
+          }
+        }
+      }
+
+      if (partialData.startsWith("data: ")) {
+        try {
+          const data = JSON.parse(partialData.slice(6))
+          handleStreamMessage(data)
+        } catch (e) {
+          console.error("Error parsing SSE data:", e)
+        }
+      }
+    } catch (error: any) {
+      addMessage("error", `Resume error: ${error.message}`)
+      setActiveTab("logs")
+    } finally {
+      setIsRunning(false)
+    }
+  }
+
   const pauseProcessing = async () => {
     try {
       const response = await fetch("/api/parse/pause", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "pause", jobId }),
+        body: JSON.stringify({
+          action: "pause",
+          jobId,
+          sessionId: jobId,
+          currentChunk,
+          processedFiles: stats.processedFiles,
+        }),
       })
 
       if (response.ok) {
         const result = await response.json()
-        setIsPaused(true)
-        addMessage("system", "Pause request sent - processing will stop gracefully")
+        addMessage("system", "Pause request sent - processing will stop gracefully and save state")
       } else {
         throw new Error("Failed to send pause request")
       }
@@ -595,30 +709,24 @@ export default function Home() {
       const response = await fetch("/api/parse/pause", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "stop", jobId }),
+        body: JSON.stringify({
+          action: "stop",
+          jobId,
+          sessionId: jobId,
+          currentChunk,
+          processedFiles: stats.processedFiles,
+        }),
       })
 
       if (response.ok) {
         const result = await response.json()
-        setIsRunning(false)
-        setIsPaused(false)
-        addMessage("system", "Stop request sent - processing will terminate")
+        addMessage("system", "Stop request sent - processing will terminate and save state for resume")
       } else {
         throw new Error("Failed to send stop request")
       }
     } catch (error) {
       addMessage("error", "Failed to stop processing")
       console.error("Stop error:", error)
-    }
-  }
-
-  const resumeProcessing = async () => {
-    try {
-      await fetch("/api/resume", { method: "POST" })
-      setIsPaused(false)
-      addMessage("system", "Processing resumed")
-    } catch (error) {
-      addMessage("error", "Failed to resume processing")
     }
   }
 
@@ -808,6 +916,11 @@ export default function Home() {
         <div className="flex items-center space-x-2">
           <Badge variant={isRunning ? "default" : "secondary"}>{isRunning ? "Processing" : "Ready"}</Badge>
           {isPaused && <Badge variant="outline">Paused</Badge>}
+          {canResume && (
+            <Badge variant="outline" className="text-orange-600">
+              Can Resume
+            </Badge>
+          )}
           {watchMode && <Badge variant="outline">Watching</Badge>}
         </div>
       </div>
@@ -1972,6 +2085,14 @@ export default function Home() {
                   <span className="text-sm font-medium">{chunkSize}</span>
                 </div>
               )}
+              {canResume && (
+                <div className="flex justify-between">
+                  <span className="text-sm">Resume:</span>
+                  <Badge variant="outline" className="text-orange-600">
+                    Available
+                  </Badge>
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -1980,21 +2101,35 @@ export default function Home() {
               <CardTitle className="text-lg">Controls</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2">
-              <Button onClick={startProcessing} disabled={isRunning || !rootDir} className="w-full">
-                {isRunning ? "Processing..." : "Start Processing"}
-              </Button>
+              {!isRunning && !canResume && (
+                <Button onClick={startProcessing} disabled={!rootDir} className="w-full">
+                  Start Processing
+                </Button>
+              )}
 
-              {isRunning && (
+              {canResume && !isRunning && (
                 <>
+                  <Button onClick={resumeProcessing} className="w-full">
+                    Resume Processing
+                  </Button>
                   <Button
-                    onClick={isPaused ? resumeProcessing : pauseProcessing}
+                    onClick={startProcessing}
+                    disabled={!rootDir}
                     variant="outline"
                     className="w-full bg-transparent"
                   >
-                    {isPaused ? "Resume" : "Pause"}
+                    Start New Processing
+                  </Button>
+                </>
+              )}
+
+              {isRunning && (
+                <>
+                  <Button onClick={pauseProcessing} variant="outline" className="w-full bg-transparent">
+                    Pause & Save State
                   </Button>
                   <Button onClick={stopProcessing} variant="destructive" className="w-full">
-                    Stop
+                    Stop & Save State
                   </Button>
                 </>
               )}

@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server"
 import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
-import { getPauseState, resetPauseState } from "../pause/route"
+import { getPauseState, setPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 
 interface ProcessingStats {
@@ -23,7 +23,52 @@ interface WorkerResult {
   workerId: number
 }
 
+interface ProcessingState {
+  sessionId: string
+  currentChunk: number
+  totalChunks: number
+  processedFiles: number
+  stats: ProcessingStats
+  outputPath: string
+  chunks: string[][]
+  config: any
+}
+
 const history = new PersistentHistory()
+const PROCESSING_STATE_FILE = path.join(process.cwd(), "chunked_processing_state.json")
+
+// Save processing state
+async function saveProcessingState(state: ProcessingState): Promise<void> {
+  try {
+    await fs.writeFile(PROCESSING_STATE_FILE, JSON.stringify(state, null, 2))
+    console.log(`[Chunked API] Saved processing state for session ${state.sessionId}`)
+  } catch (error) {
+    console.error("[Chunked API] Failed to save processing state:", error)
+  }
+}
+
+// Load processing state
+async function loadProcessingState(): Promise<ProcessingState | null> {
+  try {
+    const data = await fs.readFile(PROCESSING_STATE_FILE, "utf-8")
+    const state = JSON.parse(data)
+    console.log(`[Chunked API] Loaded processing state for session ${state.sessionId}`)
+    return state
+  } catch (error) {
+    console.log("[Chunked API] No saved processing state found")
+    return null
+  }
+}
+
+// Clear processing state
+async function clearProcessingState(): Promise<void> {
+  try {
+    await fs.unlink(PROCESSING_STATE_FILE)
+    console.log("[Chunked API] Cleared processing state file")
+  } catch (error) {
+    // File doesn't exist - that's fine
+  }
+}
 
 export async function POST(request: NextRequest) {
   const encoder = new TextEncoder()
@@ -31,6 +76,7 @@ export async function POST(request: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       let sessionId: string | null = null
+      let processingState: ProcessingState | null = null
 
       try {
         const body = await request.json()
@@ -44,20 +90,14 @@ export async function POST(request: NextRequest) {
           pauseDuration = 0,
           verbose = false,
           filterConfig = null,
+          resumeFromState = false,
         } = body
-
-        // Reset pause state at the start of processing
-        resetPauseState()
-
-        // Create session ID
-        sessionId = `chunked_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
         const sendMessage = (type: string, message: any) => {
           try {
             const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
             controller.enqueue(encoder.encode(`data: ${data}\n\n`))
 
-            // Also log to console if verbose
             if (verbose) {
               console.log(`[Chunked API] ${type.toUpperCase()}: ${JSON.stringify(message)}`)
             }
@@ -66,202 +106,273 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        sendMessage("start", "Starting chunked processing...")
+        // Check if we should resume from saved state
+        const savedState = await loadProcessingState()
+        const pauseState = getPauseState()
 
-        if (verbose) {
-          console.log(`[Chunked API] Configuration:`)
-          console.log(`  - Session ID: ${sessionId}`)
-          console.log(`  - Root Directory: ${rootDir}`)
-          console.log(`  - Output File: ${outputFile}`)
-          console.log(`  - Output Folder: ${outputFolder || "current directory"}`)
-          console.log(`  - Workers: ${numWorkers}`)
-          console.log(`  - Chunk Size: ${chunkSize}`)
-          console.log(`  - Pause Between Chunks: ${pauseBetweenChunks}`)
-          console.log(`  - Pause Duration: ${pauseDuration}s`)
-          console.log(`  - Verbose: ${verbose}`)
-          console.log(`  - Filters Enabled: ${filterConfig?.enabled || false}`)
-        }
+        if (resumeFromState && savedState && (pauseState.isPaused || pauseState.shouldStop)) {
+          // Resume from saved state
+          processingState = savedState
+          sessionId = processingState.sessionId
+          sendMessage(
+            "log",
+            `Resuming from saved state - Session: ${sessionId}, Chunk: ${processingState.currentChunk}/${processingState.totalChunks}`,
+          )
 
-        // Find all XML files
-        const xmlFiles = await findXMLFiles(rootDir)
+          // Reset pause state for resuming
+          setPauseState({
+            isPaused: false,
+            shouldStop: false,
+            pauseRequested: false,
+            stopRequested: false,
+            sessionId,
+          })
+        } else {
+          // Start new processing
+          resetPauseState()
+          sessionId = `chunked_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
-        if (xmlFiles.length === 0) {
-          sendMessage("error", "No XML files found in the specified directory")
-          controller.close()
-          return
-        }
+          sendMessage("start", "Starting chunked processing...")
 
-        const stats: ProcessingStats = {
-          totalFiles: xmlFiles.length,
-          processedFiles: 0,
-          successfulFiles: 0,
-          errorFiles: 0,
-          recordsWritten: 0,
-          filteredFiles: 0,
-          movedFiles: 0,
-        }
-
-        // Determine output path - FIXED: Use full path including output folder
-        const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
-
-        // Create initial session record
-        const session = {
-          id: sessionId,
-          startTime: new Date().toISOString(),
-          status: "running" as const,
-          config: {
-            rootDir,
-            outputFile: outputPath, // Store full path in session
-            numWorkers,
-            verbose,
-            filterConfig,
-            processingMode: "chunked",
-          },
-          progress: {
-            totalFiles: stats.totalFiles,
-            processedFiles: 0,
-            successCount: 0,
-            errorCount: 0,
-            processedFilesList: [] as string[],
-          },
-        }
-
-        // Save initial session
-        await history.addSession(session)
-        await history.setCurrentSession(session)
-
-        if (verbose) {
-          console.log(`[Chunked API] Created session: ${sessionId}`)
-          console.log(`[Chunked API] Output path: ${outputPath}`)
-        }
-
-        // Calculate chunks
-        const chunks = []
-        for (let i = 0; i < xmlFiles.length; i += chunkSize) {
-          chunks.push(xmlFiles.slice(i, i + chunkSize))
-        }
-
-        sendMessage("log", `Processing ${xmlFiles.length} files in ${chunks.length} chunks of ${chunkSize}`)
-
-        if (verbose) {
-          console.log(`[Chunked API] Created ${chunks.length} chunks from ${xmlFiles.length} files`)
-          if (pauseBetweenChunks) {
-            console.log(`[Chunked API] Will pause ${pauseDuration}s between each chunk`)
-          }
-        }
-
-        // Ensure output directory exists
-        if (outputFolder) {
-          await fs.mkdir(outputFolder, { recursive: true })
           if (verbose) {
-            console.log(`[Chunked API] Created output directory: ${outputFolder}`)
+            console.log(`[Chunked API] Configuration:`)
+            console.log(`  - Session ID: ${sessionId}`)
+            console.log(`  - Root Directory: ${rootDir}`)
+            console.log(`  - Output File: ${outputFile}`)
+            console.log(`  - Output Folder: ${outputFolder || "current directory"}`)
+            console.log(`  - Workers: ${numWorkers}`)
+            console.log(`  - Chunk Size: ${chunkSize}`)
+            console.log(`  - Pause Between Chunks: ${pauseBetweenChunks}`)
+            console.log(`  - Pause Duration: ${pauseDuration}s`)
+            console.log(`  - Verbose: ${verbose}`)
+            console.log(`  - Filters Enabled: ${filterConfig?.enabled || false}`)
+          }
+
+          // Find all XML files
+          const xmlFiles = await findXMLFiles(rootDir)
+
+          if (xmlFiles.length === 0) {
+            sendMessage("error", "No XML files found in the specified directory")
+            controller.close()
+            return
+          }
+
+          const stats: ProcessingStats = {
+            totalFiles: xmlFiles.length,
+            processedFiles: 0,
+            successfulFiles: 0,
+            errorFiles: 0,
+            recordsWritten: 0,
+            filteredFiles: 0,
+            movedFiles: 0,
+          }
+
+          // Determine output path
+          const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
+
+          // Calculate chunks
+          const chunks = []
+          for (let i = 0; i < xmlFiles.length; i += chunkSize) {
+            chunks.push(xmlFiles.slice(i, i + chunkSize))
+          }
+
+          // Create processing state
+          processingState = {
+            sessionId,
+            currentChunk: 0,
+            totalChunks: chunks.length,
+            processedFiles: 0,
+            stats,
+            outputPath,
+            chunks,
+            config: {
+              rootDir,
+              outputFile,
+              outputFolder,
+              numWorkers,
+              chunkSize,
+              pauseBetweenChunks,
+              pauseDuration,
+              verbose,
+              filterConfig,
+            },
+          }
+
+          // Create initial session record
+          const session = {
+            id: sessionId,
+            startTime: new Date().toISOString(),
+            status: "running" as const,
+            config: {
+              rootDir,
+              outputFile: outputPath,
+              numWorkers,
+              verbose,
+              filterConfig,
+              processingMode: "chunked",
+            },
+            progress: {
+              totalFiles: stats.totalFiles,
+              processedFiles: 0,
+              successCount: 0,
+              errorCount: 0,
+              processedFilesList: [] as string[],
+            },
+          }
+
+          await history.addSession(session)
+          await history.setCurrentSession(session)
+
+          sendMessage("log", `Processing ${xmlFiles.length} files in ${chunks.length} chunks of ${chunkSize}`)
+
+          // Ensure output directory exists
+          if (outputFolder) {
+            await fs.mkdir(outputFolder, { recursive: true })
+            if (verbose) {
+              console.log(`[Chunked API] Created output directory: ${outputFolder}`)
+            }
+          }
+
+          // Initialize CSV file with headers (only for new processing)
+          const headers =
+            [
+              "city",
+              "year",
+              "month",
+              "newsItemId",
+              "dateId",
+              "providerId",
+              "headline",
+              "byline",
+              "dateline",
+              "creditline",
+              "copyrightLine",
+              "slugline",
+              "keywords",
+              "edition",
+              "location",
+              "country",
+              "city_meta",
+              "pageNumber",
+              "status",
+              "urgency",
+              "language",
+              "subject",
+              "processed",
+              "published",
+              "usageType",
+              "rightsHolder",
+              "imageWidth",
+              "imageHeight",
+              "imageSize",
+              "actualFileSize",
+              "imageHref",
+              "xmlPath",
+              "imagePath",
+              "imageExists",
+              "creationDate",
+              "revisionDate",
+              "commentData",
+            ].join(",") + "\n"
+
+          await fs.writeFile(outputPath, headers, "utf8")
+
+          if (verbose) {
+            console.log(`[Chunked API] Initialized CSV file: ${outputPath}`)
           }
         }
 
-        // Initialize CSV file with headers
-        const headers =
-          [
-            "city",
-            "year",
-            "month",
-            "newsItemId",
-            "dateId",
-            "providerId",
-            "headline",
-            "byline",
-            "dateline",
-            "creditline",
-            "copyrightLine",
-            "slugline",
-            "keywords",
-            "edition",
-            "location",
-            "country",
-            "city_meta",
-            "pageNumber",
-            "status",
-            "urgency",
-            "language",
-            "subject",
-            "processed",
-            "published",
-            "usageType",
-            "rightsHolder",
-            "imageWidth",
-            "imageHeight",
-            "imageSize",
-            "actualFileSize",
-            "imageHref",
-            "xmlPath",
-            "imagePath",
-            "imageExists",
-            "creationDate",
-            "revisionDate",
-            "commentData",
-          ].join(",") + "\n"
+        // Save initial processing state
+        await saveProcessingState(processingState)
 
-        await fs.writeFile(outputPath, headers, "utf8")
-
-        if (verbose) {
-          console.log(`[Chunked API] Initialized CSV file: ${outputPath}`)
-        }
-
-        // Process chunks
+        // Process chunks starting from current chunk
         let wasInterrupted = false
+        const startChunk = processingState.currentChunk
 
-        for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+        for (let chunkIndex = startChunk; chunkIndex < processingState.totalChunks; chunkIndex++) {
           const currentChunkNumber = chunkIndex + 1
 
           if (verbose) {
-            console.log(`[Chunked API] Starting chunk ${currentChunkNumber}/${chunks.length}`)
+            console.log(`[Chunked API] Starting chunk ${currentChunkNumber}/${processingState.totalChunks}`)
           }
 
-          // Check for pause/stop using the global pause state - FIXED: Check more frequently
-          const pauseState = getPauseState()
-          if (pauseState.shouldStop) {
+          // Update current chunk in processing state
+          processingState.currentChunk = chunkIndex
+          await saveProcessingState(processingState)
+
+          // Check for pause/stop using the global pause state
+          const currentPauseState = getPauseState()
+          if (currentPauseState.shouldStop) {
             if (verbose) {
-              console.log(`[Chunked API] Stop requested, terminating processing`)
+              console.log(`[Chunked API] Stop requested, saving state and terminating`)
             }
             wasInterrupted = true
+
+            // Update pause state with current progress
+            setPauseState({
+              sessionId,
+              currentChunk: chunkIndex,
+              processedFiles: processingState.stats.processedFiles,
+            })
+
             sendMessage("shutdown", {
               reason: "Processing stopped by user",
-              stats,
-              outputFile: outputPath,
+              stats: processingState.stats,
+              outputFile: processingState.outputPath,
+              canResume: true,
+              currentChunk: chunkIndex,
+              totalChunks: processingState.totalChunks,
             })
             break
           }
 
-          if (pauseState.isPaused) {
+          if (currentPauseState.isPaused) {
             if (verbose) {
-              console.log(`[Chunked API] Pause requested, waiting for resume`)
+              console.log(`[Chunked API] Pause requested, saving state and waiting for resume`)
             }
-            sendMessage("paused", "Processing paused - waiting for resume...")
+
+            // Update pause state with current progress
+            setPauseState({
+              sessionId,
+              currentChunk: chunkIndex,
+              processedFiles: processingState.stats.processedFiles,
+            })
+
+            sendMessage("paused", {
+              message: "Processing paused - state saved for resume",
+              canResume: true,
+              currentChunk: chunkIndex,
+              totalChunks: processingState.totalChunks,
+            })
 
             // Update session status to paused
             await history.updateSession(sessionId, {
               status: "paused",
               progress: {
-                totalFiles: stats.totalFiles,
-                processedFiles: stats.processedFiles,
-                successCount: stats.successfulFiles,
-                errorCount: stats.errorFiles,
+                totalFiles: processingState.stats.totalFiles,
+                processedFiles: processingState.stats.processedFiles,
+                successCount: processingState.stats.successfulFiles,
+                errorCount: processingState.stats.errorFiles,
               },
             })
 
-            // Wait for resume - FIXED: Check more frequently
+            // Wait for resume with frequent checks
             while (getPauseState().isPaused && !getPauseState().shouldStop) {
-              await new Promise((resolve) => setTimeout(resolve, 500)) // Check every 500ms instead of 1000ms
+              await new Promise((resolve) => setTimeout(resolve, 200))
             }
 
             if (getPauseState().shouldStop) {
               if (verbose) {
-                console.log(`[Chunked API] Stop requested while paused, terminating processing`)
+                console.log(`[Chunked API] Stop requested while paused, saving state and terminating`)
               }
               wasInterrupted = true
               sendMessage("shutdown", {
                 reason: "Processing stopped while paused",
-                stats,
-                outputFile: outputPath,
+                stats: processingState.stats,
+                outputFile: processingState.outputPath,
+                canResume: true,
+                currentChunk: chunkIndex,
+                totalChunks: processingState.totalChunks,
               })
               break
             }
@@ -272,35 +383,30 @@ export async function POST(request: NextRequest) {
             })
 
             if (verbose) {
-              console.log(`[Chunked API] Processing resumed`)
+              console.log(`[Chunked API] Processing resumed from chunk ${currentChunkNumber}`)
             }
-            sendMessage("log", "Processing resumed")
+            sendMessage("log", `Processing resumed from chunk ${currentChunkNumber}`)
           }
 
-          const chunk = chunks[chunkIndex]
+          const chunk = processingState.chunks[chunkIndex]
           sendMessage("chunk_start", {
             chunkNumber: currentChunkNumber,
-            totalChunks: chunks.length,
+            totalChunks: processingState.totalChunks,
             chunkSize: chunk.length,
           })
 
-          // Process chunk
+          // Process chunk with frequent pause/stop checks
           const activeWorkers = new Set<Worker>()
-          const batchSize = Math.min(numWorkers, chunk.length)
+          const batchSize = Math.min(processingState.config.numWorkers, chunk.length)
 
           for (let i = 0; i < chunk.length; i += batchSize) {
-            // FIXED: Check pause/stop before each batch
-            const currentPauseState = getPauseState()
-            if (currentPauseState.shouldStop) {
+            // Check pause/stop before each batch
+            const batchPauseState = getPauseState()
+            if (batchPauseState.shouldStop || batchPauseState.isPaused) {
               if (verbose) {
-                console.log(`[Chunked API] Stop requested during batch processing, terminating`)
+                console.log(`[Chunked API] Pause/Stop requested during batch processing`)
               }
-              wasInterrupted = true
-              sendMessage("shutdown", {
-                reason: "Processing stopped during batch processing",
-                stats,
-                outputFile: outputPath,
-              })
+
               // Cleanup workers
               for (const worker of activeWorkers) {
                 try {
@@ -312,60 +418,52 @@ export async function POST(request: NextRequest) {
                 }
               }
               activeWorkers.clear()
-              controller.close()
-              return
-            }
 
-            if (currentPauseState.isPaused) {
-              if (verbose) {
-                console.log(`[Chunked API] Pause requested during batch processing`)
-              }
-              sendMessage("paused", "Processing paused during batch - waiting for resume...")
-
-              // Wait for resume
-              while (getPauseState().isPaused && !getPauseState().shouldStop) {
-                await new Promise((resolve) => setTimeout(resolve, 500))
-              }
-
-              if (getPauseState().shouldStop) {
+              if (batchPauseState.shouldStop) {
                 wasInterrupted = true
                 sendMessage("shutdown", {
-                  reason: "Processing stopped while paused during batch",
-                  stats,
-                  outputFile: outputPath,
+                  reason: "Processing stopped during batch processing",
+                  stats: processingState.stats,
+                  outputFile: processingState.outputPath,
+                  canResume: true,
+                  currentChunk: chunkIndex,
+                  totalChunks: processingState.totalChunks,
                 })
-                // Cleanup workers
-                for (const worker of activeWorkers) {
-                  try {
-                    worker.terminate()
-                  } catch (error) {
-                    if (verbose) {
-                      console.error("[Chunked API] Error terminating worker:", error)
-                    }
-                  }
-                }
-                activeWorkers.clear()
+                controller.close()
+                return
+              } else {
+                sendMessage("paused", {
+                  message: "Processing paused during batch - state saved",
+                  canResume: true,
+                  currentChunk: chunkIndex,
+                  totalChunks: processingState.totalChunks,
+                })
                 controller.close()
                 return
               }
-
-              sendMessage("log", "Processing resumed during batch")
             }
 
             const batch = chunk.slice(i, i + batchSize)
             const batchPromises = batch.map((xmlFile, index) =>
-              processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, i + index + 1),
+              processFile(
+                xmlFile,
+                processingState.config.filterConfig,
+                verbose,
+                activeWorkers,
+                processingState.config.rootDir,
+                i + index + 1,
+              ),
             )
 
             try {
               const batchResults = await Promise.all(batchPromises)
 
               for (const result of batchResults) {
-                stats.processedFiles++
+                processingState.stats.processedFiles++
 
                 if (result.record) {
-                  stats.successfulFiles++
-                  stats.recordsWritten++
+                  processingState.stats.successfulFiles++
+                  processingState.stats.recordsWritten++
 
                   // Append to CSV file
                   const csvLine =
@@ -378,9 +476,9 @@ export async function POST(request: NextRequest) {
                       )
                       .join(",") + "\n"
 
-                  await fs.appendFile(outputPath, csvLine, "utf8")
+                  await fs.appendFile(processingState.outputPath, csvLine, "utf8")
                 } else {
-                  stats.errorFiles++
+                  processingState.stats.errorFiles++
                   if (verbose && result.error) {
                     console.log(`[Chunked API] Error processing file: ${result.error}`)
                     sendMessage("log", `Error processing file: ${result.error}`)
@@ -388,22 +486,24 @@ export async function POST(request: NextRequest) {
                 }
 
                 if (!result.passedFilter) {
-                  stats.filteredFiles++
+                  processingState.stats.filteredFiles++
                 }
 
                 if (result.imageMoved) {
-                  stats.movedFiles++
+                  processingState.stats.movedFiles++
                 }
               }
 
-              // Update session progress periodically
-              if (stats.processedFiles % 50 === 0 || stats.processedFiles === stats.totalFiles) {
+              // Update processing state and session progress
+              await saveProcessingState(processingState)
+
+              if (processingState.stats.processedFiles % 50 === 0) {
                 await history.updateSession(sessionId, {
                   progress: {
-                    totalFiles: stats.totalFiles,
-                    processedFiles: stats.processedFiles,
-                    successCount: stats.successfulFiles,
-                    errorCount: stats.errorFiles,
+                    totalFiles: processingState.stats.totalFiles,
+                    processedFiles: processingState.stats.processedFiles,
+                    successCount: processingState.stats.successfulFiles,
+                    errorCount: processingState.stats.errorFiles,
                   },
                 })
               }
@@ -413,8 +513,8 @@ export async function POST(request: NextRequest) {
                 console.error(`[Chunked API] ${errorMsg}`)
               }
               sendMessage("error", errorMsg)
-              stats.errorFiles += batch.length
-              stats.processedFiles += batch.length
+              processingState.stats.errorFiles += batch.length
+              processingState.stats.processedFiles += batch.length
             }
           }
 
@@ -432,87 +532,63 @@ export async function POST(request: NextRequest) {
 
           sendMessage("chunk_complete", {
             chunkNumber: currentChunkNumber,
-            totalChunks: chunks.length,
+            totalChunks: processingState.totalChunks,
           })
 
           // Send progress update
-          const percentage = Math.round((stats.processedFiles / stats.totalFiles) * 100)
+          const percentage = Math.round((processingState.stats.processedFiles / processingState.stats.totalFiles) * 100)
           sendMessage("progress", {
             percentage,
-            total: stats.totalFiles,
-            processed: stats.processedFiles,
-            successful: stats.successfulFiles,
-            errors: stats.errorFiles,
-            filtered: stats.filteredFiles,
-            moved: stats.movedFiles,
+            total: processingState.stats.totalFiles,
+            processed: processingState.stats.processedFiles,
+            successful: processingState.stats.successfulFiles,
+            errors: processingState.stats.errorFiles,
+            filtered: processingState.stats.filteredFiles,
+            moved: processingState.stats.movedFiles,
           })
 
           if (verbose) {
-            console.log(`[Chunked API] Chunk ${currentChunkNumber}/${chunks.length} completed`)
-            console.log(`[Chunked API] Progress: ${stats.processedFiles}/${stats.totalFiles} (${percentage}%)`)
+            console.log(`[Chunked API] Chunk ${currentChunkNumber}/${processingState.totalChunks} completed`)
             console.log(
-              `[Chunked API] Success: ${stats.successfulFiles}, Errors: ${stats.errorFiles}, Filtered: ${stats.filteredFiles}, Moved: ${stats.movedFiles}`,
+              `[Chunked API] Progress: ${processingState.stats.processedFiles}/${processingState.stats.totalFiles} (${percentage}%)`,
             )
           }
 
           // Pause between chunks if configured
-          if (pauseBetweenChunks && pauseDuration > 0 && chunkIndex < chunks.length - 1) {
+          if (
+            processingState.config.pauseBetweenChunks &&
+            processingState.config.pauseDuration > 0 &&
+            chunkIndex < processingState.totalChunks - 1
+          ) {
             sendMessage("pause_start", {
-              duration: pauseDuration,
-              message: `Pausing for ${pauseDuration} seconds before next chunk...`,
+              duration: processingState.config.pauseDuration,
+              message: `Pausing for ${processingState.config.pauseDuration} seconds before next chunk...`,
             })
 
-            if (verbose) {
-              console.log(`[Chunked API] Pausing for ${pauseDuration} seconds before next chunk...`)
-            }
-
-            for (let countdown = pauseDuration; countdown > 0; countdown--) {
-              // Check for stop/pause during countdown - FIXED: Check more frequently
+            for (let countdown = processingState.config.pauseDuration; countdown > 0; countdown--) {
+              // Check for stop/pause during countdown
               const countdownPauseState = getPauseState()
-              if (countdownPauseState.shouldStop) {
-                if (verbose) {
-                  console.log(`[Chunked API] Stop requested during chunk pause countdown, terminating`)
-                }
-                wasInterrupted = true
-                sendMessage("shutdown", {
-                  reason: "Processing stopped during chunk pause",
-                  stats,
-                  outputFile: outputPath,
-                })
-                controller.close()
-                return
-              }
-
-              if (countdownPauseState.isPaused) {
-                if (verbose) {
-                  console.log(`[Chunked API] Manual pause requested during chunk pause countdown`)
-                }
-                sendMessage("paused", "Processing paused during chunk countdown - waiting for resume...")
-
-                // Wait for resume
-                while (getPauseState().isPaused && !getPauseState().shouldStop) {
-                  await new Promise((resolve) => setTimeout(resolve, 500))
-                }
-
-                if (getPauseState().shouldStop) {
-                  if (verbose) {
-                    console.log(`[Chunked API] Stop requested while paused during countdown, terminating`)
-                  }
+              if (countdownPauseState.shouldStop || countdownPauseState.isPaused) {
+                if (countdownPauseState.shouldStop) {
                   wasInterrupted = true
                   sendMessage("shutdown", {
-                    reason: "Processing stopped while paused during countdown",
-                    stats,
-                    outputFile: outputPath,
+                    reason: "Processing stopped during chunk pause",
+                    stats: processingState.stats,
+                    outputFile: processingState.outputPath,
+                    canResume: true,
+                    currentChunk: chunkIndex + 1,
+                    totalChunks: processingState.totalChunks,
                   })
-                  controller.close()
-                  return
+                } else {
+                  sendMessage("paused", {
+                    message: "Processing paused during chunk countdown",
+                    canResume: true,
+                    currentChunk: chunkIndex + 1,
+                    totalChunks: processingState.totalChunks,
+                  })
                 }
-
-                if (verbose) {
-                  console.log(`[Chunked API] Processing resumed during countdown`)
-                }
-                sendMessage("log", "Processing resumed during countdown")
-                // Continue with the countdown
+                controller.close()
+                return
               }
 
               sendMessage("pause_countdown", {
@@ -520,64 +596,68 @@ export async function POST(request: NextRequest) {
                 message: `Resuming in ${countdown} seconds...`,
               })
 
-              if (verbose && countdown % 5 === 0) {
-                // Log every 5 seconds to avoid spam
-                console.log(`[Chunked API] Resuming in ${countdown} seconds...`)
-              }
-
               await new Promise((resolve) => setTimeout(resolve, 1000))
             }
 
             sendMessage("pause_end", "Resuming processing...")
-
-            if (verbose) {
-              console.log(`[Chunked API] Pause completed, resuming processing...`)
-            }
           }
         }
 
-        // Update final session status
-        const finalStatus = wasInterrupted ? "interrupted" : "completed"
-        const endTime = new Date().toISOString()
+        // Processing completed successfully
+        if (!wasInterrupted) {
+          // Clear processing state file
+          await clearProcessingState()
 
-        await history.updateSession(sessionId, {
-          status: finalStatus,
-          endTime,
-          progress: {
-            totalFiles: stats.totalFiles,
-            processedFiles: stats.processedFiles,
-            successCount: stats.successfulFiles,
-            errorCount: stats.errorFiles,
-          },
-          results: {
-            outputPath,
-          },
-        })
+          // Update final session status
+          const endTime = new Date().toISOString()
+          await history.updateSession(sessionId, {
+            status: "completed",
+            endTime,
+            progress: {
+              totalFiles: processingState.stats.totalFiles,
+              processedFiles: processingState.stats.processedFiles,
+              successCount: processingState.stats.successfulFiles,
+              errorCount: processingState.stats.errorFiles,
+            },
+            results: {
+              outputPath: processingState.outputPath,
+            },
+          })
 
-        // Clear current session
-        await history.setCurrentSession(null)
+          // Clear current session and pause state
+          await history.setCurrentSession(null)
+          resetPauseState()
 
-        // Send completion message
-        const finalPauseState = getPauseState()
-        if (!finalPauseState.shouldStop && !wasInterrupted) {
-          const completionMessage = `Chunked processing completed! Processed ${stats.processedFiles} files, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`
+          const completionMessage = `Chunked processing completed! Processed ${processingState.stats.processedFiles} files, ${processingState.stats.successfulFiles} successful, ${processingState.stats.errorFiles} errors.`
 
           if (verbose) {
             console.log(`[Chunked API] ${completionMessage}`)
-            console.log(`[Chunked API] Final stats:`, stats)
-            console.log(`[Chunked API] Output file: ${outputPath}`)
             console.log(`[Chunked API] Session ${sessionId} completed successfully`)
           }
 
           sendMessage("complete", {
-            stats,
-            outputFile: outputPath,
+            stats: processingState.stats,
+            outputFile: processingState.outputPath,
             message: completionMessage,
+          })
+        } else {
+          // Update session as interrupted
+          await history.updateSession(sessionId, {
+            status: "interrupted",
+            progress: {
+              totalFiles: processingState.stats.totalFiles,
+              processedFiles: processingState.stats.processedFiles,
+              successCount: processingState.stats.successfulFiles,
+              errorCount: processingState.stats.errorFiles,
+            },
           })
         }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
         console.error("[Chunked API] Fatal error:", errorMessage)
+
+        // Clear processing state on error
+        await clearProcessingState()
 
         // Update session with error status
         if (sessionId) {
@@ -587,6 +667,8 @@ export async function POST(request: NextRequest) {
           })
           await history.setCurrentSession(null)
         }
+
+        resetPauseState()
 
         try {
           const data = JSON.stringify({
@@ -628,12 +710,12 @@ async function processFile(
   return new Promise((resolve) => {
     // Check for pause/stop before creating worker
     const pauseState = getPauseState()
-    if (pauseState.shouldStop) {
+    if (pauseState.shouldStop || pauseState.isPaused) {
       resolve({
         record: null,
         passedFilter: false,
         imageMoved: false,
-        error: "Processing stopped by user",
+        error: "Processing stopped/paused by user",
         workerId,
       })
       return
@@ -676,7 +758,7 @@ async function processFile(
       } catch (error) {
         console.error("Error during worker timeout:", error)
       }
-    }, 30000) // 30 second timeout
+    }, 30000)
 
     worker.on("message", (result: WorkerResult) => {
       try {
