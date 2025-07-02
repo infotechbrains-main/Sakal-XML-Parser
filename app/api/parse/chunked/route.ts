@@ -2,27 +2,7 @@ import type { NextRequest } from "next/server"
 import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
-
-// Global pause state - moved inline to avoid import issues
-let globalPauseState = {
-  isPaused: false,
-  shouldStop: false,
-  pauseRequested: false,
-  stopRequested: false,
-}
-
-function getPauseState() {
-  return globalPauseState
-}
-
-function resetPauseState() {
-  globalPauseState = {
-    isPaused: false,
-    shouldStop: false,
-    pauseRequested: false,
-    stopRequested: false,
-  }
-}
+import { getPauseState } from "../pause/route"
 
 interface ProcessingStats {
   totalFiles: number
@@ -55,14 +35,11 @@ export async function POST(request: NextRequest) {
           outputFolder = "",
           numWorkers = 4,
           chunkSize = 100,
-          pauseBetweenChunks = false, // This should be a boolean
-          pauseDuration = 0, // This should be the actual duration in seconds
+          pauseBetweenChunks = false,
+          pauseDuration = 0,
           verbose = false,
           filterConfig = null,
         } = body
-
-        // Reset pause state at start
-        resetPauseState()
 
         const sendMessage = (type: string, message: any) => {
           try {
@@ -194,9 +171,12 @@ export async function POST(request: NextRequest) {
             console.log(`[Chunked API] Starting chunk ${currentChunkNumber}/${chunks.length}`)
           }
 
-          // Check for pause/stop
+          // Check for pause/stop using the global pause state
           const pauseState = getPauseState()
           if (pauseState.shouldStop) {
+            if (verbose) {
+              console.log(`[Chunked API] Stop requested, terminating processing`)
+            }
             sendMessage("shutdown", {
               reason: "Processing stopped by user",
               stats,
@@ -206,6 +186,9 @@ export async function POST(request: NextRequest) {
           }
 
           if (pauseState.isPaused) {
+            if (verbose) {
+              console.log(`[Chunked API] Pause requested, waiting for resume`)
+            }
             sendMessage("paused", "Processing paused - waiting for resume...")
 
             // Wait for resume
@@ -214,6 +197,9 @@ export async function POST(request: NextRequest) {
             }
 
             if (getPauseState().shouldStop) {
+              if (verbose) {
+                console.log(`[Chunked API] Stop requested while paused, terminating processing`)
+              }
               sendMessage("shutdown", {
                 reason: "Processing stopped while paused",
                 stats,
@@ -222,6 +208,9 @@ export async function POST(request: NextRequest) {
               break
             }
 
+            if (verbose) {
+              console.log(`[Chunked API] Processing resumed`)
+            }
             sendMessage("log", "Processing resumed")
           }
 
@@ -289,6 +278,32 @@ export async function POST(request: NextRequest) {
               stats.errorFiles += batch.length
               stats.processedFiles += batch.length
             }
+
+            // Check for pause/stop during batch processing
+            const currentPauseState = getPauseState()
+            if (currentPauseState.shouldStop) {
+              if (verbose) {
+                console.log(`[Chunked API] Stop requested during batch processing, terminating`)
+              }
+              sendMessage("shutdown", {
+                reason: "Processing stopped during batch processing",
+                stats,
+                outputFile: outputPath,
+              })
+              // Cleanup workers
+              for (const worker of activeWorkers) {
+                try {
+                  worker.terminate()
+                } catch (error) {
+                  if (verbose) {
+                    console.error("[Chunked API] Error terminating worker:", error)
+                  }
+                }
+              }
+              activeWorkers.clear()
+              controller.close()
+              return
+            }
           }
 
           // Cleanup workers
@@ -340,6 +355,52 @@ export async function POST(request: NextRequest) {
             }
 
             for (let countdown = pauseDuration; countdown > 0; countdown--) {
+              // Check for stop/pause during countdown
+              const countdownPauseState = getPauseState()
+              if (countdownPauseState.shouldStop) {
+                if (verbose) {
+                  console.log(`[Chunked API] Stop requested during chunk pause countdown, terminating`)
+                }
+                sendMessage("shutdown", {
+                  reason: "Processing stopped during chunk pause",
+                  stats,
+                  outputFile: outputPath,
+                })
+                controller.close()
+                return
+              }
+
+              if (countdownPauseState.isPaused) {
+                if (verbose) {
+                  console.log(`[Chunked API] Manual pause requested during chunk pause countdown`)
+                }
+                sendMessage("paused", "Processing paused during chunk countdown - waiting for resume...")
+
+                // Wait for resume
+                while (getPauseState().isPaused && !getPauseState().shouldStop) {
+                  await new Promise((resolve) => setTimeout(resolve, 1000))
+                }
+
+                if (getPauseState().shouldStop) {
+                  if (verbose) {
+                    console.log(`[Chunked API] Stop requested while paused during countdown, terminating`)
+                  }
+                  sendMessage("shutdown", {
+                    reason: "Processing stopped while paused during countdown",
+                    stats,
+                    outputFile: outputPath,
+                  })
+                  controller.close()
+                  return
+                }
+
+                if (verbose) {
+                  console.log(`[Chunked API] Processing resumed during countdown`)
+                }
+                sendMessage("log", "Processing resumed during countdown")
+                // Continue with the countdown
+              }
+
               sendMessage("pause_countdown", {
                 remaining: countdown,
                 message: `Resuming in ${countdown} seconds...`,
@@ -351,17 +412,6 @@ export async function POST(request: NextRequest) {
               }
 
               await new Promise((resolve) => setTimeout(resolve, 1000))
-
-              // Check for stop during pause
-              if (getPauseState().shouldStop) {
-                sendMessage("shutdown", {
-                  reason: "Processing stopped during chunk pause",
-                  stats,
-                  outputFile: outputPath,
-                })
-                controller.close()
-                return
-              }
             }
 
             sendMessage("pause_end", "Resuming processing...")
@@ -373,7 +423,8 @@ export async function POST(request: NextRequest) {
         }
 
         // Send completion message
-        if (!getPauseState().shouldStop) {
+        const finalPauseState = getPauseState()
+        if (!finalPauseState.shouldStop) {
           const completionMessage = `Chunked processing completed! Processed ${stats.processedFiles} files, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`
 
           if (verbose) {
