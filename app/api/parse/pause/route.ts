@@ -16,13 +16,27 @@ let pauseState: PauseState = {
   stopRequested: false,
 }
 
-function resetPauseState() {
+// Export the functions that are used by other routes
+export function getPauseState(): PauseState {
+  return { ...pauseState }
+}
+
+export function resetPauseState() {
   pauseState = {
     isPaused: false,
     pauseRequested: false,
     shouldStop: false,
     stopRequested: false,
   }
+  console.log("[Pause API] State reset")
+}
+
+export function setPauseState(newState: Partial<PauseState>): void {
+  pauseState = {
+    ...pauseState,
+    ...newState,
+  }
+  console.log("[Pause API] State updated:", pauseState)
 }
 
 interface ProcessingConfig {
@@ -65,8 +79,10 @@ export async function POST(request: NextRequest) {
     const { action, config } = body
 
     if (action === "pause") {
-      pauseState.isPaused = true
-      pauseState.pauseRequested = true
+      setPauseState({
+        isPaused: true,
+        pauseRequested: true,
+      })
 
       if (config) {
         await saveProcessingConfig(config)
@@ -77,8 +93,10 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === "stop") {
-      pauseState.shouldStop = true
-      pauseState.stopRequested = true
+      setPauseState({
+        shouldStop: true,
+        stopRequested: true,
+      })
 
       if (config) {
         await saveProcessingConfig(config)
