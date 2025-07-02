@@ -55,7 +55,8 @@ export async function POST(request: NextRequest) {
           outputFolder = "",
           numWorkers = 4,
           chunkSize = 100,
-          pauseBetweenChunks = 0,
+          pauseBetweenChunks = false, // This should be a boolean
+          pauseDuration = 0, // This should be the actual duration in seconds
           verbose = false,
           filterConfig = null,
         } = body
@@ -67,12 +68,30 @@ export async function POST(request: NextRequest) {
           try {
             const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
             controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+
+            // Also log to console if verbose
+            if (verbose) {
+              console.log(`[Chunked API] ${type.toUpperCase()}: ${JSON.stringify(message)}`)
+            }
           } catch (error) {
             console.error("Error sending message:", error)
           }
         }
 
         sendMessage("start", "Starting chunked processing...")
+
+        if (verbose) {
+          console.log(`[Chunked API] Configuration:`)
+          console.log(`  - Root Directory: ${rootDir}`)
+          console.log(`  - Output File: ${outputFile}`)
+          console.log(`  - Output Folder: ${outputFolder || "current directory"}`)
+          console.log(`  - Workers: ${numWorkers}`)
+          console.log(`  - Chunk Size: ${chunkSize}`)
+          console.log(`  - Pause Between Chunks: ${pauseBetweenChunks}`)
+          console.log(`  - Pause Duration: ${pauseDuration}s`)
+          console.log(`  - Verbose: ${verbose}`)
+          console.log(`  - Filters Enabled: ${filterConfig?.enabled || false}`)
+        }
 
         // Find all XML files
         const xmlFiles = await findXMLFiles(rootDir)
@@ -101,12 +120,22 @@ export async function POST(request: NextRequest) {
 
         sendMessage("log", `Processing ${xmlFiles.length} files in ${chunks.length} chunks of ${chunkSize}`)
 
+        if (verbose) {
+          console.log(`[Chunked API] Created ${chunks.length} chunks from ${xmlFiles.length} files`)
+          if (pauseBetweenChunks) {
+            console.log(`[Chunked API] Will pause ${pauseDuration}s between each chunk`)
+          }
+        }
+
         // Determine output path
         const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
 
         // Ensure output directory exists
         if (outputFolder) {
           await fs.mkdir(outputFolder, { recursive: true })
+          if (verbose) {
+            console.log(`[Chunked API] Created output directory: ${outputFolder}`)
+          }
         }
 
         // Initialize CSV file with headers
@@ -153,8 +182,18 @@ export async function POST(request: NextRequest) {
 
         await fs.writeFile(outputPath, headers, "utf8")
 
+        if (verbose) {
+          console.log(`[Chunked API] Initialized CSV file: ${outputPath}`)
+        }
+
         // Process chunks
         for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+          const currentChunkNumber = chunkIndex + 1
+
+          if (verbose) {
+            console.log(`[Chunked API] Starting chunk ${currentChunkNumber}/${chunks.length}`)
+          }
+
           // Check for pause/stop
           const pauseState = getPauseState()
           if (pauseState.shouldStop) {
@@ -188,7 +227,7 @@ export async function POST(request: NextRequest) {
 
           const chunk = chunks[chunkIndex]
           sendMessage("chunk_start", {
-            chunkNumber: chunkIndex + 1,
+            chunkNumber: currentChunkNumber,
             totalChunks: chunks.length,
             chunkSize: chunk.length,
           })
@@ -228,6 +267,7 @@ export async function POST(request: NextRequest) {
                 } else {
                   stats.errorFiles++
                   if (verbose && result.error) {
+                    console.log(`[Chunked API] Error processing file: ${result.error}`)
                     sendMessage("log", `Error processing file: ${result.error}`)
                   }
                 }
@@ -241,10 +281,11 @@ export async function POST(request: NextRequest) {
                 }
               }
             } catch (error) {
-              sendMessage(
-                "error",
-                `Batch processing error: ${error instanceof Error ? error.message : "Unknown error"}`,
-              )
+              const errorMsg = `Batch processing error: ${error instanceof Error ? error.message : "Unknown error"}`
+              if (verbose) {
+                console.error(`[Chunked API] ${errorMsg}`)
+              }
+              sendMessage("error", errorMsg)
               stats.errorFiles += batch.length
               stats.processedFiles += batch.length
             }
@@ -255,13 +296,15 @@ export async function POST(request: NextRequest) {
             try {
               worker.terminate()
             } catch (error) {
-              console.error("Error terminating worker:", error)
+              if (verbose) {
+                console.error("[Chunked API] Error terminating worker:", error)
+              }
             }
           }
           activeWorkers.clear()
 
           sendMessage("chunk_complete", {
-            chunkNumber: chunkIndex + 1,
+            chunkNumber: currentChunkNumber,
             totalChunks: chunks.length,
           })
 
@@ -277,18 +320,36 @@ export async function POST(request: NextRequest) {
             moved: stats.movedFiles,
           })
 
+          if (verbose) {
+            console.log(`[Chunked API] Chunk ${currentChunkNumber}/${chunks.length} completed`)
+            console.log(`[Chunked API] Progress: ${stats.processedFiles}/${stats.totalFiles} (${percentage}%)`)
+            console.log(
+              `[Chunked API] Success: ${stats.successfulFiles}, Errors: ${stats.errorFiles}, Filtered: ${stats.filteredFiles}, Moved: ${stats.movedFiles}`,
+            )
+          }
+
           // Pause between chunks if configured
-          if (pauseBetweenChunks > 0 && chunkIndex < chunks.length - 1) {
+          if (pauseBetweenChunks && pauseDuration > 0 && chunkIndex < chunks.length - 1) {
             sendMessage("pause_start", {
-              duration: pauseBetweenChunks,
-              message: `Pausing for ${pauseBetweenChunks} seconds before next chunk...`,
+              duration: pauseDuration,
+              message: `Pausing for ${pauseDuration} seconds before next chunk...`,
             })
 
-            for (let countdown = pauseBetweenChunks; countdown > 0; countdown--) {
+            if (verbose) {
+              console.log(`[Chunked API] Pausing for ${pauseDuration} seconds before next chunk...`)
+            }
+
+            for (let countdown = pauseDuration; countdown > 0; countdown--) {
               sendMessage("pause_countdown", {
                 remaining: countdown,
                 message: `Resuming in ${countdown} seconds...`,
               })
+
+              if (verbose && countdown % 5 === 0) {
+                // Log every 5 seconds to avoid spam
+                console.log(`[Chunked API] Resuming in ${countdown} seconds...`)
+              }
+
               await new Promise((resolve) => setTimeout(resolve, 1000))
 
               // Check for stop during pause
@@ -304,19 +365,33 @@ export async function POST(request: NextRequest) {
             }
 
             sendMessage("pause_end", "Resuming processing...")
+
+            if (verbose) {
+              console.log(`[Chunked API] Pause completed, resuming processing...`)
+            }
           }
         }
 
         // Send completion message
         if (!getPauseState().shouldStop) {
+          const completionMessage = `Chunked processing completed! Processed ${stats.processedFiles} files, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`
+
+          if (verbose) {
+            console.log(`[Chunked API] ${completionMessage}`)
+            console.log(`[Chunked API] Final stats:`, stats)
+            console.log(`[Chunked API] Output file: ${outputPath}`)
+          }
+
           sendMessage("complete", {
             stats,
             outputFile: outputPath,
-            message: `Chunked processing completed! Processed ${stats.processedFiles} files, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`,
+            message: completionMessage,
           })
         }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
+        console.error("[Chunked API] Fatal error:", errorMessage)
+
         try {
           const data = JSON.stringify({
             type: "error",
@@ -368,6 +443,10 @@ async function processFile(
       return
     }
 
+    if (verbose) {
+      console.log(`[Chunked API] Creating worker ${workerId} for file: ${path.basename(xmlFile)}`)
+    }
+
     const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"), {
       workerData: {
         xmlFilePath: xmlFile,
@@ -386,6 +465,9 @@ async function processFile(
 
     const timeout = setTimeout(() => {
       try {
+        if (verbose) {
+          console.log(`[Chunked API] Worker ${workerId} timed out after 30 seconds`)
+        }
         worker.terminate()
         activeWorkers.delete(worker)
         resolve({
@@ -405,6 +487,11 @@ async function processFile(
         clearTimeout(timeout)
         activeWorkers.delete(worker)
         worker.terminate()
+
+        if (verbose) {
+          console.log(`[Chunked API] Worker ${workerId} completed successfully`)
+        }
+
         resolve(result)
       } catch (error) {
         console.error("Error handling worker message:", error)
@@ -422,6 +509,11 @@ async function processFile(
       try {
         clearTimeout(timeout)
         activeWorkers.delete(worker)
+
+        if (verbose) {
+          console.error(`[Chunked API] Worker ${workerId} error:`, error.message)
+        }
+
         resolve({
           record: null,
           passedFilter: false,
@@ -439,6 +531,11 @@ async function processFile(
         try {
           clearTimeout(timeout)
           activeWorkers.delete(worker)
+
+          if (verbose) {
+            console.log(`[Chunked API] Worker ${workerId} exited with code ${code}`)
+          }
+
           resolve({
             record: null,
             passedFilter: false,
