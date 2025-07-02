@@ -302,6 +302,17 @@ export default function Home() {
 
   const checkResumeStatus = async () => {
     try {
+      // Check for chunked processing state first
+      const chunkedResumeResponse = await fetch("/api/resume-chunked")
+      if (chunkedResumeResponse.ok) {
+        const chunkedData = await chunkedResumeResponse.json()
+        if (chunkedData.success && chunkedData.canResume) {
+          setCanResume(true)
+          addMessage("system", "Previous chunked processing session can be resumed")
+          return
+        }
+      }
+
       // Check pause state for resume capability
       const pauseResponse = await fetch("/api/parse/pause")
       if (pauseResponse.ok) {
@@ -350,6 +361,8 @@ export default function Home() {
       timestamp: new Date().toLocaleTimeString(),
     }
 
+    console.log(`[UI] Adding message: ${type} - ${JSON.stringify(message)}`)
+
     if (type === "error") {
       setErrorMessages((prev) => [...prev, newMessage])
     } else {
@@ -358,7 +371,12 @@ export default function Home() {
   }
 
   const handleStreamMessage = (data: any) => {
+    console.log(`[UI] Received stream message:`, data)
+
     switch (data.type) {
+      case "start":
+        addMessage("system", data.message)
+        break
       case "log":
         addMessage("log", data.message)
         break
@@ -381,6 +399,12 @@ export default function Home() {
         if (data.message.stats) {
           setStats(data.message.stats)
         }
+        if (data.message.currentChunk) {
+          setCurrentChunk(data.message.currentChunk)
+        }
+        if (data.message.totalChunks) {
+          setTotalChunks(data.message.totalChunks)
+        }
         break
       case "chunk_start":
         setCurrentChunk(data.message.chunkNumber || 0)
@@ -389,6 +413,9 @@ export default function Home() {
         break
       case "chunk_complete":
         addMessage("chunk", `Completed chunk ${data.message.chunkNumber}/${data.message.totalChunks}`)
+        break
+      case "chunk":
+        addMessage("chunk", data.message)
         break
       case "pause_start":
         addMessage("system", `Pausing for ${data.message.duration} seconds before next chunk...`)
@@ -426,6 +453,9 @@ export default function Home() {
         break
       case "job_created":
         setJobId(data.message.jobId)
+        break
+      default:
+        addMessage("info", data.message)
         break
     }
   }
@@ -593,17 +623,77 @@ export default function Home() {
   }
 
   const resumeProcessing = async () => {
-    if (processingMode !== "chunked") {
-      addMessage("error", "Resume is only available for chunked processing mode")
-      return
-    }
-
     setIsRunning(true)
     setCanResume(false)
     setIsPaused(false)
     setActiveTab("logs")
 
     try {
+      // Check if we have chunked processing state to resume
+      const chunkedResumeResponse = await fetch("/api/resume-chunked")
+      if (chunkedResumeResponse.ok) {
+        const chunkedData = await chunkedResumeResponse.json()
+        if (chunkedData.success && chunkedData.canResume) {
+          // Resume chunked processing
+          const response = await fetch("/api/resume-chunked", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          })
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`)
+          }
+
+          // Handle streaming response
+          const reader = response.body?.getReader()
+          if (!reader) {
+            throw new Error("No response body")
+          }
+
+          const textDecoder = new TextDecoder()
+          let partialData = ""
+
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            partialData += textDecoder.decode(value)
+
+            let completeLines
+            if (partialData.includes("\n")) {
+              completeLines = partialData.split("\n")
+              partialData = completeLines.pop() || ""
+            } else {
+              completeLines = []
+            }
+
+            for (const line of completeLines) {
+              if (line.startsWith("data: ")) {
+                try {
+                  const data = JSON.parse(line.slice(6))
+                  handleStreamMessage(data)
+                } catch (e) {
+                  console.error("Error parsing SSE data:", e)
+                }
+              }
+            }
+          }
+
+          if (partialData.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(partialData.slice(6))
+              handleStreamMessage(data)
+            } catch (e) {
+              console.error("Error parsing SSE data:", e)
+            }
+          }
+
+          return
+        }
+      }
+
+      // Fallback to regular resume
       const requestBody = {
         rootDir,
         outputFile,
@@ -617,7 +707,7 @@ export default function Home() {
         resumeFromState: true,
       }
 
-      const response = await fetch("/api/resume-chunked", {
+      const response = await fetch("/api/resume", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
@@ -627,48 +717,11 @@ export default function Home() {
         throw new Error(`HTTP error! status: ${response.status}`)
       }
 
-      // Handle streaming response
-      const reader = response.body?.getReader()
-      if (!reader) {
-        throw new Error("No response body")
-      }
-
-      const textDecoder = new TextDecoder()
-      let partialData = ""
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        partialData += textDecoder.decode(value)
-
-        let completeLines
-        if (partialData.includes("\n")) {
-          completeLines = partialData.split("\n")
-          partialData = completeLines.pop() || ""
-        } else {
-          completeLines = []
-        }
-
-        for (const line of completeLines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(line.slice(6))
-              handleStreamMessage(data)
-            } catch (e) {
-              console.error("Error parsing SSE data:", e)
-            }
-          }
-        }
-      }
-
-      if (partialData.startsWith("data: ")) {
-        try {
-          const data = JSON.parse(partialData.slice(6))
-          handleStreamMessage(data)
-        } catch (e) {
-          console.error("Error parsing SSE data:", e)
-        }
+      const data = await response.json()
+      if (data.success) {
+        addMessage("system", "Processing resumed successfully")
+      } else {
+        throw new Error(data.error || "Failed to resume processing")
       }
     } catch (error: any) {
       addMessage("error", `Resume error: ${error.message}`)
@@ -1931,7 +1984,9 @@ export default function Home() {
                           <div key={index} className="text-sm">
                             <span className="text-muted-foreground">{message.timestamp}</span>
                             <span className="ml-2 font-medium">[{message.type}]</span>
-                            <span className="ml-2">{JSON.stringify(message.message)}</span>
+                            <span className="ml-2">
+                              {typeof message.message === "string" ? message.message : JSON.stringify(message.message)}
+                            </span>
                           </div>
                         ))}
                         <div ref={logsEndRef} />
@@ -1951,7 +2006,9 @@ export default function Home() {
                           <div key={index} className="text-sm text-red-600">
                             <span className="text-muted-foreground">{message.timestamp}</span>
                             <span className="ml-2 font-medium">[ERROR]</span>
-                            <span className="ml-2">{JSON.stringify(message.message)}</span>
+                            <span className="ml-2">
+                              {typeof message.message === "string" ? message.message : JSON.stringify(message.message)}
+                            </span>
                           </div>
                         ))}
                         <div ref={errorLogsEndRef} />
