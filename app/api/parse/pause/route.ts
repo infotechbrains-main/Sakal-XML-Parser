@@ -4,18 +4,20 @@ import { type NextRequest, NextResponse } from "next/server"
 let globalPauseState = {
   isPaused: false,
   shouldStop: false,
-  timestamp: Date.now(),
+  pauseRequested: false,
+  stopRequested: false,
 }
 
 export function getPauseState() {
-  return { ...globalPauseState }
+  return globalPauseState
 }
 
 export function resetPauseState() {
   globalPauseState = {
     isPaused: false,
     shouldStop: false,
-    timestamp: Date.now(),
+    pauseRequested: false,
+    stopRequested: false,
   }
 }
 
@@ -27,35 +29,29 @@ export async function POST(request: NextRequest) {
     switch (action) {
       case "pause":
         globalPauseState.isPaused = true
-        globalPauseState.timestamp = Date.now()
+        globalPauseState.pauseRequested = true
         return NextResponse.json({
           success: true,
-          message: "Processing paused",
+          message: "Pause requested",
           state: globalPauseState,
         })
 
       case "resume":
         globalPauseState.isPaused = false
-        globalPauseState.timestamp = Date.now()
+        globalPauseState.pauseRequested = false
         return NextResponse.json({
           success: true,
-          message: "Processing resumed",
+          message: "Resume requested",
           state: globalPauseState,
         })
 
       case "stop":
         globalPauseState.shouldStop = true
+        globalPauseState.stopRequested = true
         globalPauseState.isPaused = false
-        globalPauseState.timestamp = Date.now()
         return NextResponse.json({
           success: true,
-          message: "Processing stopped",
-          state: globalPauseState,
-        })
-
-      case "status":
-        return NextResponse.json({
-          success: true,
+          message: "Stop requested",
           state: globalPauseState,
         })
 
