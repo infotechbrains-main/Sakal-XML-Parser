@@ -357,24 +357,24 @@ export default function Home() {
         addMessage("system", data.message)
         break
       case "progress":
-        setProgress(data.percentage || 0)
-        if (data.stats) {
-          setStats(data.stats)
+        setProgress(data.message.percentage || 0)
+        if (data.message.stats) {
+          setStats(data.message.stats)
         }
         break
       case "chunk_start":
-        setCurrentChunk(data.chunkNumber)
-        setTotalChunks(data.totalChunks)
-        addMessage("chunk", `Starting chunk ${data.chunkNumber}/${data.totalChunks}`)
+        setCurrentChunk(data.message.chunkNumber || 0)
+        setTotalChunks(data.message.totalChunks || 0)
+        addMessage("chunk", `Starting chunk ${data.message.chunkNumber}/${data.message.totalChunks}`)
         break
       case "chunk_complete":
-        addMessage("chunk", `Completed chunk ${data.chunkNumber}/${data.totalChunks}`)
+        addMessage("chunk", `Completed chunk ${data.message.chunkNumber}/${data.message.totalChunks}`)
         break
       case "pause_start":
-        addMessage("system", `Pausing for ${data.duration} seconds before next chunk...`)
+        addMessage("system", `Pausing for ${data.message.duration} seconds before next chunk...`)
         break
       case "pause_countdown":
-        addMessage("system", `Resuming in ${data.remaining} seconds...`)
+        addMessage("system", `Resuming in ${data.message.remaining} seconds...`)
         break
       case "pause_end":
         addMessage("system", data.message)
@@ -387,9 +387,9 @@ export default function Home() {
           : "Unknown"
 
         setProcessingResults({
-          stats: data.stats || stats,
-          outputFile: data.outputFile || outputFile,
-          errors: data.errors || [],
+          stats: data.message.stats || stats,
+          outputFile: data.message.outputFile || outputFile,
+          errors: data.message.errors || [],
           processingTime,
           startTime: processingStartTime,
           endTime: new Date().toISOString(),
@@ -399,11 +399,11 @@ export default function Home() {
         setActiveTab("results") // Auto-switch to results tab
         break
       case "download":
-        setDownloadURL(data.url)
+        setDownloadURL(data.message.url)
         addMessage("success", "Processing complete! Download ready.")
         break
       case "job_created":
-        setJobId(data.jobId)
+        setJobId(data.message.jobId)
         break
     }
   }
@@ -468,6 +468,7 @@ export default function Home() {
         numWorkers,
         verbose,
         filterConfig: finalFilterConfig,
+        // Fix: Send the correct chunked processing parameters
         chunkSize: processingMode === "chunked" ? chunkSize : undefined,
         pauseBetweenChunks: processingMode === "chunked" ? pauseBetweenChunks : undefined,
         pauseDuration: processingMode === "chunked" ? pauseDuration : undefined,
