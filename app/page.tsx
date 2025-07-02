@@ -354,6 +354,67 @@ export default function Home() {
     }
   }
 
+  // Add this function after checkResumeStatus
+  const loadSavedConfig = async () => {
+    try {
+      const response = await fetch("/api/parse/pause")
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success && data.savedConfig) {
+          const config = data.savedConfig
+
+          // Load all saved settings
+          setRootDir(config.rootDir || "")
+          setOutputFile(config.outputFile || "image_metadata.csv")
+          setOutputFolder(config.outputFolder || "")
+          setProcessingMode(config.processingMode || "stream")
+          setNumWorkers(config.numWorkers || 4)
+          setVerbose(config.verbose || false)
+
+          // Load chunked settings
+          if (config.chunkSize) setChunkSize(config.chunkSize)
+          if (config.pauseBetweenChunks !== undefined) setPauseBetweenChunks(config.pauseBetweenChunks)
+          if (config.pauseDuration) setPauseDuration(config.pauseDuration)
+
+          // Load filter settings
+          if (config.filterConfig) {
+            setFilterConfig(config.filterConfig)
+            setFilterEnabled(config.filterConfig.enabled || false)
+          }
+
+          addMessage("system", "Loaded saved processing configuration")
+          return true
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load saved config:", error)
+    }
+    return false
+  }
+
+  // Add this function to reset all settings to defaults
+  const resetToDefaults = () => {
+    setRootDir("")
+    setOutputFile("image_metadata.csv")
+    setOutputFolder("")
+    setProcessingMode("stream")
+    setNumWorkers(4)
+    setVerbose(false)
+    setChunkSize(100)
+    setPauseBetweenChunks(false)
+    setPauseDuration(5)
+    setFilterEnabled(false)
+    setFilterConfig({
+      enabled: false,
+      fileTypes: ["jpg", "jpeg", "png", "tiff", "bmp"],
+      customExtensions: "",
+      allowedFileTypes: ["jpg", "jpeg", "png", "tiff", "bmp"],
+      moveImages: false,
+      moveFolderStructureOption: "replicate",
+    })
+    addMessage("system", "Reset all settings to defaults")
+  }
+
   const addMessage = (type: string, message: any) => {
     const newMessage: Message = {
       type,
@@ -508,7 +569,14 @@ export default function Home() {
     }))
   }
 
+  // Update the startProcessing function to reset settings when starting new
   const startProcessing = async () => {
+    // Only reset to defaults if this is a completely new start (not a resume)
+    if (!canResume) {
+      // Don't reset if user has manually configured settings
+      // This preserves user's current configuration for new processing
+    }
+
     setIsRunning(true)
     setMessages([])
     setErrorMessages([])
@@ -650,6 +718,93 @@ export default function Home() {
     }
   }
 
+  // Update the pauseProcessing function
+  const pauseProcessing = async () => {
+    try {
+      // Prepare current config to save
+      const currentConfig = {
+        rootDir,
+        outputFile,
+        outputFolder,
+        processingMode,
+        numWorkers,
+        verbose,
+        filterConfig: filterEnabled ? { ...filterConfig, enabled: true } : null,
+        chunkSize,
+        pauseBetweenChunks,
+        pauseDuration,
+      }
+
+      const response = await fetch("/api/parse/pause", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "pause",
+          config: currentConfig,
+          jobId,
+          sessionId: jobId,
+          currentChunk,
+          processedFiles: stats.processedFiles,
+        }),
+      })
+
+      if (response.ok) {
+        const result = await response.json()
+        addMessage("system", "Pause request sent - processing will stop gracefully and save state")
+        console.log("[UI] Pause response:", result)
+      } else {
+        throw new Error("Failed to send pause request")
+      }
+    } catch (error) {
+      addMessage("error", "Failed to pause processing")
+      console.error("Pause error:", error)
+    }
+  }
+
+  // Update the stopProcessing function
+  const stopProcessing = async () => {
+    try {
+      // Prepare current config to save
+      const currentConfig = {
+        rootDir,
+        outputFile,
+        outputFolder,
+        processingMode,
+        numWorkers,
+        verbose,
+        filterConfig: filterEnabled ? { ...filterConfig, enabled: true } : null,
+        chunkSize,
+        pauseBetweenChunks,
+        pauseDuration,
+      }
+
+      const response = await fetch("/api/parse/pause", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "stop",
+          config: currentConfig,
+          jobId,
+          sessionId: jobId,
+          currentChunk,
+          processedFiles: stats.processedFiles,
+        }),
+      })
+
+      if (response.ok) {
+        const result = await response.json()
+        addMessage("system", "Stop request sent - processing will terminate and save state for resume")
+        console.log("[UI] Stop response:", result)
+      } else {
+        throw new Error("Failed to send stop request")
+      }
+    } catch (error) {
+      addMessage("error", "Failed to stop processing")
+      console.error("Stop error:", error)
+    }
+  }
+
+  // Update the resumeProcessing function
   const resumeProcessing = async () => {
     setIsRunning(true)
     setCanResume(false)
@@ -721,22 +876,50 @@ export default function Home() {
         }
       }
 
-      // Check pause state and try to resume from there
+      // Check pause state and try to load saved config
       const pauseResponse = await fetch("/api/parse/pause")
       if (pauseResponse.ok) {
         const pauseData = await pauseResponse.json()
         if (pauseData.success && pauseData.state && (pauseData.state.isPaused || pauseData.state.shouldStop)) {
-          // Reset pause state and restart processing with current config
+          // Load saved configuration
+          if (pauseData.savedConfig) {
+            const config = pauseData.savedConfig
+
+            // Load all saved settings
+            setRootDir(config.rootDir || "")
+            setOutputFile(config.outputFile || "image_metadata.csv")
+            setOutputFolder(config.outputFolder || "")
+            setProcessingMode(config.processingMode || "stream")
+            setNumWorkers(config.numWorkers || 4)
+            setVerbose(config.verbose || false)
+
+            // Load chunked settings
+            if (config.chunkSize) setChunkSize(config.chunkSize)
+            if (config.pauseBetweenChunks !== undefined) setPauseBetweenChunks(config.pauseBetweenChunks)
+            if (config.pauseDuration) setPauseDuration(config.pauseDuration)
+
+            // Load filter settings
+            if (config.filterConfig) {
+              setFilterConfig(config.filterConfig)
+              setFilterEnabled(config.filterConfig.enabled || false)
+            }
+
+            addMessage("system", "Loaded saved configuration for resume")
+          }
+
+          // Reset pause state and restart processing with loaded config
           await fetch("/api/parse/pause", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ action: "reset" }),
           })
 
-          addMessage("system", "Resuming from paused state with current configuration")
+          addMessage("system", "Resuming from paused state with saved configuration")
 
-          // Restart processing with current configuration
-          await startProcessing()
+          // Small delay to ensure state is updated
+          setTimeout(() => {
+            startProcessing()
+          }, 500)
           return
         }
       }
@@ -758,73 +941,23 @@ export default function Home() {
           }
 
           addMessage("system", "Resuming from saved session")
-          await startProcessing()
+          setTimeout(() => {
+            startProcessing()
+          }, 500)
           return
         }
       }
 
       // If no resume state found, just restart with current config
       addMessage("system", "No specific resume state found, restarting with current configuration")
-      await startProcessing()
+      setTimeout(() => {
+        startProcessing()
+      }, 500)
     } catch (error: any) {
       addMessage("error", `Resume error: ${error.message}`)
       setActiveTab("logs")
     } finally {
       setIsRunning(false)
-    }
-  }
-
-  const pauseProcessing = async () => {
-    try {
-      const response = await fetch("/api/parse/pause", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "pause",
-          jobId,
-          sessionId: jobId,
-          currentChunk,
-          processedFiles: stats.processedFiles,
-        }),
-      })
-
-      if (response.ok) {
-        const result = await response.json()
-        addMessage("system", "Pause request sent - processing will stop gracefully and save state")
-        console.log("[UI] Pause response:", result)
-      } else {
-        throw new Error("Failed to send pause request")
-      }
-    } catch (error) {
-      addMessage("error", "Failed to pause processing")
-      console.error("Pause error:", error)
-    }
-  }
-
-  const stopProcessing = async () => {
-    try {
-      const response = await fetch("/api/parse/pause", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "stop",
-          jobId,
-          sessionId: jobId,
-          currentChunk,
-          processedFiles: stats.processedFiles,
-        }),
-      })
-
-      if (response.ok) {
-        const result = await response.json()
-        addMessage("system", "Stop request sent - processing will terminate and save state for resume")
-        console.log("[UI] Stop response:", result)
-      } else {
-        throw new Error("Failed to send stop request")
-      }
-    } catch (error) {
-      addMessage("error", "Failed to stop processing")
-      console.error("Stop error:", error)
     }
   }
 
@@ -2200,9 +2333,19 @@ export default function Home() {
             </CardHeader>
             <CardContent className="space-y-2">
               {!isRunning && !canResume && (
-                <Button onClick={startProcessing} disabled={!rootDir} className="w-full">
-                  Start Processing
-                </Button>
+                <>
+                  <Button onClick={startProcessing} disabled={!rootDir} className="w-full">
+                    Start Processing
+                  </Button>
+                  <div className="flex space-x-2">
+                    <Button onClick={loadSavedConfig} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Load Saved
+                    </Button>
+                    <Button onClick={resetToDefaults} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Reset All
+                    </Button>
+                  </div>
+                </>
               )}
 
               {canResume && !isRunning && (
@@ -2218,6 +2361,14 @@ export default function Home() {
                   >
                     Start New Processing
                   </Button>
+                  <div className="flex space-x-2">
+                    <Button onClick={loadSavedConfig} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Load Saved
+                    </Button>
+                    <Button onClick={resetToDefaults} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Reset All
+                    </Button>
+                  </div>
                 </>
               )}
 

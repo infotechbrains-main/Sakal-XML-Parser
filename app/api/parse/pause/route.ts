@@ -1,133 +1,116 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { promises as fs } from "fs"
+import path from "path"
 
 interface PauseState {
   isPaused: boolean
-  shouldStop: boolean
   pauseRequested: boolean
+  shouldStop: boolean
   stopRequested: boolean
-  sessionId?: string
-  currentChunk?: number
-  processedFiles?: number
-  timestamp?: string
 }
 
-let globalPauseState: PauseState = {
+let pauseState: PauseState = {
   isPaused: false,
-  shouldStop: false,
   pauseRequested: false,
+  shouldStop: false,
   stopRequested: false,
 }
 
-export function getPauseState(): PauseState {
-  return { ...globalPauseState }
-}
-
-export function setPauseState(newState: Partial<PauseState>): void {
-  globalPauseState = {
-    ...globalPauseState,
-    ...newState,
-    timestamp: new Date().toISOString(),
-  }
-  console.log("[Pause API] State updated:", globalPauseState)
-}
-
-export function resetPauseState(): void {
-  globalPauseState = {
+function resetPauseState() {
+  pauseState = {
     isPaused: false,
-    shouldStop: false,
     pauseRequested: false,
+    shouldStop: false,
     stopRequested: false,
   }
-  console.log("[Pause API] State reset")
 }
 
-export async function GET() {
+interface ProcessingConfig {
+  rootDir: string
+  outputFile: string
+  outputFolder: string
+  processingMode: string
+  numWorkers: number
+  verbose: boolean
+  filterConfig: any
+  chunkSize?: number
+  pauseBetweenChunks?: boolean
+  pauseDuration?: number
+}
+
+async function saveProcessingConfig(config: ProcessingConfig) {
   try {
-    return NextResponse.json({
-      success: true,
-      state: globalPauseState,
-    })
+    const configPath = path.join(process.cwd(), "last_processing_config.json")
+    await fs.writeFile(configPath, JSON.stringify(config, null, 2))
+    console.log("[Pause API] Saved processing configuration")
   } catch (error) {
-    console.error("[Pause API] GET error:", error)
-    return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-      { status: 500 },
-    )
+    console.error("[Pause API] Error saving processing config:", error)
+  }
+}
+
+async function loadProcessingConfig(): Promise<ProcessingConfig | null> {
+  try {
+    const configPath = path.join(process.cwd(), "last_processing_config.json")
+    const content = await fs.readFile(configPath, "utf-8")
+    return JSON.parse(content)
+  } catch (error) {
+    console.log("[Pause API] No saved processing config found")
+    return null
   }
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { action, sessionId, currentChunk, processedFiles } = body
-
-    console.log(`[Pause API] Received ${action} request for session ${sessionId}`)
+    const { action, config } = body
 
     if (action === "pause") {
-      setPauseState({
-        isPaused: true,
-        pauseRequested: true,
-        shouldStop: false,
-        stopRequested: false,
-        sessionId,
-        currentChunk,
-        processedFiles,
-      })
+      pauseState.isPaused = true
+      pauseState.pauseRequested = true
 
-      return NextResponse.json({
-        success: true,
-        message: "Pause request received",
-        state: globalPauseState,
-      })
-    } else if (action === "stop") {
-      setPauseState({
-        isPaused: false,
-        pauseRequested: false,
-        shouldStop: true,
-        stopRequested: true,
-        sessionId,
-        currentChunk,
-        processedFiles,
-      })
+      if (config) {
+        await saveProcessingConfig(config)
+      }
 
-      return NextResponse.json({
-        success: true,
-        message: "Stop request received",
-        state: globalPauseState,
-      })
-    } else if (action === "resume") {
-      setPauseState({
-        isPaused: false,
-        pauseRequested: false,
-        shouldStop: false,
-        stopRequested: false,
-      })
-
-      return NextResponse.json({
-        success: true,
-        message: "Resume request received",
-        state: globalPauseState,
-      })
-    } else {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Invalid action. Use 'pause', 'stop', or 'resume'",
-        },
-        { status: 400 },
-      )
+      console.log("[Pause API] Pause requested")
+      return NextResponse.json({ success: true, message: "Pause requested" })
     }
+
+    if (action === "stop") {
+      pauseState.shouldStop = true
+      pauseState.stopRequested = true
+
+      if (config) {
+        await saveProcessingConfig(config)
+      }
+
+      console.log("[Pause API] Stop requested")
+      return NextResponse.json({ success: true, message: "Stop requested" })
+    }
+
+    if (action === "reset") {
+      resetPauseState()
+      console.log("[Pause API] Pause state reset")
+      return NextResponse.json({ success: true, message: "Pause state reset" })
+    }
+
+    return NextResponse.json({ error: "Invalid action" }, { status: 400 })
   } catch (error) {
-    console.error("[Pause API] POST error:", error)
-    return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-      { status: 500 },
-    )
+    console.error("[Pause API] Error:", error)
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+  }
+}
+
+export async function GET() {
+  try {
+    const config = await loadProcessingConfig()
+    return NextResponse.json({
+      success: true,
+      state: pauseState,
+      savedConfig: config,
+    })
+  } catch (error) {
+    console.error("[Pause API] Error:", error)
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
   }
 }
