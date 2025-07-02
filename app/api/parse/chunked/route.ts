@@ -77,6 +77,40 @@ export async function POST(request: NextRequest) {
     async start(controller) {
       let sessionId: string | null = null
       let processingState: ProcessingState | null = null
+      let controllerClosed = false
+
+      // Helper function to safely close controller
+      const safeCloseController = () => {
+        if (!controllerClosed) {
+          try {
+            controller.close()
+            controllerClosed = true
+            console.log("[Chunked API] Controller closed safely")
+          } catch (error) {
+            console.error("[Chunked API] Error closing controller:", error)
+          }
+        }
+      }
+
+      // Helper function to safely send messages
+      const sendMessage = (type: string, message: any) => {
+        if (controllerClosed) {
+          console.log(`[Chunked API] Skipping message (controller closed): ${type}`)
+          return
+        }
+
+        try {
+          const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
+          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+
+          if (processingState?.config?.verbose) {
+            console.log(`[Chunked API] ${type.toUpperCase()}: ${JSON.stringify(message)}`)
+          }
+        } catch (error) {
+          console.error("Error sending message:", error)
+          controllerClosed = true
+        }
+      }
 
       try {
         const body = await request.json()
@@ -92,19 +126,6 @@ export async function POST(request: NextRequest) {
           filterConfig = null,
           resumeFromState = false,
         } = body
-
-        const sendMessage = (type: string, message: any) => {
-          try {
-            const data = JSON.stringify({ type, message, timestamp: new Date().toISOString() })
-            controller.enqueue(encoder.encode(`data: ${data}\n\n`))
-
-            if (verbose) {
-              console.log(`[Chunked API] ${type.toUpperCase()}: ${JSON.stringify(message)}`)
-            }
-          } catch (error) {
-            console.error("Error sending message:", error)
-          }
-        }
 
         // Check if we should resume from saved state
         const savedState = await loadProcessingState()
@@ -153,7 +174,7 @@ export async function POST(request: NextRequest) {
 
           if (xmlFiles.length === 0) {
             sendMessage("error", "No XML files found in the specified directory")
-            controller.close()
+            safeCloseController()
             return
           }
 
@@ -429,7 +450,7 @@ export async function POST(request: NextRequest) {
                   currentChunk: chunkIndex,
                   totalChunks: processingState.totalChunks,
                 })
-                controller.close()
+                safeCloseController()
                 return
               } else {
                 sendMessage("paused", {
@@ -438,7 +459,7 @@ export async function POST(request: NextRequest) {
                   currentChunk: chunkIndex,
                   totalChunks: processingState.totalChunks,
                 })
-                controller.close()
+                safeCloseController()
                 return
               }
             }
@@ -587,7 +608,7 @@ export async function POST(request: NextRequest) {
                     totalChunks: processingState.totalChunks,
                   })
                 }
-                controller.close()
+                safeCloseController()
                 return
               }
 
@@ -676,16 +697,14 @@ export async function POST(request: NextRequest) {
             message: `Chunked processing error: ${errorMessage}`,
             timestamp: new Date().toISOString(),
           })
-          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+          if (!controllerClosed) {
+            controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+          }
         } catch (encodeError) {
           console.error("Error encoding error message:", encodeError)
         }
       } finally {
-        try {
-          controller.close()
-        } catch (closeError) {
-          console.error("Error closing controller:", closeError)
-        }
+        safeCloseController()
       }
     },
   })
