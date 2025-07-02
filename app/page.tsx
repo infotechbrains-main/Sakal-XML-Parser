@@ -721,36 +721,51 @@ export default function Home() {
         }
       }
 
-      // Fallback to regular resume
-      const requestBody = {
-        rootDir,
-        outputFile,
-        outputFolder,
-        numWorkers,
-        verbose,
-        filterConfig: filterEnabled ? { ...filterConfig, enabled: true } : null,
-        chunkSize,
-        pauseBetweenChunks,
-        pauseDuration,
-        resumeFromState: true,
+      // Check pause state and try to resume from there
+      const pauseResponse = await fetch("/api/parse/pause")
+      if (pauseResponse.ok) {
+        const pauseData = await pauseResponse.json()
+        if (pauseData.success && pauseData.state && (pauseData.state.isPaused || pauseData.state.shouldStop)) {
+          // Reset pause state and restart processing with current config
+          await fetch("/api/parse/pause", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "reset" }),
+          })
+
+          addMessage("system", "Resuming from paused state with current configuration")
+
+          // Restart processing with current configuration
+          await startProcessing()
+          return
+        }
       }
 
-      const response = await fetch("/api/resume", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      })
+      // Try regular resume API as fallback
+      const response = await fetch("/api/resume")
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success && data.canResume && data.session) {
+          // Load session config and restart
+          const session = data.session
+          setRootDir(session.config.rootDir)
+          setOutputFile(session.config.outputFile)
+          setNumWorkers(session.config.numWorkers)
+          setProcessingMode(session.config.processingMode as any)
+          if (session.config.filterConfig) {
+            setFilterConfig(session.config.filterConfig)
+            setFilterEnabled(true)
+          }
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
+          addMessage("system", "Resuming from saved session")
+          await startProcessing()
+          return
+        }
       }
 
-      const data = await response.json()
-      if (data.success) {
-        addMessage("system", "Processing resumed successfully")
-      } else {
-        throw new Error(data.error || "Failed to resume processing")
-      }
+      // If no resume state found, just restart with current config
+      addMessage("system", "No specific resume state found, restarting with current configuration")
+      await startProcessing()
     } catch (error: any) {
       addMessage("error", `Resume error: ${error.message}`)
       setActiveTab("logs")
