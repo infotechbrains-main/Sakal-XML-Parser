@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server"
 import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
-import { getPauseState, resetPauseState } from "./pause/route"
+import { getPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 
 interface ProcessingStats {
