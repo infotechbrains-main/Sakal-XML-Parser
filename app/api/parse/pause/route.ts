@@ -1,13 +1,10 @@
 import { type NextRequest, NextResponse } from "next/server"
-import fs from "fs/promises"
+import { promises as fs } from "fs"
 import path from "path"
 
 interface PauseState {
   isPaused: boolean
   shouldStop: boolean
-  sessionId?: string
-  currentChunk?: number
-  processedFiles?: number
   timestamp: string
 }
 
@@ -15,13 +12,12 @@ interface ProcessingConfig {
   rootDir: string
   outputFile: string
   outputFolder: string
-  processingMode: string
+  chunkSize: number
+  pauseDuration: number
   numWorkers: number
   verbose: boolean
   filterConfig: any
-  chunkSize?: number
-  pauseBetweenChunks?: boolean
-  pauseDuration?: number
+  processingMode: string
 }
 
 let pauseState: PauseState = {
@@ -30,38 +26,44 @@ let pauseState: PauseState = {
   timestamp: new Date().toISOString(),
 }
 
-let savedConfig: ProcessingConfig | null = null
-
 const PAUSE_STATE_FILE = path.join(process.cwd(), "pause_state.json")
-const CONFIG_STATE_FILE = path.join(process.cwd(), "last_processing_config.json")
-
-// Load pause state from file
-async function loadPauseState(): Promise<PauseState | null> {
-  try {
-    const data = await fs.readFile(PAUSE_STATE_FILE, "utf8")
-    const state = JSON.parse(data)
-    console.log("[Pause API] Loaded pause state from file")
-    return state
-  } catch (error) {
-    console.log("[Pause API] No saved pause state found")
-    return null
-  }
-}
+const PROCESSING_CONFIG_FILE = path.join(process.cwd(), "processing_config.json")
 
 // Save pause state to file
-async function savePauseState(state: PauseState): Promise<void> {
+async function savePauseState(): Promise<void> {
   try {
-    await fs.writeFile(PAUSE_STATE_FILE, JSON.stringify(state, null, 2), "utf8")
+    await fs.writeFile(PAUSE_STATE_FILE, JSON.stringify(pauseState, null, 2), "utf8")
     console.log("[Pause API] Saved pause state to file")
   } catch (error) {
     console.error("[Pause API] Error saving pause state:", error)
   }
 }
 
+// Load pause state from file
+async function loadPauseState(): Promise<void> {
+  try {
+    const data = await fs.readFile(PAUSE_STATE_FILE, "utf8")
+    pauseState = JSON.parse(data)
+    console.log("[Pause API] Loaded pause state from file")
+  } catch (error) {
+    console.log("[Pause API] No saved pause state found, using defaults")
+  }
+}
+
+// Save processing config to file
+async function saveProcessingConfig(config: ProcessingConfig): Promise<void> {
+  try {
+    await fs.writeFile(PROCESSING_CONFIG_FILE, JSON.stringify(config, null, 2), "utf8")
+    console.log("[Pause API] Saved processing config to file")
+  } catch (error) {
+    console.error("[Pause API] Error saving processing config:", error)
+  }
+}
+
 // Load processing config from file
 async function loadProcessingConfig(): Promise<ProcessingConfig | null> {
   try {
-    const data = await fs.readFile(CONFIG_STATE_FILE, "utf8")
+    const data = await fs.readFile(PROCESSING_CONFIG_FILE, "utf8")
     const config = JSON.parse(data)
     console.log("[Pause API] Loaded processing config from file")
     return config
@@ -71,37 +73,110 @@ async function loadProcessingConfig(): Promise<ProcessingConfig | null> {
   }
 }
 
-// Save processing config to file
-async function saveProcessingConfig(config: ProcessingConfig): Promise<void> {
+// Clear processing config file
+async function clearProcessingConfig(): Promise<void> {
   try {
-    await fs.writeFile(CONFIG_STATE_FILE, JSON.stringify(config, null, 2), "utf8")
-    console.log("[Pause API] Saved processing config to file")
-  } catch (error) {
-    console.error("[Pause API] Error saving processing config:", error)
-  }
-}
-
-// Clear pause state file
-async function clearPauseState(): Promise<void> {
-  try {
-    await fs.unlink(PAUSE_STATE_FILE)
-    console.log("[Pause API] Cleared pause state file")
+    await fs.unlink(PROCESSING_CONFIG_FILE)
+    console.log("[Pause API] Cleared processing config file")
   } catch (error) {
     // File doesn't exist, which is fine
   }
 }
 
+// Initialize pause state from file on module load
+loadPauseState()
+
+export async function GET() {
+  try {
+    // Load current state from file
+    await loadPauseState()
+
+    const config = await loadProcessingConfig()
+
+    return NextResponse.json({
+      ...pauseState,
+      hasConfig: !!config,
+      config: config,
+    })
+  } catch (error) {
+    console.error("[Pause API] Error getting pause state:", error)
+    return NextResponse.json({ error: "Failed to get pause state" }, { status: 500 })
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json()
+    const { action, config } = body
+
+    console.log(`[Pause API] Received action: ${action}`)
+
+    switch (action) {
+      case "pause":
+        pauseState.isPaused = true
+        pauseState.shouldStop = false
+        pauseState.timestamp = new Date().toISOString()
+        await savePauseState()
+
+        if (config) {
+          await saveProcessingConfig(config)
+        }
+
+        console.log("[Pause API] Processing paused")
+        break
+
+      case "stop":
+        pauseState.isPaused = false
+        pauseState.shouldStop = true
+        pauseState.timestamp = new Date().toISOString()
+        await savePauseState()
+
+        if (config) {
+          await saveProcessingConfig(config)
+        }
+
+        console.log("[Pause API] Processing stopped")
+        break
+
+      case "resume":
+        pauseState.isPaused = false
+        pauseState.shouldStop = false
+        pauseState.timestamp = new Date().toISOString()
+        await savePauseState()
+        console.log("[Pause API] Processing resumed")
+        break
+
+      case "reset":
+        pauseState.isPaused = false
+        pauseState.shouldStop = false
+        pauseState.timestamp = new Date().toISOString()
+        await savePauseState()
+        await clearProcessingConfig()
+        console.log("[Pause API] State reset")
+        break
+
+      default:
+        return NextResponse.json({ error: "Invalid action" }, { status: 400 })
+    }
+
+    return NextResponse.json({
+      success: true,
+      state: pauseState,
+    })
+  } catch (error) {
+    console.error("[Pause API] Error updating pause state:", error)
+    return NextResponse.json({ error: "Failed to update pause state" }, { status: 500 })
+  }
+}
+
+// Export functions for use by other modules
 export function getPauseState(): PauseState {
-  return pauseState
+  return { ...pauseState }
 }
 
 export function setPauseState(newState: Partial<PauseState>): void {
-  pauseState = {
-    ...pauseState,
-    ...newState,
-    timestamp: new Date().toISOString(),
-  }
-  savePauseState(pauseState)
+  pauseState = { ...pauseState, ...newState }
+  savePauseState()
 }
 
 export function resetPauseState(): void {
@@ -110,116 +185,5 @@ export function resetPauseState(): void {
     shouldStop: false,
     timestamp: new Date().toISOString(),
   }
-  clearPauseState()
-  console.log("[Pause API] State reset")
-}
-
-export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json()
-    const { action, config, jobId, sessionId, currentChunk, processedFiles } = body
-
-    console.log(`[Pause API] Received ${action} request`)
-
-    switch (action) {
-      case "pause":
-        setPauseState({
-          isPaused: true,
-          shouldStop: false,
-          sessionId: sessionId || jobId,
-          currentChunk,
-          processedFiles,
-        })
-
-        // Save config if provided
-        if (config) {
-          savedConfig = config
-          await saveProcessingConfig(config)
-        }
-
-        return NextResponse.json({
-          success: true,
-          message: "Pause request received",
-          state: pauseState,
-        })
-
-      case "stop":
-        setPauseState({
-          isPaused: false,
-          shouldStop: true,
-          sessionId: sessionId || jobId,
-          currentChunk,
-          processedFiles,
-        })
-
-        // Save config if provided
-        if (config) {
-          savedConfig = config
-          await saveProcessingConfig(config)
-        }
-
-        return NextResponse.json({
-          success: true,
-          message: "Stop request received",
-          state: pauseState,
-        })
-
-      case "reset":
-        resetPauseState()
-        return NextResponse.json({
-          success: true,
-          message: "State reset",
-          state: pauseState,
-        })
-
-      default:
-        return NextResponse.json(
-          {
-            success: false,
-            message: "Invalid action",
-          },
-          { status: 400 },
-        )
-    }
-  } catch (error) {
-    console.error("[Pause API] Error:", error)
-    return NextResponse.json(
-      {
-        success: false,
-        message: "Internal server error",
-      },
-      { status: 500 },
-    )
-  }
-}
-
-export async function GET() {
-  try {
-    // Load state from file if it exists
-    const fileState = await loadPauseState()
-    if (fileState) {
-      pauseState = fileState
-    }
-
-    // Load saved config
-    const fileConfig = await loadProcessingConfig()
-    if (fileConfig) {
-      savedConfig = fileConfig
-    }
-
-    return NextResponse.json({
-      success: true,
-      state: pauseState,
-      savedConfig: savedConfig,
-    })
-  } catch (error) {
-    console.error("[Pause API] Error:", error)
-    return NextResponse.json(
-      {
-        success: false,
-        message: "Internal server error",
-      },
-      { status: 500 },
-    )
-  }
+  savePauseState()
 }

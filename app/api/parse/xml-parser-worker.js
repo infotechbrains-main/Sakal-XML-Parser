@@ -8,6 +8,58 @@ function isRemotePath(filePath) {
   return filePath && (filePath.startsWith("http://") || filePath.startsWith("https://"))
 }
 
+// Helper function to fetch remote file content
+async function fetchRemoteFile(url) {
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+    return await response.text()
+  } catch (error) {
+    throw new Error(`Failed to fetch remote file ${url}: ${error.message}`)
+  }
+}
+
+// Helper function to download remote file to temp location
+async function downloadRemoteFile(url, tempDir) {
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+
+    const fileName = path.basename(new URL(url).pathname)
+    const localPath = path.join(tempDir, fileName)
+
+    const buffer = await response.arrayBuffer()
+    await fs.writeFile(localPath, Buffer.from(buffer))
+
+    return localPath
+  } catch (error) {
+    throw new Error(`Failed to download remote file ${url}: ${error.message}`)
+  }
+}
+
+// Helper function to create temp directory
+async function createTempDir() {
+  const tempDir = path.join(
+    require("os").tmpdir(),
+    `xml-parser-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+  )
+  await fs.mkdir(tempDir, { recursive: true })
+  return tempDir
+}
+
+// Helper function to cleanup temp directory
+async function cleanupTempDir(tempDir) {
+  try {
+    await fs.rm(tempDir, { recursive: true, force: true })
+  } catch (error) {
+    // Ignore cleanup errors
+  }
+}
+
 // Helper function to find the main news component
 function findMainNewsComponent(newsComponent) {
   if (!newsComponent) return null
@@ -64,7 +116,7 @@ function isImageFile(fileName) {
 }
 
 // Enhanced image path finder - tries multiple possible locations
-async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associatedImagePath) {
+async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associatedImagePath, isRemote, tempDir) {
   if (!imageHref) return null
 
   // If we have an associated image path from the watcher, use it first
@@ -92,6 +144,116 @@ async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associat
     }
   }
 
+  // Handle remote images
+  if (isRemote) {
+    try {
+      // Try to construct the image URL based on the XML URL
+      const xmlUrl = new URL(xmlFilePath)
+      const baseUrl = `${xmlUrl.protocol}//${xmlUrl.host}`
+      const xmlPath = xmlUrl.pathname
+
+      // Try different possible image locations relative to XML
+      const possibleImagePaths = [
+        // Same directory as XML
+        path.dirname(xmlPath) + "/" + imageHref,
+        // Media folder at same level
+        path.dirname(path.dirname(xmlPath)) + "/media/" + imageHref,
+        // Images folder at same level
+        path.dirname(path.dirname(xmlPath)) + "/images/" + imageHref,
+        // Root media folder
+        "/media/" + imageHref,
+        // Root images folder
+        "/images/" + imageHref,
+      ]
+
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Searching for remote image: ${imageHref}`)
+        console.log(`[Worker ${workerId}] XML URL: ${xmlFilePath}`)
+        console.log(`[Worker ${workerId}] Trying ${possibleImagePaths.length} possible remote locations...`)
+      }
+
+      for (let i = 0; i < possibleImagePaths.length; i++) {
+        const imagePath = possibleImagePaths[i]
+        const imageUrl = baseUrl + imagePath
+
+        try {
+          const response = await fetch(imageUrl, { method: "HEAD" })
+          if (response.ok) {
+            const contentLength = response.headers.get("content-length")
+            const size = contentLength ? Number.parseInt(contentLength) : 0
+
+            if (verbose) {
+              console.log(`[Worker ${workerId}] ✓ Found remote image at location ${i + 1}: ${imageUrl}`)
+              console.log(`[Worker ${workerId}] Image size: ${size} bytes`)
+            }
+
+            // Download the image to temp directory for processing
+            let localImagePath = null
+            try {
+              localImagePath = await downloadRemoteFile(imageUrl, tempDir)
+              const stats = await fs.stat(localImagePath)
+
+              return {
+                exists: true,
+                size: stats.size,
+                path: localImagePath,
+                fileName: imageHref,
+                foundAt: `remote_location_${i + 1}`,
+                remoteUrl: imageUrl,
+              }
+            } catch (downloadError) {
+              if (verbose) {
+                console.log(`[Worker ${workerId}] ✗ Failed to download remote image: ${downloadError.message}`)
+              }
+              // Return info about found image even if download failed
+              return {
+                exists: true,
+                size: size,
+                path: imageUrl, // Use URL as path for remote
+                fileName: imageHref,
+                foundAt: `remote_location_${i + 1}`,
+                remoteUrl: imageUrl,
+                downloadFailed: true,
+              }
+            }
+          }
+        } catch (error) {
+          if (verbose && i < 3) {
+            console.log(`[Worker ${workerId}] ✗ Remote image not found at location ${i + 1}: ${imageUrl}`)
+          }
+        }
+      }
+
+      if (verbose) {
+        console.log(
+          `[Worker ${workerId}] ✗ Remote image not found in any of the ${possibleImagePaths.length} locations`,
+        )
+      }
+
+      return {
+        exists: false,
+        size: 0,
+        path: baseUrl + possibleImagePaths[0],
+        fileName: imageHref,
+        foundAt: "not_found",
+        remoteUrl: baseUrl + possibleImagePaths[0],
+      }
+    } catch (error) {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] ✗ Error searching for remote image: ${error.message}`)
+      }
+      return {
+        exists: false,
+        size: 0,
+        path: imageHref,
+        fileName: imageHref,
+        foundAt: "error",
+        error: error.message,
+      }
+    }
+  }
+
+  // Handle local images (existing logic)
   const xmlDir = path.dirname(xmlFilePath)
   const parentDir = path.dirname(xmlDir)
 
@@ -115,7 +277,7 @@ async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associat
   ]
 
   if (verbose) {
-    console.log(`[Worker ${workerId}] Searching for image: ${imageHref}`)
+    console.log(`[Worker ${workerId}] Searching for local image: ${imageHref}`)
     console.log(`[Worker ${workerId}] XML file: ${xmlFilePath}`)
     console.log(`[Worker ${workerId}] Trying ${possiblePaths.length} possible locations...`)
   }
@@ -365,7 +527,18 @@ async function moveImage(
       console.log(`  - XML file path: ${xmlFilePath}`)
     }
 
-    // Verify source image exists
+    // For remote images, sourceImagePath might be a URL or a temp file
+    const isRemoteSource = isRemotePath(sourceImagePath)
+
+    if (isRemoteSource) {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] ✗ Cannot move remote image directly: ${sourceImagePath}`)
+        console.log(`[Worker ${workerId}] Remote images need to be downloaded first`)
+      }
+      return false
+    }
+
+    // Verify source image exists (for local files)
     try {
       await fs.access(sourceImagePath)
       if (verbose) {
@@ -475,6 +648,8 @@ async function processXmlFileInWorker(
   originalRemoteXmlUrl,
   associatedImagePath,
 ) {
+  let tempDir = null
+
   try {
     if (verbose) {
       console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
@@ -482,25 +657,62 @@ async function processXmlFileInWorker(
       if (associatedImagePath) {
         console.log(`[Worker ${workerId}] Associated image: ${associatedImagePath}`)
       }
+      if (isRemote) {
+        console.log(`[Worker ${workerId}] Remote processing mode enabled`)
+      }
     }
 
-    const xmlContent = await fs.readFile(xmlFilePath, "utf-8")
+    // Create temp directory for remote file processing
+    if (isRemote) {
+      tempDir = await createTempDir()
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Created temp directory: ${tempDir}`)
+      }
+    }
+
+    // Read XML content (local or remote)
+    let xmlContent
+    if (isRemote) {
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Fetching remote XML: ${xmlFilePath}`)
+      }
+      xmlContent = await fetchRemoteFile(xmlFilePath)
+    } else {
+      xmlContent = await fs.readFile(xmlFilePath, "utf-8")
+    }
+
     const result = await parseStringPromise(xmlContent, {
       explicitArray: false,
       mergeAttrs: true,
     })
 
-    // Extract folder structure from local path
+    // Extract folder structure from local path or URL
     let city = "",
       year = "",
       month = ""
-    const pathParts = xmlFilePath.split(path.sep)
-    const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
-    if (yearIndex !== -1) {
-      year = pathParts[yearIndex]
-      if (yearIndex > 0) city = pathParts[yearIndex - 1]
-      if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
-        month = pathParts[yearIndex + 1]
+
+    if (isRemote) {
+      // Extract from URL path
+      const url = new URL(xmlFilePath)
+      const pathParts = url.pathname.split("/").filter((part) => part.length > 0)
+      const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
+      if (yearIndex !== -1) {
+        year = pathParts[yearIndex]
+        if (yearIndex > 0) city = pathParts[yearIndex - 1]
+        if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
+          month = pathParts[yearIndex + 1]
+        }
+      }
+    } else {
+      // Extract from local path
+      const pathParts = xmlFilePath.split(path.sep)
+      const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
+      if (yearIndex !== -1) {
+        year = pathParts[yearIndex]
+        if (yearIndex > 0) city = pathParts[yearIndex - 1]
+        if (yearIndex + 1 < pathParts.length && /^\d{2}$/.test(pathParts[yearIndex + 1])) {
+          month = pathParts[yearIndex + 1]
+        }
       }
     }
 
@@ -658,7 +870,7 @@ async function processXmlFileInWorker(
     let imageInfo = null
 
     if (imageHref) {
-      imageInfo = await findImagePath(xmlFilePath, imageHref, verbose, workerId, associatedImagePath)
+      imageInfo = await findImagePath(xmlFilePath, imageHref, verbose, workerId, associatedImagePath, isRemote, tempDir)
       imageExists = imageInfo.exists
       actualFileSize = imageInfo.size
       imagePath = imageInfo.path
@@ -670,6 +882,12 @@ async function processXmlFileInWorker(
         console.log(`  - Path: ${imagePath}`)
         if (imageInfo.foundAt) {
           console.log(`  - Found at: ${imageInfo.foundAt}`)
+        }
+        if (imageInfo.remoteUrl) {
+          console.log(`  - Remote URL: ${imageInfo.remoteUrl}`)
+        }
+        if (imageInfo.downloadFailed) {
+          console.log(`  - Download failed: ${imageInfo.downloadFailed}`)
         }
       }
     }
@@ -724,6 +942,8 @@ async function processXmlFileInWorker(
       imageExists &&
       imageHref &&
       imagePath &&
+      !isRemote && // Don't move remote images for now
+      !imageInfo?.downloadFailed &&
       // Move if filters are disabled (move all images)
       (!filterConfig?.enabled ||
         // Or move if filters are enabled and image passed
@@ -734,6 +954,8 @@ async function processXmlFileInWorker(
       console.log(`  - Move images enabled: ${filterConfig?.moveImages}`)
       console.log(`  - Destination path set: ${!!filterConfig?.moveDestinationPath}`)
       console.log(`  - Image exists: ${imageExists}`)
+      console.log(`  - Is remote: ${isRemote}`)
+      console.log(`  - Download failed: ${imageInfo?.downloadFailed || false}`)
       console.log(`  - Filters enabled: ${filterConfig?.enabled}`)
       console.log(`  - Passed filters: ${passed}`)
       console.log(`  - Should move: ${shouldMoveImage}`)
@@ -774,7 +996,7 @@ async function processXmlFileInWorker(
 
     if (verbose) {
       console.log(
-        `[Worker ${workerId}] File ${path.basename(xmlFilePath)} processed successfully. Passed filter: ${passed}, Image moved: ${moved}, Record included: ${shouldReturnRecord}`,
+        `[Worker ${workerId}] File ${isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)} processed successfully. Passed filter: ${passed}, Image moved: ${moved}, Record included: ${shouldReturnRecord}`,
       )
     }
 
@@ -790,6 +1012,14 @@ async function processXmlFileInWorker(
       console.error(`[Worker ${workerId}] Stack trace:`, err.stack)
     }
     return { record: null, passedFilter: false, imageMoved: false, error: err.message, workerId }
+  } finally {
+    // Cleanup temp directory
+    if (tempDir) {
+      await cleanupTempDir(tempDir)
+      if (verbose) {
+        console.log(`[Worker ${workerId}] Cleaned up temp directory: ${tempDir}`)
+      }
+    }
   }
 }
 
@@ -812,7 +1042,9 @@ async function main() {
     } = workerData
 
     if (verbose) {
-      console.log(`[Worker ${workerId}] Starting to process: ${path.basename(xmlFilePath)}`)
+      console.log(
+        `[Worker ${workerId}] Starting to process: ${isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)}`,
+      )
       console.log(`[Worker ${workerId}] Filter config received:`, JSON.stringify(filterConfig, null, 2))
       if (filterConfig?.enabled) {
         console.log(`[Worker ${workerId}] ✓ Filters are ENABLED`)
@@ -821,6 +1053,9 @@ async function main() {
       }
       if (filterConfig?.moveImages) {
         console.log(`[Worker ${workerId}] Image moving enabled to: ${filterConfig.moveDestinationPath}`)
+      }
+      if (isRemote) {
+        console.log(`[Worker ${workerId}] Remote processing mode: ${isRemote}`)
       }
     }
 
@@ -836,7 +1071,9 @@ async function main() {
     )
 
     if (verbose) {
-      console.log(`[Worker ${workerId}] Finished processing: ${path.basename(xmlFilePath)}`)
+      console.log(
+        `[Worker ${workerId}] Finished processing: ${isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)}`,
+      )
     }
 
     if (parentPort) {
