@@ -4,6 +4,7 @@ import path from "path"
 import { Worker } from "worker_threads"
 import { getPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
+import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
 
 interface ProcessingStats {
   totalFiles: number
@@ -90,8 +91,46 @@ export async function POST(request: NextRequest) {
           console.log(`  - Filters Enabled: ${filterConfig?.enabled || false}`)
         }
 
-        // Find all XML files
-        const xmlFiles = await findXMLFiles(rootDir)
+        // Check if this is a remote path
+        const isRemote = await isRemotePath(rootDir)
+
+        if (verbose) {
+          console.log(`[Stream API] Processing mode: ${isRemote ? "Remote" : "Local"}`)
+        }
+
+        // Find all XML files (local or remote)
+        let xmlFiles: any[] = []
+
+        if (isRemote) {
+          sendMessage("log", `Scanning remote directory: ${rootDir}`)
+
+          try {
+            const remoteFiles = await scanRemoteDirectory(rootDir, (message) => {
+              if (verbose) {
+                console.log(`[Stream API] Remote scan: ${message}`)
+                sendMessage("log", `Remote scan: ${message}`)
+              }
+            })
+
+            // Convert RemoteFile objects to file paths (URLs)
+            xmlFiles = remoteFiles.map((file) => file.url)
+
+            if (verbose) {
+              console.log(`[Stream API] Found ${xmlFiles.length} remote XML files`)
+              if (xmlFiles.length > 0) {
+                console.log(`[Stream API] Sample files:`, xmlFiles.slice(0, 3))
+              }
+            }
+          } catch (error) {
+            const errorMsg = `Failed to scan remote directory: ${error instanceof Error ? error.message : "Unknown error"}`
+            console.error(`[Stream API] ${errorMsg}`)
+            sendMessage("error", errorMsg)
+            safeCloseController()
+            return
+          }
+        } else {
+          xmlFiles = await findXMLFiles(rootDir)
+        }
 
         if (xmlFiles.length === 0) {
           sendMessage("error", "No XML files found in the specified directory")
@@ -124,6 +163,7 @@ export async function POST(request: NextRequest) {
             verbose,
             filterConfig,
             processingMode: "stream",
+            isRemote,
           },
           progress: {
             totalFiles: stats.totalFiles,
@@ -258,7 +298,7 @@ export async function POST(request: NextRequest) {
           }
 
           const batchPromises = batch.map((xmlFile, index) =>
-            processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, i + index + 1),
+            processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, i + index + 1, isRemote),
           )
 
           try {
@@ -376,7 +416,10 @@ export async function POST(request: NextRequest) {
                 await fs.appendFile(outputPath, csvLine, "utf8")
 
                 if (verbose) {
-                  sendMessage("log", `Processed file: ${path.basename(result.record.xmlPath || "unknown")} - Success`)
+                  const fileName = isRemote
+                    ? new URL(result.record.xmlPath).pathname.split("/").pop()
+                    : path.basename(result.record.xmlPath || "unknown")
+                  sendMessage("log", `Processed file: ${fileName} - Success`)
                 }
               } else {
                 stats.errorFiles++
@@ -591,6 +634,7 @@ async function processFile(
   activeWorkers: Set<Worker>,
   originalRootDir: string,
   workerId: number,
+  isRemote = false,
 ): Promise<WorkerResult> {
   return new Promise((resolve) => {
     // Check for pause/stop before creating worker
@@ -606,8 +650,10 @@ async function processFile(
       return
     }
 
+    const fileName = isRemote ? new URL(xmlFile).pathname.split("/").pop() : path.basename(xmlFile)
+
     if (verbose) {
-      console.log(`[Stream API] Creating worker ${workerId} for file: ${path.basename(xmlFile)}`)
+      console.log(`[Stream API] Creating worker ${workerId} for file: ${fileName}`)
     }
 
     const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"), {
@@ -617,8 +663,8 @@ async function processFile(
         originalRootDir: originalRootDir,
         workerId: workerId,
         verbose: verbose,
-        isRemote: false,
-        originalRemoteXmlUrl: null,
+        isRemote: isRemote,
+        originalRemoteXmlUrl: isRemote ? xmlFile : null,
         associatedImagePath: null,
         isWatchMode: false,
       },
