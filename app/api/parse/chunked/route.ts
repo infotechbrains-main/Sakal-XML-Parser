@@ -145,14 +145,26 @@ export async function POST(request: NextRequest) {
           sendMessage("log", "Scanning remote directory for XML files...")
 
           try {
-            const remoteFiles = await scanRemoteDirectory(rootDir, (message) => {
-              sendMessage("log", message)
-            })
+            // Limit scanning depth to prevent infinite loops
+            const remoteFiles = await scanRemoteDirectory(
+              rootDir,
+              (message) => {
+                sendMessage("log", message)
+              },
+              4,
+            ) // Max depth of 4 levels
 
             xmlFiles = remoteFiles.map((file) => file.url)
 
             if (verbose) {
               console.log(`[Chunked API] Found ${xmlFiles.length} remote XML files`)
+            }
+
+            if (xmlFiles.length === 0) {
+              sendMessage("log", "No XML files found in remote directory. Scanning may have been limited by depth.")
+              sendMessage("error", "No XML files found in the specified remote directory")
+              safeCloseController()
+              return
             }
           } catch (error) {
             const errorMsg = `Failed to scan remote directory: ${error instanceof Error ? error.message : "Unknown error"}`

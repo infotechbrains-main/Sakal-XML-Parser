@@ -3,13 +3,13 @@ import path from "path"
 import os from "os"
 import { createWriteStream } from "fs"
 import { pipeline } from "stream/promises"
+import { promises as fsPromise } from "fs"
 
 export interface RemoteFile {
   name: string
   url: string
-  localPath?: string
   size?: number
-  directory?: string
+  lastModified?: string
 }
 
 export interface RemoteDirectory {
@@ -19,8 +19,8 @@ export interface RemoteDirectory {
   subdirectories: RemoteDirectory[]
 }
 
-export async function isRemotePath(path: string): Promise<boolean> {
-  return path.startsWith("http://") || path.startsWith("https://")
+export async function isRemotePath(filePath: string): Promise<boolean> {
+  return filePath && (filePath.startsWith("http://") || filePath.startsWith("https://"))
 }
 
 // Helper function to check if a URL is within the allowed base path
@@ -204,7 +204,7 @@ export async function downloadFile(fileUrl: string, tempDir: string): Promise<st
 }
 
 export async function createTempDirectory(): Promise<string> {
-  const tempDir = path.join(os.tmpdir(), `xml-parser-${Date.now()}`)
+  const tempDir = path.join(os.tmpdir(), `xml-parser-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`)
   await fs.mkdir(tempDir, { recursive: true })
   return tempDir
 }
@@ -213,7 +213,7 @@ export async function cleanupTempDirectory(tempDir: string): Promise<void> {
   try {
     await fs.rm(tempDir, { recursive: true, force: true })
   } catch (error) {
-    console.error(`Error cleaning up temp directory ${tempDir}:`, error)
+    console.error("Error cleaning up temp directory:", error)
   }
 }
 
@@ -341,69 +341,185 @@ export async function scanTopLevelFolders(
   }
 }
 
+// Scan remote directory
 export async function scanRemoteDirectory(
   baseUrl: string,
   onProgress?: (message: string) => void,
+  maxDepth = 3,
 ): Promise<RemoteFile[]> {
-  onProgress?.(`Starting scan of: ${baseUrl}`)
+  const xmlFiles: RemoteFile[] = []
+  const visitedUrls = new Set<string>()
 
-  try {
-    // Determine if this is a specific folder or root level scan
-    const url = new URL(baseUrl)
-    const pathParts = url.pathname.split("/").filter((part) => part.length > 0)
-
-    // If the path ends with a specific folder name (not just the app root)
-    // Example: /photoapp/charitra vs /photoapp/ or /photoapp
-    const isSpecificFolder = pathParts.length > 1 && !baseUrl.endsWith("/photoapp/") && !baseUrl.endsWith("/photoapp")
-
-    if (isSpecificFolder) {
-      onProgress?.(`Detected specific folder scan: ${baseUrl}`)
-      return await scanFolderCompletely(baseUrl, baseUrl, 10, 0, onProgress)
-    } else {
-      onProgress?.(`Detected root level scan: ${baseUrl}`)
-      return await scanTopLevelFolders(baseUrl, onProgress)
+  async function scanDirectory(url: string, depth = 0): Promise<void> {
+    if (depth > maxDepth || visitedUrls.has(url)) {
+      return
     }
-  } catch (error) {
-    onProgress?.(
-      `Error determining scan type for ${baseUrl}: ${error instanceof Error ? error.message : "Unknown error"}`,
-    )
-    // Fallback to complete folder scan
-    return await scanFolderCompletely(baseUrl, baseUrl, 10, 0, onProgress)
+
+    visitedUrls.add(url)
+
+    try {
+      if (onProgress) {
+        onProgress(`Scanning: ${url}`)
+      }
+
+      console.log(`Fetching directory listing from: ${url}`)
+      const response = await fetch(url)
+
+      if (!response.ok) {
+        console.log(`Failed to fetch ${url}: ${response.status}`)
+        return
+      }
+
+      const html = await response.text()
+      console.log(`HTML response length: ${html.length}`)
+
+      // Parse HTML to find links
+      const links = parseDirectoryListing(html, url)
+
+      const xmlFilesInDir = links.filter((link) => link.name.toLowerCase().endsWith(".xml"))
+
+      const subdirectories = links.filter(
+        (link) => link.name.endsWith("/") && !link.name.startsWith("..") && link.name !== "/",
+      )
+
+      console.log(`Found ${xmlFilesInDir.length} XML files and ${subdirectories.length} directories in bounds`)
+
+      // Add XML files
+      for (const xmlFile of xmlFilesInDir) {
+        xmlFiles.push({
+          name: xmlFile.name,
+          url: xmlFile.url,
+          size: xmlFile.size,
+        })
+      }
+
+      if (xmlFilesInDir.length > 0) {
+        console.log(`XML files found: ${xmlFilesInDir.map((f) => f.name).join(", ")}`)
+      }
+
+      // Only scan subdirectories if we haven't found XML files in current directory
+      // This prevents infinite recursion through media folders
+      if (xmlFilesInDir.length === 0 && depth < maxDepth) {
+        if (subdirectories.length > 0) {
+          console.log(`Directories found: ${subdirectories.map((d) => d.name).join(", ")}`)
+        }
+
+        // Prioritize 'processed' directories over 'media' directories
+        const processedDirs = subdirectories.filter((dir) => dir.name.toLowerCase().includes("processed"))
+        const otherDirs = subdirectories.filter(
+          (dir) => !dir.name.toLowerCase().includes("processed") && !dir.name.toLowerCase().includes("media"),
+        )
+
+        // Scan processed directories first
+        for (const dir of processedDirs) {
+          await scanDirectory(dir.url, depth + 1)
+        }
+
+        // Then scan other directories (but skip media if we found XML files)
+        for (const dir of otherDirs) {
+          await scanDirectory(dir.url, depth + 1)
+        }
+      }
+    } catch (error) {
+      console.error(`Error scanning ${url}:`, error)
+      if (onProgress) {
+        onProgress(`Error scanning ${url}: ${error instanceof Error ? error.message : "Unknown error"}`)
+      }
+    }
   }
+
+  await scanDirectory(baseUrl)
+
+  if (onProgress) {
+    onProgress(`Scan complete. Found ${xmlFiles.length} XML files.`)
+  }
+
+  return xmlFiles
 }
 
-// Alternative method to try direct file access if directory listing fails
-export async function tryDirectFileAccess(baseUrl: string, commonXmlNames: string[] = []): Promise<RemoteFile[]> {
+function parseDirectoryListing(html: string, baseUrl: string): RemoteFile[] {
   const files: RemoteFile[] = []
 
-  // Common XML file patterns to try
-  const defaultPatterns = ["data.xml", "metadata.xml", "index.xml", "config.xml"]
+  // Common patterns for directory listings
+  const patterns = [
+    // Apache directory listing
+    /<a href="([^"]+)"[^>]*>([^<]+)<\/a>/gi,
+    // Nginx directory listing
+    /<a href="([^"]+)">([^<]+)<\/a>/gi,
+    // IIS directory listing
+    /<A HREF="([^"]+)">([^<]+)<\/A>/gi,
+  ]
 
-  const patternsToTry = [...commonXmlNames, ...defaultPatterns]
+  for (const pattern of patterns) {
+    let match
+    pattern.lastIndex = 0 // Reset regex
 
-  for (const pattern of patternsToTry) {
-    try {
-      const fileUrl = new URL(pattern, baseUrl).toString()
+    while ((match = pattern.exec(html)) !== null) {
+      const href = match[1]
+      const name = match[2].trim()
 
-      // Ensure the direct file access is within base path
-      if (!isWithinBasePath(baseUrl, fileUrl)) {
+      // Skip parent directory links and self references
+      if (href === "../" || href === "./" || name === "Parent Directory" || name === "..") {
         continue
       }
 
-      const response = await fetch(fileUrl, { method: "HEAD" })
-
-      if (response.ok) {
-        files.push({
-          name: pattern,
-          url: fileUrl,
-          directory: baseUrl,
-        })
+      // Skip common non-content files
+      if (name.match(/^(index\.|default\.|robots\.txt|favicon\.ico)/i)) {
+        continue
       }
-    } catch (error) {
-      // Ignore errors for direct file access attempts
-      continue
+
+      // Create full URL
+      let fullUrl: string
+      if (href.startsWith("http://") || href.startsWith("https://")) {
+        fullUrl = href
+      } else {
+        const cleanBaseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/"
+        const cleanHref = href.startsWith("/") ? href.substring(1) : href
+        fullUrl = cleanBaseUrl + cleanHref
+      }
+
+      // Decode URL-encoded names
+      const decodedName = decodeURIComponent(name)
+
+      files.push({
+        name: decodedName,
+        url: fullUrl,
+      })
+    }
+
+    // If we found files with this pattern, use them
+    if (files.length > 0) {
+      break
     }
   }
 
   return files
+}
+
+export async function fetchRemoteFile(url: string): Promise<string> {
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+    return await response.text()
+  } catch (error) {
+    throw new Error(`Failed to fetch remote file ${url}: ${error instanceof Error ? error.message : "Unknown error"}`)
+  }
+}
+
+export async function downloadRemoteFile(url: string, localPath: string): Promise<void> {
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+
+    const buffer = await response.arrayBuffer()
+    await fsPromise.writeFile(localPath, Buffer.from(buffer))
+  } catch (error) {
+    throw new Error(
+      `Failed to download remote file ${url}: ${error instanceof Error ? error.message : "Unknown error"}`,
+    )
+  }
 }
