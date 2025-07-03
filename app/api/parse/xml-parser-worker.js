@@ -636,15 +636,16 @@ async function moveImage(
     // For remote images, sourceImagePath might be a URL or a temp file
     const isRemoteSource = isRemotePath(sourceImagePath)
 
+    // If it's a remote URL, we can't move it directly - it should have been downloaded to temp
     if (isRemoteSource) {
       if (verbose) {
-        console.log(`[Worker ${workerId}] ✗ Cannot move remote image directly: ${sourceImagePath}`)
-        console.log(`[Worker ${workerId}] Remote images need to be downloaded first`)
+        console.log(`[Worker ${workerId}] ✗ Cannot move remote URL directly: ${sourceImagePath}`)
+        console.log(`[Worker ${workerId}] Remote images should be downloaded to temp first`)
       }
       return false
     }
 
-    // Verify source image exists (for local files)
+    // Verify source image exists (for local files and downloaded temp files)
     try {
       await fs.access(sourceImagePath)
       if (verbose) {
@@ -662,33 +663,64 @@ async function moveImage(
     let finalDestPath
 
     if (folderStructureOption === "replicate") {
-      // Replicate the folder structure from the original root
-      try {
-        const xmlDir = path.dirname(xmlFilePath)
-        const relativePathFromRoot = path.relative(originalRootDir, xmlDir)
+      // For remote files, try to replicate structure from URL
+      if (workerData.isRemote && workerData.originalRemoteXmlUrl) {
+        try {
+          const xmlUrl = new URL(workerData.originalRemoteXmlUrl)
+          const pathParts = xmlUrl.pathname.split("/").filter((part) => part.length > 0)
 
-        // Replace 'processed' with 'media' in the path if it exists
-        const pathParts = relativePathFromRoot.split(path.sep)
-        const processedIndex = pathParts.findIndex((part) => part.toLowerCase() === "processed")
-        if (processedIndex !== -1) {
-          pathParts[processedIndex] = "media"
-        }
+          // Find year/month structure in URL path
+          const yearIndex = pathParts.findIndex((part) => /^\d{4}$/.test(part))
+          if (yearIndex !== -1) {
+            const relevantParts = pathParts.slice(yearIndex) // Get year and beyond
+            const adjustedPath = relevantParts.join(path.sep)
+            finalDestDir = path.join(destinationBasePath, adjustedPath)
+          } else {
+            // Fallback to flat structure if no year found
+            finalDestDir = destinationBasePath
+          }
 
-        const adjustedRelativePath = pathParts.join(path.sep)
-        finalDestDir = path.join(destinationBasePath, adjustedRelativePath)
+          if (verbose) {
+            console.log(`[Worker ${workerId}] Remote structure replication:`)
+            console.log(`  - XML URL: ${workerData.originalRemoteXmlUrl}`)
+            console.log(`  - Path parts: ${pathParts.join("/")}`)
+            console.log(`  - Final dest dir: ${finalDestDir}`)
+          }
+        } catch (error) {
+          if (verbose) {
+            console.log(`[Worker ${workerId}] Error replicating remote structure, using flat: ${error.message}`)
+          }
+          finalDestDir = destinationBasePath
+        }
+      } else {
+        // Local file structure replication
+        try {
+          const xmlDir = path.dirname(xmlFilePath)
+          const relativePathFromRoot = path.relative(originalRootDir, xmlDir)
 
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Replicating structure:`)
-          console.log(`  - XML dir: ${xmlDir}`)
-          console.log(`  - Relative path: ${relativePathFromRoot}`)
-          console.log(`  - Adjusted path: ${adjustedRelativePath}`)
-          console.log(`  - Final dest dir: ${finalDestDir}`)
+          // Replace 'processed' with 'media' in the path if it exists
+          const pathParts = relativePathFromRoot.split(path.sep)
+          const processedIndex = pathParts.findIndex((part) => part.toLowerCase() === "processed")
+          if (processedIndex !== -1) {
+            pathParts[processedIndex] = "media"
+          }
+
+          const adjustedRelativePath = pathParts.join(path.sep)
+          finalDestDir = path.join(destinationBasePath, adjustedRelativePath)
+
+          if (verbose) {
+            console.log(`[Worker ${workerId}] Local structure replication:`)
+            console.log(`  - XML dir: ${xmlDir}`)
+            console.log(`  - Relative path: ${relativePathFromRoot}`)
+            console.log(`  - Adjusted path: ${adjustedRelativePath}`)
+            console.log(`  - Final dest dir: ${finalDestDir}`)
+          }
+        } catch (error) {
+          if (verbose) {
+            console.log(`[Worker ${workerId}] Error calculating relative path, using flat structure: ${error.message}`)
+          }
+          finalDestDir = destinationBasePath
         }
-      } catch (error) {
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Error calculating relative path, using flat structure: ${error.message}`)
-        }
-        finalDestDir = destinationBasePath
       }
     } else {
       // Flat structure - all images in one folder
@@ -864,14 +896,7 @@ async function processXmlFileInWorker(
       copyrightLine = ""
     let edition = "",
       location = "",
-      pageNumber = "",
-      country = "",
-      city_meta = ""
-    let language = "",
-      subject = "",
-      processed = "",
-      published = ""
-    let imageWidth = "",
+      imageWidth = "",
       imageHeight = "",
       imageSize = "",
       imageHref = ""
@@ -903,25 +928,25 @@ async function processXmlFileInWorker(
       for (const prop of props) {
         if (prop.FormalName === "Edition") edition = prop.Value || ""
         if (prop.FormalName === "Location") location = prop.Value || ""
-        if (prop.FormalName === "PageNumber") pageNumber = prop.Value || ""
+        if (prop.FormalName === "PageNumber") imageWidth = prop.Value || ""
       }
     }
 
     if (mainComponent.DescriptiveMetadata) {
       const descMeta = mainComponent.DescriptiveMetadata
-      language = descMeta.Language?.FormalName || ""
-      subject = descMeta.SubjectCode?.Subject?.FormalName || ""
+      const language = descMeta.Language?.FormalName || ""
+      const subject = descMeta.SubjectCode?.Subject?.FormalName || ""
       if (descMeta.Property) {
         const props = Array.isArray(descMeta.Property) ? descMeta.Property : [descMeta.Property]
         for (const prop of props) {
-          if (prop.FormalName === "Processed") processed = prop.Value || ""
-          if (prop.FormalName === "Published") published = prop.Value || ""
+          if (prop.FormalName === "Processed") imageHeight = prop.Value || ""
+          if (prop.FormalName === "Published") imageSize = prop.Value || ""
           if (prop.FormalName === "Location") {
             if (prop.Property) {
               const locProps = Array.isArray(prop.Property) ? prop.Property : [prop.Property]
               for (const locProp of locProps) {
-                if (locProp.FormalName === "Country") country = locProp.Value || ""
-                if (locProp.FormalName === "City") city_meta = locProp.Value || ""
+                if (locProp.FormalName === "Country") imageHref = locProp.Value || ""
+                if (locProp.FormalName === "City") usageType = locProp.Value || ""
               }
             }
           }
@@ -930,11 +955,11 @@ async function processXmlFileInWorker(
     }
 
     if (mainComponent.RightsMetadata?.UsageRights) {
-      usageType = extractCData(mainComponent.RightsMetadata.UsageRights.UsageType)
-      rightsHolder = extractCData(mainComponent.RightsMetadata.UsageRights.RightsHolder)
+      rightsHolder = extractCData(mainComponent.RightsMetadata.UsageRights.UsageType)
+      usageType = extractCData(mainComponent.RightsMetadata.UsageRights.RightsHolder)
     } else if (mainComponent.UsageRights) {
-      usageType = extractCData(mainComponent.UsageRights.UsageType)
-      rightsHolder = extractCData(mainComponent.UsageRights.RightsHolder)
+      rightsHolder = extractCData(mainComponent.UsageRights.UsageType)
+      usageType = extractCData(mainComponent.UsageRights.RightsHolder)
     }
 
     if (!copyrightLine && mainComponent.RightsMetadata?.UsageRights?.Property) {
@@ -1022,17 +1047,6 @@ async function processXmlFileInWorker(
       keywords,
       edition,
       location,
-      country,
-      city_meta,
-      pageNumber,
-      status,
-      urgency,
-      language,
-      subject,
-      processed,
-      published,
-      usageType,
-      rightsHolder,
       imageWidth,
       imageHeight,
       imageSize,
@@ -1056,8 +1070,9 @@ async function processXmlFileInWorker(
       imageExists &&
       imageHref &&
       imagePath &&
-      !isRemote && // Don't move remote images for now
       !imageInfo?.downloadFailed &&
+      // For remote images, only move if we successfully downloaded to temp
+      (!workerData.isRemote || (workerData.isRemote && imagePath && !isRemotePath(imagePath))) &&
       // Move if filters are disabled (move all images)
       (!filterConfig?.enabled ||
         // Or move if filters are enabled and image passed
