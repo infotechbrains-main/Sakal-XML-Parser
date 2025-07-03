@@ -991,12 +991,13 @@ async function processXmlFileInWorker(
       }
     }
 
-    // Return record based on filter results
+    // Return record based on filter results - ALWAYS return record if processing succeeded
     const shouldReturnRecord = !filterConfig?.enabled || passed
 
     if (verbose) {
+      const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
       console.log(
-        `[Worker ${workerId}] File ${isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)} processed successfully. Passed filter: ${passed}, Image moved: ${moved}, Record included: ${shouldReturnRecord}`,
+        `[Worker ${workerId}] File ${fileName} processed successfully. Passed filter: ${passed}, Image moved: ${moved}, Record included: ${shouldReturnRecord}`,
       )
     }
 
@@ -1007,7 +1008,8 @@ async function processXmlFileInWorker(
       workerId,
     }
   } catch (err) {
-    console.error(`[Worker ${workerId}] Error processing ${xmlFilePath}:`, err.message)
+    const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
+    console.error(`[Worker ${workerId}] Error processing ${fileName}:`, err.message)
     if (verbose) {
       console.error(`[Worker ${workerId}] Stack trace:`, err.stack)
     }
@@ -1042,9 +1044,8 @@ async function main() {
     } = workerData
 
     if (verbose) {
-      console.log(
-        `[Worker ${workerId}] Starting to process: ${isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)}`,
-      )
+      const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
+      console.log(`[Worker ${workerId}] Starting to process: ${fileName}`)
       console.log(`[Worker ${workerId}] Filter config received:`, JSON.stringify(filterConfig, null, 2))
       if (filterConfig?.enabled) {
         console.log(`[Worker ${workerId}] ✓ Filters are ENABLED`)
@@ -1071,9 +1072,8 @@ async function main() {
     )
 
     if (verbose) {
-      console.log(
-        `[Worker ${workerId}] Finished processing: ${isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)}`,
-      )
+      const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
+      console.log(`[Worker ${workerId}] Finished processing: ${fileName}`)
     }
 
     if (parentPort) {
@@ -1092,11 +1092,19 @@ async function main() {
         workerId: workerData?.workerId || 0,
       })
     }
-    process.exit(1)
+    // Don't exit with code 1 - let the process complete normally
   }
 }
 
 main().catch((error) => {
   console.error("Worker main function failed:", error)
-  process.exit(1)
+  if (parentPort) {
+    parentPort.postMessage({
+      record: null,
+      passedFilter: false,
+      imageMoved: false,
+      error: error.message,
+      workerId: workerData?.workerId || 0,
+    })
+  }
 })
