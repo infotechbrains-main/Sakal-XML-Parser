@@ -3,6 +3,36 @@ const fs = require("fs/promises")
 const path = require("path")
 const { parseStringPromise } = require("xml2js")
 
+// Add comprehensive error tracking
+const workerState = {
+  id: workerData?.workerId || "unknown",
+  status: "initializing",
+  currentStep: "startup",
+  errors: [],
+  warnings: [],
+}
+
+function logWorkerState(step, details = "") {
+  workerState.currentStep = step
+  if (workerData?.verbose) {
+    console.log(`[Worker ${workerState.id}] STATE: ${step} ${details}`)
+  }
+}
+
+function logWorkerError(error, step = "unknown") {
+  const errorInfo = {
+    step,
+    message: error.message,
+    stack: error.stack,
+    timestamp: new Date().toISOString(),
+  }
+  workerState.errors.push(errorInfo)
+  console.error(`[Worker ${workerState.id}] ERROR in ${step}:`, error.message)
+  if (workerData?.verbose) {
+    console.error(`[Worker ${workerState.id}] ERROR STACK:`, error.stack)
+  }
+}
+
 // Helper function to check if a path is remote
 function isRemotePath(filePath) {
   return filePath && (filePath.startsWith("http://") || filePath.startsWith("https://"))
@@ -11,12 +41,16 @@ function isRemotePath(filePath) {
 // Helper function to fetch remote file content
 async function fetchRemoteFile(url) {
   try {
+    logWorkerState("fetching_remote_file", url)
     const response = await fetch(url)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`)
     }
-    return await response.text()
+    const content = await response.text()
+    logWorkerState("fetched_remote_file", `${content.length} bytes`)
+    return content
   } catch (error) {
+    logWorkerError(error, "fetchRemoteFile")
     throw new Error(`Failed to fetch remote file ${url}: ${error.message}`)
   }
 }
@@ -24,6 +58,7 @@ async function fetchRemoteFile(url) {
 // Helper function to download remote file to temp location
 async function downloadRemoteFile(url, tempDir) {
   try {
+    logWorkerState("downloading_remote_file", url)
     const response = await fetch(url)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`)
@@ -35,481 +70,539 @@ async function downloadRemoteFile(url, tempDir) {
     const buffer = await response.arrayBuffer()
     await fs.writeFile(localPath, Buffer.from(buffer))
 
+    logWorkerState("downloaded_remote_file", `${buffer.byteLength} bytes to ${localPath}`)
     return localPath
   } catch (error) {
+    logWorkerError(error, "downloadRemoteFile")
     throw new Error(`Failed to download remote file ${url}: ${error.message}`)
   }
 }
 
 // Helper function to create temp directory
 async function createTempDir() {
-  const tempDir = path.join(
-    require("os").tmpdir(),
-    `xml-parser-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-  )
-  await fs.mkdir(tempDir, { recursive: true })
-  return tempDir
+  try {
+    logWorkerState("creating_temp_dir")
+    const tempDir = path.join(
+      require("os").tmpdir(),
+      `xml-parser-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+    )
+    await fs.mkdir(tempDir, { recursive: true })
+    logWorkerState("created_temp_dir", tempDir)
+    return tempDir
+  } catch (error) {
+    logWorkerError(error, "createTempDir")
+    throw error
+  }
 }
 
 // Helper function to cleanup temp directory
 async function cleanupTempDir(tempDir) {
   try {
+    logWorkerState("cleaning_temp_dir", tempDir)
     await fs.rm(tempDir, { recursive: true, force: true })
+    logWorkerState("cleaned_temp_dir", tempDir)
   } catch (error) {
-    // Ignore cleanup errors
+    logWorkerError(error, "cleanupTempDir")
+    // Don't throw - cleanup errors are not critical
   }
 }
 
 // Helper function to find the main news component
 function findMainNewsComponent(newsComponent) {
-  if (!newsComponent) return null
-  if (typeof newsComponent !== "object") return null
+  try {
+    logWorkerState("finding_main_news_component")
+    if (!newsComponent) return null
+    if (typeof newsComponent !== "object") return null
 
-  if (newsComponent.Role && newsComponent.Role.FormalName === "PICTURE") return newsComponent
+    if (newsComponent.Role && newsComponent.Role.FormalName === "PICTURE") return newsComponent
 
-  if (newsComponent.NewsComponent) {
-    const components = Array.isArray(newsComponent.NewsComponent)
-      ? newsComponent.NewsComponent
-      : [newsComponent.NewsComponent]
-    for (const comp of components) {
-      const found = findMainNewsComponent(comp)
-      if (found) return found
+    if (newsComponent.NewsComponent) {
+      const components = Array.isArray(newsComponent.NewsComponent)
+        ? newsComponent.NewsComponent
+        : [newsComponent.NewsComponent]
+      for (const comp of components) {
+        const found = findMainNewsComponent(comp)
+        if (found) return found
+      }
     }
+    return null
+  } catch (error) {
+    logWorkerError(error, "findMainNewsComponent")
+    return null
   }
-  return null
 }
 
 // Helper function to extract CDATA content
 function extractCData(element) {
-  if (!element) return ""
+  try {
+    if (!element) return ""
 
-  if (typeof element === "string") {
-    return element.trim()
-  }
-
-  if (element && typeof element === "object" && element.hasOwnProperty("_")) {
-    const content = String(element._).trim()
-    return content
-  }
-
-  if (element && typeof element === "object" && element.$ && element.$.Value) {
-    return String(element.$.Value).trim()
-  }
-
-  if (element && typeof element === "object") {
-    const keys = Object.keys(element)
-    if (keys.length === 0) return ""
-
-    if (element.toString && element.toString() !== "[object Object]") {
-      return element.toString().trim()
+    if (typeof element === "string") {
+      return element.trim()
     }
-  }
 
-  return ""
+    if (element && typeof element === "object" && element.hasOwnProperty("_")) {
+      const content = String(element._).trim()
+      return content
+    }
+
+    if (element && typeof element === "object" && element.$ && element.$.Value) {
+      return String(element.$.Value).trim()
+    }
+
+    if (element && typeof element === "object") {
+      const keys = Object.keys(element)
+      if (keys.length === 0) return ""
+
+      if (element.toString && element.toString() !== "[object Object]") {
+        return element.toString().trim()
+      }
+    }
+
+    return ""
+  } catch (error) {
+    logWorkerError(error, "extractCData")
+    return ""
+  }
 }
 
 // Helper function to check if file is an image
 function isImageFile(fileName) {
-  const imageExtensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".svg"]
-  const ext = path.extname(fileName).toLowerCase()
-  return imageExtensions.includes(ext)
+  try {
+    const imageExtensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".svg"]
+    const ext = path.extname(fileName).toLowerCase()
+    return imageExtensions.includes(ext)
+  } catch (error) {
+    logWorkerError(error, "isImageFile")
+    return false
+  }
 }
 
 // Enhanced image path finder - tries multiple possible locations
 async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associatedImagePath, isRemote, tempDir) {
-  if (!imageHref) return null
+  try {
+    logWorkerState("finding_image_path", imageHref)
 
-  // If we have an associated image path from the watcher, use it first
-  if (associatedImagePath && workerData.isWatchMode) {
-    try {
-      await fs.access(associatedImagePath)
-      const stats = await fs.stat(associatedImagePath)
+    if (!imageHref) return null
 
-      if (verbose) {
-        console.log(`[Worker ${workerId}] ✓ Using associated image from watcher: ${associatedImagePath}`)
-        console.log(`[Worker ${workerId}] Image size: ${stats.size} bytes`)
-      }
+    // If we have an associated image path from the watcher, use it first
+    if (associatedImagePath && workerData.isWatchMode) {
+      try {
+        await fs.access(associatedImagePath)
+        const stats = await fs.stat(associatedImagePath)
 
-      return {
-        exists: true,
-        size: stats.size,
-        path: associatedImagePath,
-        fileName: path.basename(associatedImagePath),
-        foundAt: "watcher_provided",
-      }
-    } catch (error) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] ✗ Associated image from watcher not accessible: ${associatedImagePath}`)
-      }
-    }
-  }
+        if (verbose) {
+          console.log(`[Worker ${workerId}] ✓ Using associated image from watcher: ${associatedImagePath}`)
+          console.log(`[Worker ${workerId}] Image size: ${stats.size} bytes`)
+        }
 
-  // Handle remote images
-  if (isRemote) {
-    try {
-      // Try to construct the image URL based on the XML URL
-      const xmlUrl = new URL(xmlFilePath)
-      const baseUrl = `${xmlUrl.protocol}//${xmlUrl.host}`
-      const xmlPath = xmlUrl.pathname
-
-      // Try different possible image locations relative to XML
-      const possibleImagePaths = [
-        // Same directory as XML
-        path.dirname(xmlPath) + "/" + imageHref,
-        // Media folder at same level
-        path.dirname(path.dirname(xmlPath)) + "/media/" + imageHref,
-        // Images folder at same level
-        path.dirname(path.dirname(xmlPath)) + "/images/" + imageHref,
-        // Root media folder
-        "/media/" + imageHref,
-        // Root images folder
-        "/images/" + imageHref,
-      ]
-
-      if (verbose) {
-        console.log(`[Worker ${workerId}] Searching for remote image: ${imageHref}`)
-        console.log(`[Worker ${workerId}] XML URL: ${xmlFilePath}`)
-        console.log(`[Worker ${workerId}] Trying ${possibleImagePaths.length} possible remote locations...`)
-      }
-
-      for (let i = 0; i < possibleImagePaths.length; i++) {
-        const imagePath = possibleImagePaths[i]
-        const imageUrl = baseUrl + imagePath
-
-        try {
-          const response = await fetch(imageUrl, { method: "HEAD" })
-          if (response.ok) {
-            const contentLength = response.headers.get("content-length")
-            const size = contentLength ? Number.parseInt(contentLength) : 0
-
-            if (verbose) {
-              console.log(`[Worker ${workerId}] ✓ Found remote image at location ${i + 1}: ${imageUrl}`)
-              console.log(`[Worker ${workerId}] Image size: ${size} bytes`)
-            }
-
-            // Download the image to temp directory for processing
-            let localImagePath = null
-            try {
-              localImagePath = await downloadRemoteFile(imageUrl, tempDir)
-              const stats = await fs.stat(localImagePath)
-
-              return {
-                exists: true,
-                size: stats.size,
-                path: localImagePath,
-                fileName: imageHref,
-                foundAt: `remote_location_${i + 1}`,
-                remoteUrl: imageUrl,
-              }
-            } catch (downloadError) {
-              if (verbose) {
-                console.log(`[Worker ${workerId}] ✗ Failed to download remote image: ${downloadError.message}`)
-              }
-              // Return info about found image even if download failed
-              return {
-                exists: true,
-                size: size,
-                path: imageUrl, // Use URL as path for remote
-                fileName: imageHref,
-                foundAt: `remote_location_${i + 1}`,
-                remoteUrl: imageUrl,
-                downloadFailed: true,
-              }
-            }
-          }
-        } catch (error) {
-          if (verbose && i < 3) {
-            console.log(`[Worker ${workerId}] ✗ Remote image not found at location ${i + 1}: ${imageUrl}`)
-          }
+        return {
+          exists: true,
+          size: stats.size,
+          path: associatedImagePath,
+          fileName: path.basename(associatedImagePath),
+          foundAt: "watcher_provided",
+        }
+      } catch (error) {
+        if (verbose) {
+          console.log(`[Worker ${workerId}] ✗ Associated image from watcher not accessible: ${associatedImagePath}`)
         }
       }
+    }
 
-      if (verbose) {
-        console.log(
-          `[Worker ${workerId}] ✗ Remote image not found in any of the ${possibleImagePaths.length} locations`,
-        )
-      }
+    // Handle remote images
+    if (isRemote) {
+      try {
+        logWorkerState("searching_remote_image", imageHref)
 
-      return {
-        exists: false,
-        size: 0,
-        path: baseUrl + possibleImagePaths[0],
-        fileName: imageHref,
-        foundAt: "not_found",
-        remoteUrl: baseUrl + possibleImagePaths[0],
-      }
-    } catch (error) {
-      if (verbose) {
-        console.log(`[Worker ${workerId}] ✗ Error searching for remote image: ${error.message}`)
-      }
-      return {
-        exists: false,
-        size: 0,
-        path: imageHref,
-        fileName: imageHref,
-        foundAt: "error",
-        error: error.message,
+        // Try to construct the image URL based on the XML URL
+        const xmlUrl = new URL(xmlFilePath)
+        const baseUrl = `${xmlUrl.protocol}//${xmlUrl.host}`
+        const xmlPath = xmlUrl.pathname
+
+        // Try different possible image locations relative to XML
+        const possibleImagePaths = [
+          // Same directory as XML
+          path.dirname(xmlPath) + "/" + imageHref,
+          // Media folder at same level
+          path.dirname(path.dirname(xmlPath)) + "/media/" + imageHref,
+          // Images folder at same level
+          path.dirname(path.dirname(xmlPath)) + "/images/" + imageHref,
+          // Root media folder
+          "/media/" + imageHref,
+          // Root images folder
+          "/images/" + imageHref,
+        ]
+
+        if (verbose) {
+          console.log(`[Worker ${workerId}] Searching for remote image: ${imageHref}`)
+          console.log(`[Worker ${workerId}] XML URL: ${xmlFilePath}`)
+          console.log(`[Worker ${workerId}] Trying ${possibleImagePaths.length} possible remote locations...`)
+        }
+
+        for (let i = 0; i < possibleImagePaths.length; i++) {
+          const imagePath = possibleImagePaths[i]
+          const imageUrl = baseUrl + imagePath
+
+          try {
+            logWorkerState("checking_remote_image", `location ${i + 1}: ${imageUrl}`)
+            const response = await fetch(imageUrl, { method: "HEAD" })
+            if (response.ok) {
+              const contentLength = response.headers.get("content-length")
+              const size = contentLength ? Number.parseInt(contentLength) : 0
+
+              if (verbose) {
+                console.log(`[Worker ${workerId}] ✓ Found remote image at location ${i + 1}: ${imageUrl}`)
+                console.log(`[Worker ${workerId}] Image size: ${size} bytes`)
+              }
+
+              // Download the image to temp directory for processing
+              let localImagePath = null
+              try {
+                logWorkerState("downloading_found_image", imageUrl)
+                localImagePath = await downloadRemoteFile(imageUrl, tempDir)
+                const stats = await fs.stat(localImagePath)
+
+                logWorkerState("downloaded_found_image", `${stats.size} bytes`)
+                return {
+                  exists: true,
+                  size: stats.size,
+                  path: localImagePath,
+                  fileName: imageHref,
+                  foundAt: `remote_location_${i + 1}`,
+                  remoteUrl: imageUrl,
+                }
+              } catch (downloadError) {
+                logWorkerError(downloadError, "downloadFoundImage")
+                if (verbose) {
+                  console.log(`[Worker ${workerId}] ✗ Failed to download remote image: ${downloadError.message}`)
+                }
+                // Return info about found image even if download failed
+                return {
+                  exists: true,
+                  size: size,
+                  path: imageUrl, // Use URL as path for remote
+                  fileName: imageHref,
+                  foundAt: `remote_location_${i + 1}`,
+                  remoteUrl: imageUrl,
+                  downloadFailed: true,
+                }
+              }
+            }
+          } catch (error) {
+            if (verbose && i < 3) {
+              console.log(`[Worker ${workerId}] ✗ Remote image not found at location ${i + 1}: ${imageUrl}`)
+            }
+          }
+        }
+
+        if (verbose) {
+          console.log(
+            `[Worker ${workerId}] ✗ Remote image not found in any of the ${possibleImagePaths.length} locations`,
+          )
+        }
+
+        return {
+          exists: false,
+          size: 0,
+          path: baseUrl + possibleImagePaths[0],
+          fileName: imageHref,
+          foundAt: "not_found",
+          remoteUrl: baseUrl + possibleImagePaths[0],
+        }
+      } catch (error) {
+        logWorkerError(error, "findRemoteImage")
+        if (verbose) {
+          console.log(`[Worker ${workerId}] ✗ Error searching for remote image: ${error.message}`)
+        }
+        return {
+          exists: false,
+          size: 0,
+          path: imageHref,
+          fileName: imageHref,
+          foundAt: "error",
+          error: error.message,
+        }
       }
     }
-  }
 
-  // Handle local images (existing logic)
-  const xmlDir = path.dirname(xmlFilePath)
-  const parentDir = path.dirname(xmlDir)
+    // Handle local images (existing logic)
+    logWorkerState("searching_local_image", imageHref)
+    const xmlDir = path.dirname(xmlFilePath)
+    const parentDir = path.dirname(xmlDir)
 
-  // List of possible image locations to try
-  const possiblePaths = [
-    // Standard media folder at same level as processed
-    path.join(parentDir, "media", imageHref),
-    // Media folder inside the same directory as XML
-    path.join(xmlDir, "media", imageHref),
-    // Images folder at same level as processed
-    path.join(parentDir, "images", imageHref),
-    // Images folder inside the same directory as XML
-    path.join(xmlDir, "images", imageHref),
-    // Same directory as XML file
-    path.join(xmlDir, imageHref),
-    // Parent directory
-    path.join(parentDir, imageHref),
-    // One level up from parent
-    path.join(path.dirname(parentDir), "media", imageHref),
-    path.join(path.dirname(parentDir), "images", imageHref),
-  ]
+    // List of possible image locations to try
+    const possiblePaths = [
+      // Standard media folder at same level as processed
+      path.join(parentDir, "media", imageHref),
+      // Media folder inside the same directory as XML
+      path.join(xmlDir, "media", imageHref),
+      // Images folder at same level as processed
+      path.join(parentDir, "images", imageHref),
+      // Images folder inside the same directory as XML
+      path.join(xmlDir, "images", imageHref),
+      // Same directory as XML file
+      path.join(xmlDir, imageHref),
+      // Parent directory
+      path.join(parentDir, imageHref),
+      // One level up from parent
+      path.join(path.dirname(parentDir), "media", imageHref),
+      path.join(path.dirname(parentDir), "images", imageHref),
+    ]
 
-  if (verbose) {
-    console.log(`[Worker ${workerId}] Searching for local image: ${imageHref}`)
-    console.log(`[Worker ${workerId}] XML file: ${xmlFilePath}`)
-    console.log(`[Worker ${workerId}] Trying ${possiblePaths.length} possible locations...`)
-  }
+    if (verbose) {
+      console.log(`[Worker ${workerId}] Searching for local image: ${imageHref}`)
+      console.log(`[Worker ${workerId}] XML file: ${xmlFilePath}`)
+      console.log(`[Worker ${workerId}] Trying ${possiblePaths.length} possible locations...`)
+    }
 
-  // Try each possible path
-  for (let i = 0; i < possiblePaths.length; i++) {
-    const testPath = possiblePaths[i]
-    try {
-      await fs.access(testPath)
-      const stats = await fs.stat(testPath)
+    // Try each possible path
+    for (let i = 0; i < possiblePaths.length; i++) {
+      const testPath = possiblePaths[i]
+      try {
+        await fs.access(testPath)
+        const stats = await fs.stat(testPath)
 
-      if (verbose) {
-        console.log(`[Worker ${workerId}] ✓ Found image at location ${i + 1}: ${testPath}`)
-        console.log(`[Worker ${workerId}] Image size: ${stats.size} bytes`)
-      }
+        if (verbose) {
+          console.log(`[Worker ${workerId}] ✓ Found image at location ${i + 1}: ${testPath}`)
+          console.log(`[Worker ${workerId}] Image size: ${stats.size} bytes`)
+        }
 
-      return {
-        exists: true,
-        size: stats.size,
-        path: testPath,
-        fileName: path.basename(testPath),
-        foundAt: `location_${i + 1}`,
-      }
-    } catch (error) {
-      if (verbose && i < 3) {
-        // Only log first few attempts to avoid spam
-        console.log(`[Worker ${workerId}] ✗ Not found at location ${i + 1}: ${testPath}`)
+        return {
+          exists: true,
+          size: stats.size,
+          path: testPath,
+          fileName: path.basename(testPath),
+          foundAt: `location_${i + 1}`,
+        }
+      } catch (error) {
+        if (verbose && i < 3) {
+          // Only log first few attempts to avoid spam
+          console.log(`[Worker ${workerId}] ✗ Not found at location ${i + 1}: ${testPath}`)
+        }
       }
     }
-  }
 
-  if (verbose) {
-    console.log(`[Worker ${workerId}] ✗ Image not found in any of the ${possiblePaths.length} locations`)
-    console.log(`[Worker ${workerId}] Searched locations:`)
-    possiblePaths.slice(0, 5).forEach((p, i) => {
-      console.log(`[Worker ${workerId}]   ${i + 1}. ${p}`)
-    })
-    if (possiblePaths.length > 5) {
-      console.log(`[Worker ${workerId}]   ... and ${possiblePaths.length - 5} more locations`)
+    if (verbose) {
+      console.log(`[Worker ${workerId}] ✗ Image not found in any of the ${possiblePaths.length} locations`)
+      console.log(`[Worker ${workerId}] Searched locations:`)
+      possiblePaths.slice(0, 5).forEach((p, i) => {
+        console.log(`[Worker ${workerId}]   ${i + 1}. ${p}`)
+      })
+      if (possiblePaths.length > 5) {
+        console.log(`[Worker ${workerId}]   ... and ${possiblePaths.length - 5} more locations`)
+      }
     }
-  }
 
-  return {
-    exists: false,
-    size: 0,
-    path: possiblePaths[0], // Return the first attempted path as default
-    fileName: imageHref,
-    foundAt: "not_found",
+    return {
+      exists: false,
+      size: 0,
+      path: possiblePaths[0], // Return the first attempted path as default
+      fileName: imageHref,
+      foundAt: "not_found",
+    }
+  } catch (error) {
+    logWorkerError(error, "findImagePath")
+    return {
+      exists: false,
+      size: 0,
+      path: imageHref,
+      fileName: imageHref,
+      foundAt: "error",
+      error: error.message,
+    }
   }
 }
 
 // Check if image passes filter criteria - FIXED VERSION
 function passesFilter(record, filterConfig) {
-  // Debug log the filter config received
-  if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] Filter config received:`, JSON.stringify(filterConfig, null, 2))
-  }
+  try {
+    logWorkerState("checking_filters", record.imageHref)
 
-  if (!filterConfig || !filterConfig.enabled) {
+    // Debug log the filter config received
     if (workerData.verbose) {
-      console.log(`[Worker ${workerData.workerId}] Filters disabled - image ${record.imageHref} passes by default`)
+      console.log(`[Worker ${workerData.workerId}] Filter config received:`, JSON.stringify(filterConfig, null, 2))
     }
-    return true
-  }
 
-  if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] ✓ Filters are ENABLED - checking image: ${record.imageHref}`)
-  }
-
-  const applyTextFilter = (fieldValue, filter, fieldName) => {
-    if (!filter || !filter.operator) {
+    if (!filterConfig || !filterConfig.enabled) {
+      if (workerData.verbose) {
+        console.log(`[Worker ${workerData.workerId}] Filters disabled - image ${record.imageHref} passes by default`)
+      }
       return true
     }
 
-    const val = String(fieldValue || "")
-      .toLowerCase()
-      .trim()
-    const filterVal = String(filter.value || "")
-      .toLowerCase()
-      .trim()
-
-    let result = true
-    switch (filter.operator) {
-      case "like":
-        result = val.includes(filterVal)
-        break
-      case "notLike":
-        result = !val.includes(filterVal)
-        break
-      case "equals":
-        result = val === filterVal
-        break
-      case "notEquals":
-        result = val !== filterVal
-        break
-      case "startsWith":
-        result = val.startsWith(filterVal)
-        break
-      case "endsWith":
-        result = val.endsWith(filterVal)
-        break
-      case "notBlank":
-        result = val !== ""
-        break
-      case "isBlank":
-        result = val === ""
-        break
-      default:
-        result = true
+    if (workerData.verbose) {
+      console.log(`[Worker ${workerData.workerId}] ✓ Filters are ENABLED - checking image: ${record.imageHref}`)
     }
 
-    return result
-  }
-
-  // File type filter - FIXED to handle both .tif and .tiff
-  const allowedTypes = filterConfig.allowedFileTypes || filterConfig.fileTypes || []
-  if (allowedTypes && allowedTypes.length > 0) {
-    const imageFileName = record.imageHref || ""
-    if (imageFileName) {
-      const fileExtension = imageFileName.split(".").pop()?.toLowerCase() || ""
-
-      // Create a normalized list of allowed extensions
-      const normalizedAllowedTypes = allowedTypes.map((type) => type.toLowerCase())
-
-      // Handle special case for TIFF files - both .tif and .tiff should be accepted if either is allowed
-      let isAllowedType = normalizedAllowedTypes.includes(fileExtension)
-
-      // Special handling for TIFF files
-      if (!isAllowedType && (fileExtension === "tif" || fileExtension === "tiff")) {
-        isAllowedType = normalizedAllowedTypes.includes("tif") || normalizedAllowedTypes.includes("tiff")
+    const applyTextFilter = (fieldValue, filter, fieldName) => {
+      if (!filter || !filter.operator) {
+        return true
       }
 
-      if (workerData.verbose) {
-        console.log(`[Worker ${workerData.workerId}] File type check:`)
-        console.log(`  - Image extension: .${fileExtension}`)
-        console.log(`  - Allowed types: [${allowedTypes.join(", ")}]`)
-        console.log(`  - Normalized allowed types: [${normalizedAllowedTypes.join(", ")}]`)
-        console.log(`  - Is allowed: ${isAllowedType}`)
+      const val = String(fieldValue || "")
+        .toLowerCase()
+        .trim()
+      const filterVal = String(filter.value || "")
+        .toLowerCase()
+        .trim()
+
+      let result = true
+      switch (filter.operator) {
+        case "like":
+          result = val.includes(filterVal)
+          break
+        case "notLike":
+          result = !val.includes(filterVal)
+          break
+        case "equals":
+          result = val === filterVal
+          break
+        case "notEquals":
+          result = val !== filterVal
+          break
+        case "startsWith":
+          result = val.startsWith(filterVal)
+          break
+        case "endsWith":
+          result = val.endsWith(filterVal)
+          break
+        case "notBlank":
+          result = val !== ""
+          break
+        case "isBlank":
+          result = val === ""
+          break
+        default:
+          result = true
       }
 
-      if (!isAllowedType) {
-        if (workerData.verbose) {
-          console.log(
-            `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file type .${fileExtension} not in allowed types`,
-          )
+      return result
+    }
+
+    // File type filter - FIXED to handle both .tif and .tiff
+    const allowedTypes = filterConfig.allowedFileTypes || filterConfig.fileTypes || []
+    if (allowedTypes && allowedTypes.length > 0) {
+      const imageFileName = record.imageHref || ""
+      if (imageFileName) {
+        const fileExtension = imageFileName.split(".").pop()?.toLowerCase() || ""
+
+        // Create a normalized list of allowed extensions
+        const normalizedAllowedTypes = allowedTypes.map((type) => type.toLowerCase())
+
+        // Handle special case for TIFF files - both .tif and .tiff should be accepted if either is allowed
+        let isAllowedType = normalizedAllowedTypes.includes(fileExtension)
+
+        // Special handling for TIFF files
+        if (!isAllowedType && (fileExtension === "tif" || fileExtension === "tiff")) {
+          isAllowedType = normalizedAllowedTypes.includes("tif") || normalizedAllowedTypes.includes("tiff")
         }
-        return false
+
+        if (workerData.verbose) {
+          console.log(`[Worker ${workerData.workerId}] File type check:`)
+          console.log(`  - Image extension: .${fileExtension}`)
+          console.log(`  - Allowed types: [${allowedTypes.join(", ")}]`)
+          console.log(`  - Normalized allowed types: [${normalizedAllowedTypes.join(", ")}]`)
+          console.log(`  - Is allowed: ${isAllowedType}`)
+        }
+
+        if (!isAllowedType) {
+          if (workerData.verbose) {
+            console.log(
+              `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file type .${fileExtension} not in allowed types`,
+            )
+          }
+          return false
+        }
       }
     }
-  }
 
-  // Image dimension filters
-  const imageWidth = Number.parseInt(record.imageWidth) || 0
-  const imageHeight = Number.parseInt(record.imageHeight) || 0
+    // Image dimension filters
+    const imageWidth = Number.parseInt(record.imageWidth) || 0
+    const imageHeight = Number.parseInt(record.imageHeight) || 0
 
-  if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] Dimension check:`)
-    console.log(`  - Image dimensions: ${imageWidth}x${imageHeight}`)
-    console.log(`  - Min width filter: ${filterConfig.minWidth || "none"}`)
-    console.log(`  - Min height filter: ${filterConfig.minHeight || "none"}`)
-  }
-
-  if (filterConfig.minWidth && imageWidth < filterConfig.minWidth) {
     if (workerData.verbose) {
-      console.log(
-        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: width ${imageWidth} < ${filterConfig.minWidth}`,
-      )
+      console.log(`[Worker ${workerData.workerId}] Dimension check:`)
+      console.log(`  - Image dimensions: ${imageWidth}x${imageHeight}`)
+      console.log(`  - Min width filter: ${filterConfig.minWidth || "none"}`)
+      console.log(`  - Min height filter: ${filterConfig.minHeight || "none"}`)
     }
-    return false
-  }
-  if (filterConfig.minHeight && imageHeight < filterConfig.minHeight) {
+
+    if (filterConfig.minWidth && imageWidth < filterConfig.minWidth) {
+      if (workerData.verbose) {
+        console.log(
+          `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: width ${imageWidth} < ${filterConfig.minWidth}`,
+        )
+      }
+      return false
+    }
+    if (filterConfig.minHeight && imageHeight < filterConfig.minHeight) {
+      if (workerData.verbose) {
+        console.log(
+          `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: height ${imageHeight} < ${filterConfig.minHeight}`,
+        )
+      }
+      return false
+    }
+
+    // File size filters
+    let fileSizeBytes = record.actualFileSize || 0
+    if (!fileSizeBytes && record.imageSize) {
+      const cleanSize = String(record.imageSize).replace(/,/g, "")
+      fileSizeBytes = Number.parseInt(cleanSize) || 0
+    }
+
     if (workerData.verbose) {
-      console.log(
-        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: height ${imageHeight} < ${filterConfig.minHeight}`,
-      )
+      console.log(`[Worker ${workerData.workerId}] File size check:`)
+      console.log(`  - Actual file size: ${fileSizeBytes} bytes`)
+      console.log(`  - Min size filter: ${filterConfig.minFileSize || "none"}`)
+      console.log(`  - Max size filter: ${filterConfig.maxFileSize || "none"}`)
     }
-    return false
-  }
 
-  // File size filters
-  let fileSizeBytes = record.actualFileSize || 0
-  if (!fileSizeBytes && record.imageSize) {
-    const cleanSize = String(record.imageSize).replace(/,/g, "")
-    fileSizeBytes = Number.parseInt(cleanSize) || 0
-  }
+    if (filterConfig.minFileSize && fileSizeBytes < filterConfig.minFileSize) {
+      if (workerData.verbose) {
+        console.log(
+          `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file size ${fileSizeBytes} < ${filterConfig.minFileSize}`,
+        )
+      }
+      return false
+    }
 
-  if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] File size check:`)
-    console.log(`  - Actual file size: ${fileSizeBytes} bytes`)
-    console.log(`  - Min size filter: ${filterConfig.minFileSize || "none"}`)
-    console.log(`  - Max size filter: ${filterConfig.maxFileSize || "none"}`)
-  }
+    if (filterConfig.maxFileSize && fileSizeBytes > filterConfig.maxFileSize) {
+      if (workerData.verbose) {
+        console.log(
+          `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file size ${fileSizeBytes} > ${filterConfig.maxFileSize}`,
+        )
+      }
+      return false
+    }
 
-  if (filterConfig.minFileSize && fileSizeBytes < filterConfig.minFileSize) {
+    // Text filters
+    if (!applyTextFilter(record.creditline, filterConfig.creditLine, "creditLine")) {
+      return false
+    }
+    if (!applyTextFilter(record.copyrightLine, filterConfig.copyright, "copyright")) {
+      return false
+    }
+    if (!applyTextFilter(record.usageType, filterConfig.usageType, "usageType")) {
+      return false
+    }
+    if (!applyTextFilter(record.rightsHolder, filterConfig.rightsHolder, "rightsHolder")) {
+      return false
+    }
+    if (!applyTextFilter(record.location, filterConfig.location, "location")) {
+      return false
+    }
+
     if (workerData.verbose) {
-      console.log(
-        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file size ${fileSizeBytes} < ${filterConfig.minFileSize}`,
-      )
+      console.log(`[Worker ${workerData.workerId}] ✓ Image ${record.imageHref} passed all filters`)
     }
-    return false
+    return true
+  } catch (error) {
+    logWorkerError(error, "passesFilter")
+    // If filter check fails, default to passing
+    return true
   }
-
-  if (filterConfig.maxFileSize && fileSizeBytes > filterConfig.maxFileSize) {
-    if (workerData.verbose) {
-      console.log(
-        `[Worker ${workerData.workerId}] ✗ Image ${record.imageHref} filtered out: file size ${fileSizeBytes} > ${filterConfig.maxFileSize}`,
-      )
-    }
-    return false
-  }
-
-  // Text filters
-  if (!applyTextFilter(record.creditline, filterConfig.creditLine, "creditLine")) {
-    return false
-  }
-  if (!applyTextFilter(record.copyrightLine, filterConfig.copyright, "copyright")) {
-    return false
-  }
-  if (!applyTextFilter(record.usageType, filterConfig.usageType, "usageType")) {
-    return false
-  }
-  if (!applyTextFilter(record.rightsHolder, filterConfig.rightsHolder, "rightsHolder")) {
-    return false
-  }
-  if (!applyTextFilter(record.location, filterConfig.location, "location")) {
-    return false
-  }
-
-  if (workerData.verbose) {
-    console.log(`[Worker ${workerData.workerId}] ✓ Image ${record.imageHref} passed all filters`)
-  }
-  return true
 }
 
 // Move image to destination folder
@@ -524,6 +617,8 @@ async function moveImage(
   xmlFilePath,
 ) {
   try {
+    logWorkerState("moving_image", sourceImagePath)
+
     if (!sourceImagePath || !destinationBasePath) {
       if (verbose) console.log(`[Worker ${workerId}] Missing paths for move operation.`)
       return false
@@ -640,6 +735,7 @@ async function moveImage(
 
     return true
   } catch (error) {
+    logWorkerError(error, "moveImage")
     if (verbose) {
       console.error(`[Worker ${workerId}] ✗ Error moving image ${sourceImagePath}:`, error.message)
       console.error(`[Worker ${workerId}] Stack trace:`, error.stack)
@@ -662,6 +758,8 @@ async function processXmlFileInWorker(
   let tempDir = null
 
   try {
+    logWorkerState("processing_xml_file", xmlFilePath)
+
     if (verbose) {
       console.log(`[Worker ${workerId}] Processing: ${xmlFilePath}`)
       console.log(`[Worker ${workerId}] Filter config:`, JSON.stringify(filterConfig, null, 2))
@@ -689,13 +787,17 @@ async function processXmlFileInWorker(
       }
       xmlContent = await fetchRemoteFile(xmlFilePath)
     } else {
+      logWorkerState("reading_local_xml", xmlFilePath)
       xmlContent = await fs.readFile(xmlFilePath, "utf-8")
     }
 
+    logWorkerState("parsing_xml", `${xmlContent.length} bytes`)
     const result = await parseStringPromise(xmlContent, {
       explicitArray: false,
       mergeAttrs: true,
     })
+
+    logWorkerState("extracting_metadata")
 
     // Extract folder structure from local path or URL
     let city = "",
@@ -903,6 +1005,7 @@ async function processXmlFileInWorker(
       }
     }
 
+    logWorkerState("building_record")
     const record = {
       city,
       year,
@@ -996,6 +1099,7 @@ async function processXmlFileInWorker(
           console.log(`[Worker ${workerId}] Image move result: ${moved ? "SUCCESS" : "FAILED"}`)
         }
       } catch (error) {
+        logWorkerError(error, "moveImageAttempt")
         if (verbose) {
           console.error(`[Worker ${workerId}] Error during image move:`, error.message)
         }
@@ -1011,6 +1115,9 @@ async function processXmlFileInWorker(
       )
     }
 
+    logWorkerState("processing_complete", "success")
+    workerState.status = "completed"
+
     return {
       record: record, // Always return the record
       passedFilter: passed,
@@ -1018,11 +1125,14 @@ async function processXmlFileInWorker(
       workerId,
     }
   } catch (err) {
+    logWorkerError(err, "processXmlFileInWorker")
     const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
     console.error(`[Worker ${workerId}] Error processing ${fileName}:`, err.message)
     if (verbose) {
       console.error(`[Worker ${workerId}] Stack trace:`, err.stack)
     }
+
+    workerState.status = "error"
     return { record: null, passedFilter: false, imageMoved: false, error: err.message, workerId }
   } finally {
     // Cleanup temp directory
@@ -1035,9 +1145,29 @@ async function processXmlFileInWorker(
   }
 }
 
-// Main worker execution
+// Safe message sending function
+function sendResult(result) {
+  try {
+    logWorkerState("sending_result")
+    if (parentPort) {
+      parentPort.postMessage(result)
+      logWorkerState("result_sent", "success")
+    } else {
+      console.error(`[Worker ${workerState.id}] No parentPort available to send result`)
+      logWorkerState("result_sent", "no_parent_port")
+    }
+  } catch (error) {
+    logWorkerError(error, "sendResult")
+    console.error(`[Worker ${workerState.id}] Error sending result:`, error.message)
+  }
+}
+
+// Main worker execution with comprehensive error handling
 async function main() {
   try {
+    logWorkerState("main_start")
+    workerState.status = "running"
+
     if (!workerData) {
       throw new Error("No workerData provided")
     }
@@ -1052,6 +1182,9 @@ async function main() {
       originalRemoteXmlUrl,
       associatedImagePath,
     } = workerData
+
+    // Update worker state
+    workerState.id = workerId || "unknown"
 
     if (verbose) {
       const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
@@ -1070,6 +1203,7 @@ async function main() {
       }
     }
 
+    logWorkerState("calling_process_function")
     const result = await processXmlFileInWorker(
       xmlFilePath,
       filterConfig,
@@ -1086,67 +1220,114 @@ async function main() {
       console.log(`[Worker ${workerId}] Finished processing: ${fileName}`)
     }
 
-    if (parentPort) {
-      parentPort.postMessage(result)
-    } else {
-      console.error(`[Worker ${workerId}] No parentPort available to send result`)
-    }
+    logWorkerState("sending_final_result")
+    sendResult(result)
+
+    logWorkerState("main_complete", "success")
+    workerState.status = "completed"
   } catch (error) {
-    console.error(`[Worker ${workerData?.workerId || "unknown"}] Fatal error:`, error.message)
-    if (parentPort) {
-      parentPort.postMessage({
-        record: null,
-        passedFilter: false,
-        imageMoved: false,
-        error: error.message,
-        workerId: workerData?.workerId || 0,
-      })
+    logWorkerError(error, "main")
+    console.error(`[Worker ${workerState.id}] Fatal error in main:`, error.message)
+
+    workerState.status = "fatal_error"
+
+    const errorResult = {
+      record: null,
+      passedFilter: false,
+      imageMoved: false,
+      error: error.message,
+      workerId: workerData?.workerId || 0,
+      workerState: workerState,
     }
-    // Don't exit with error code - let the process complete normally
+
+    sendResult(errorResult)
   }
 }
 
-// Execute main function and handle any uncaught errors gracefully
-main().catch((error) => {
-  console.error("Worker main function failed:", error)
-  if (parentPort) {
-    parentPort.postMessage({
-      record: null,
-      passedFilter: false,
-      imageMoved: false,
-      error: error.message,
-      workerId: workerData?.workerId || 0,
-    })
-  }
-  // Don't exit with error code - complete normally
-})
-
 // Handle uncaught exceptions gracefully
 process.on("uncaughtException", (error) => {
-  console.error("Uncaught Exception:", error)
-  if (parentPort) {
-    parentPort.postMessage({
-      record: null,
-      passedFilter: false,
-      imageMoved: false,
-      error: error.message,
-      workerId: workerData?.workerId || 0,
-    })
+  logWorkerError(error, "uncaughtException")
+  console.error(`[Worker ${workerState.id}] Uncaught Exception:`, error.message)
+
+  workerState.status = "uncaught_exception"
+
+  const errorResult = {
+    record: null,
+    passedFilter: false,
+    imageMoved: false,
+    error: `Uncaught Exception: ${error.message}`,
+    workerId: workerData?.workerId || 0,
+    workerState: workerState,
   }
-  // Don't exit with error code
+
+  sendResult(errorResult)
+
+  // Give time for message to be sent before exiting
+  setTimeout(() => {
+    process.exit(0) // Exit cleanly
+  }, 100)
 })
 
 // Handle unhandled promise rejections gracefully
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection at:", promise, "reason:", reason)
-  if (parentPort) {
-    parentPort.postMessage({
-      record: null,
-      passedFilter: false,
-      imageMoved: false,
-      error: String(reason),
-      workerId: workerData?.workerId || 0,
-    })
+  const errorMsg = String(reason)
+  logWorkerError(new Error(errorMsg), "unhandledRejection")
+  console.error(`[Worker ${workerState.id}] Unhandled Rejection:`, errorMsg)
+
+  workerState.status = "unhandled_rejection"
+
+  const errorResult = {
+    record: null,
+    passedFilter: false,
+    imageMoved: false,
+    error: `Unhandled Rejection: ${errorMsg}`,
+    workerId: workerData?.workerId || 0,
+    workerState: workerState,
   }
-  // Don't exit with error code
+
+  sendResult(errorResult)
+
+  // Give time for message to be sent before exiting
+  setTimeout(() => {
+    process.exit(0) // Exit cleanly
+  }, 100)
+})
+
+// Handle SIGTERM gracefully
+process.on("SIGTERM", () => {
+  console.log(`[Worker ${workerState.id}] Received SIGTERM, shutting down gracefully`)
+  workerState.status = "terminated"
+  process.exit(0)
+})
+
+// Handle SIGINT gracefully
+process.on("SIGINT", () => {
+  console.log(`[Worker ${workerState.id}] Received SIGINT, shutting down gracefully`)
+  workerState.status = "interrupted"
+  process.exit(0)
+})
+
+// Execute main function
+logWorkerState("worker_startup")
+main().catch((error) => {
+  logWorkerError(error, "main_catch")
+  console.error(`[Worker ${workerState.id}] Main function failed:`, error.message)
+
+  workerState.status = "main_failed"
+
+  const errorResult = {
+    record: null,
+    passedFilter: false,
+    imageMoved: false,
+    error: `Main function failed: ${error.message}`,
+    workerId: workerData?.workerId || 0,
+    workerState: workerState,
+  }
+
+  sendResult(errorResult)
+
+  // Exit cleanly after sending result
+  setTimeout(() => {
+    process.exit(0)
+  }, 100)
 })
