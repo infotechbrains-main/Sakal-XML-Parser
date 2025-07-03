@@ -222,10 +222,10 @@ async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associat
 
         // Try different possible image locations relative to XML
         const possibleImagePaths = [
+          // Media folder at same level as processed
+          path.dirname(path.dirname(xmlPath)) + "/media/" + imageHref,
           // Same directory as XML
           path.dirname(xmlPath) + "/" + imageHref,
-          // Media folder at same level
-          path.dirname(path.dirname(xmlPath)) + "/media/" + imageHref,
           // Images folder at same level
           path.dirname(path.dirname(xmlPath)) + "/images/" + imageHref,
           // Root media folder
@@ -257,10 +257,9 @@ async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associat
               }
 
               // Download the image to temp directory for processing
-              let localImagePath = null
               try {
                 logWorkerState("downloading_found_image", imageUrl)
-                localImagePath = await downloadRemoteFile(imageUrl, tempDir)
+                const localImagePath = await downloadRemoteFile(imageUrl, tempDir)
                 const stats = await fs.stat(localImagePath)
 
                 logWorkerState("downloaded_found_image", `${stats.size} bytes`)
@@ -271,6 +270,7 @@ async function findImagePath(xmlFilePath, imageHref, verbose, workerId, associat
                   fileName: imageHref,
                   foundAt: `remote_location_${i + 1}`,
                   remoteUrl: imageUrl,
+                  isRemoteDownloaded: true, // Flag to indicate this is a downloaded remote image
                 }
               } catch (downloadError) {
                 logWorkerError(downloadError, "downloadFoundImage")
@@ -605,7 +605,7 @@ function passesFilter(record, filterConfig) {
   }
 }
 
-// Move image to destination folder
+// Move image to destination folder - UPDATED to handle remote images
 async function moveImage(
   sourceImagePath,
   destinationBasePath,
@@ -615,6 +615,7 @@ async function moveImage(
   workerId,
   imageFileName,
   xmlFilePath,
+  isRemoteDownloaded = false,
 ) {
   try {
     logWorkerState("moving_image", sourceImagePath)
@@ -631,12 +632,12 @@ async function moveImage(
       console.log(`  - Folder structure: ${folderStructureOption}`)
       console.log(`  - Image filename: ${imageFileName}`)
       console.log(`  - XML file path: ${xmlFilePath}`)
+      console.log(`  - Is remote downloaded: ${isRemoteDownloaded}`)
     }
 
-    // For remote images, sourceImagePath might be a URL or a temp file
+    // For remote images that haven't been downloaded, we can't move them
     const isRemoteSource = isRemotePath(sourceImagePath)
-
-    if (isRemoteSource) {
+    if (isRemoteSource && !isRemoteDownloaded) {
       if (verbose) {
         console.log(`[Worker ${workerId}] ✗ Cannot move remote image directly: ${sourceImagePath}`)
         console.log(`[Worker ${workerId}] Remote images need to be downloaded first`)
@@ -644,7 +645,7 @@ async function moveImage(
       return false
     }
 
-    // Verify source image exists (for local files)
+    // Verify source image exists (for local files and downloaded remote files)
     try {
       await fs.access(sourceImagePath)
       if (verbose) {
@@ -662,33 +663,71 @@ async function moveImage(
     let finalDestPath
 
     if (folderStructureOption === "replicate") {
-      // Replicate the folder structure from the original root
-      try {
-        const xmlDir = path.dirname(xmlFilePath)
-        const relativePathFromRoot = path.relative(originalRootDir, xmlDir)
+      // For remote files, extract structure from URL
+      if (isRemotePath(xmlFilePath)) {
+        try {
+          const url = new URL(xmlFilePath)
+          const pathParts = url.pathname.split("/").filter((part) => part.length > 0)
 
-        // Replace 'processed' with 'media' in the path if it exists
-        const pathParts = relativePathFromRoot.split(path.sep)
-        const processedIndex = pathParts.findIndex((part) => part.toLowerCase() === "processed")
-        if (processedIndex !== -1) {
-          pathParts[processedIndex] = "media"
-        }
+          // Find the structure: photoapp/City/Year/Month/processed
+          const photoappIndex = pathParts.findIndex((part) => part.toLowerCase() === "photoapp")
+          if (photoappIndex !== -1 && pathParts.length > photoappIndex + 3) {
+            const city = pathParts[photoappIndex + 1]
+            const year = pathParts[photoappIndex + 2]
+            const month = pathParts[photoappIndex + 3]
 
-        const adjustedRelativePath = pathParts.join(path.sep)
-        finalDestDir = path.join(destinationBasePath, adjustedRelativePath)
+            // Create structure: City/Year/Month/media
+            const relativePath = path.join(city, year, month, "media")
+            finalDestDir = path.join(destinationBasePath, relativePath)
 
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Replicating structure:`)
-          console.log(`  - XML dir: ${xmlDir}`)
-          console.log(`  - Relative path: ${relativePathFromRoot}`)
-          console.log(`  - Adjusted path: ${adjustedRelativePath}`)
-          console.log(`  - Final dest dir: ${finalDestDir}`)
+            if (verbose) {
+              console.log(`[Worker ${workerId}] Remote structure replication:`)
+              console.log(`  - URL path: ${url.pathname}`)
+              console.log(`  - Extracted: ${city}/${year}/${month}`)
+              console.log(`  - Final dest dir: ${finalDestDir}`)
+            }
+          } else {
+            // Fallback to flat structure
+            finalDestDir = destinationBasePath
+            if (verbose) {
+              console.log(`[Worker ${workerId}] Could not extract remote structure, using flat`)
+            }
+          }
+        } catch (error) {
+          if (verbose) {
+            console.log(`[Worker ${workerId}] Error parsing remote URL, using flat structure: ${error.message}`)
+          }
+          finalDestDir = destinationBasePath
         }
-      } catch (error) {
-        if (verbose) {
-          console.log(`[Worker ${workerId}] Error calculating relative path, using flat structure: ${error.message}`)
+      } else {
+        // Local file structure replication
+        try {
+          const xmlDir = path.dirname(xmlFilePath)
+          const relativePathFromRoot = path.relative(originalRootDir, xmlDir)
+
+          // Replace 'processed' with 'media' in the path if it exists
+          const pathParts = relativePathFromRoot.split(path.sep)
+          const processedIndex = pathParts.findIndex((part) => part.toLowerCase() === "processed")
+          if (processedIndex !== -1) {
+            pathParts[processedIndex] = "media"
+          }
+
+          const adjustedRelativePath = pathParts.join(path.sep)
+          finalDestDir = path.join(destinationBasePath, adjustedRelativePath)
+
+          if (verbose) {
+            console.log(`[Worker ${workerId}] Local structure replication:`)
+            console.log(`  - XML dir: ${xmlDir}`)
+            console.log(`  - Relative path: ${relativePathFromRoot}`)
+            console.log(`  - Adjusted path: ${adjustedRelativePath}`)
+            console.log(`  - Final dest dir: ${finalDestDir}`)
+          }
+        } catch (error) {
+          if (verbose) {
+            console.log(`[Worker ${workerId}] Error calculating relative path, using flat structure: ${error.message}`)
+          }
+          finalDestDir = destinationBasePath
         }
-        finalDestDir = destinationBasePath
       }
     } else {
       // Flat structure - all images in one folder
@@ -1002,6 +1041,9 @@ async function processXmlFileInWorker(
         if (imageInfo.downloadFailed) {
           console.log(`  - Download failed: ${imageInfo.downloadFailed}`)
         }
+        if (imageInfo.isRemoteDownloaded) {
+          console.log(`  - Remote image downloaded to temp: ${imageInfo.isRemoteDownloaded}`)
+        }
       }
     }
 
@@ -1049,15 +1091,16 @@ async function processXmlFileInWorker(
     const passed = passesFilter(record, filterConfig)
     let moved = false
 
-    // Determine if we should move the image
+    // Determine if we should move the image - UPDATED for remote images
     const shouldMoveImage =
       filterConfig?.moveImages &&
       filterConfig?.moveDestinationPath &&
       imageExists &&
       imageHref &&
       imagePath &&
-      !isRemote && // Don't move remote images for now
       !imageInfo?.downloadFailed &&
+      // For remote images, we can move if they were downloaded
+      (imageInfo?.isRemoteDownloaded || !isRemote) &&
       // Move if filters are disabled (move all images)
       (!filterConfig?.enabled ||
         // Or move if filters are enabled and image passed
@@ -1069,6 +1112,7 @@ async function processXmlFileInWorker(
       console.log(`  - Destination path set: ${!!filterConfig?.moveDestinationPath}`)
       console.log(`  - Image exists: ${imageExists}`)
       console.log(`  - Is remote: ${isRemote}`)
+      console.log(`  - Remote downloaded: ${imageInfo?.isRemoteDownloaded || false}`)
       console.log(`  - Download failed: ${imageInfo?.downloadFailed || false}`)
       console.log(`  - Filters enabled: ${filterConfig?.enabled}`)
       console.log(`  - Passed filters: ${passed}`)
@@ -1093,6 +1137,7 @@ async function processXmlFileInWorker(
           workerId,
           imageHref,
           xmlFilePath,
+          imageInfo?.isRemoteDownloaded || false,
         )
 
         if (verbose) {
