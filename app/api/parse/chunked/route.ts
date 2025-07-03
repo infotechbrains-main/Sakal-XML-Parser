@@ -143,16 +143,18 @@ export async function POST(request: NextRequest) {
 
         if (isRemote) {
           sendMessage("log", "Scanning remote directory for XML files...")
+          sendMessage("log", "This may take a few minutes for large directories...")
 
           try {
-            // Limit scanning depth to prevent infinite loops
+            // Enhanced scanning with better progress reporting
             const remoteFiles = await scanRemoteDirectory(
               rootDir,
               (message) => {
                 sendMessage("log", message)
+                console.log(`[Remote Scanner] ${message}`)
               },
-              4,
-            ) // Max depth of 4 levels
+              5, // Increased max depth to 5 for city/year/month/processed structure
+            )
 
             xmlFiles = remoteFiles.map((file) => file.url)
 
@@ -160,11 +162,22 @@ export async function POST(request: NextRequest) {
               console.log(`[Chunked API] Found ${xmlFiles.length} remote XML files`)
             }
 
+            sendMessage("log", `Found ${xmlFiles.length} XML files in remote directory`)
+
             if (xmlFiles.length === 0) {
-              sendMessage("log", "No XML files found in remote directory. Scanning may have been limited by depth.")
+              sendMessage("log", "No XML files found. This could be due to:")
+              sendMessage("log", "1. Server directory listing format not recognized")
+              sendMessage("log", "2. XML files are in deeper nested directories")
+              sendMessage("log", "3. Access permissions or server configuration")
               sendMessage("error", "No XML files found in the specified remote directory")
               safeCloseController()
               return
+            }
+
+            // Limit to first 10000 files to prevent memory issues
+            if (xmlFiles.length > 10000) {
+              sendMessage("log", `Limiting processing to first 10,000 files (found ${xmlFiles.length} total)`)
+              xmlFiles = xmlFiles.slice(0, 10000)
             }
           } catch (error) {
             const errorMsg = `Failed to scan remote directory: ${error instanceof Error ? error.message : "Unknown error"}`
@@ -175,6 +188,7 @@ export async function POST(request: NextRequest) {
           }
         } else {
           // Local file processing
+          sendMessage("log", "Scanning local directory for XML files...")
           xmlFiles = await findXMLFiles(rootDir)
         }
 

@@ -3,7 +3,6 @@ import path from "path"
 import os from "os"
 import { createWriteStream } from "fs"
 import { pipeline } from "stream/promises"
-import { promises as fsPromise } from "fs"
 
 export interface RemoteFile {
   name: string
@@ -58,7 +57,12 @@ export async function fetchDirectoryListing(
       return { files: [], directories: [] }
     }
 
-    const response = await fetch(url)
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; XML-Parser/1.0)",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    })
 
     if (!response.ok) {
       console.log(`Failed to fetch directory listing: ${response.status} ${response.statusText}`)
@@ -68,98 +72,131 @@ export async function fetchDirectoryListing(
     const html = await response.text()
     console.log(`HTML response length: ${html.length}`)
 
-    // Enhanced patterns to catch more directory listing formats
-    const filePatterns = [
-      // Standard Apache/Nginx patterns for XML files
-      /<a\s+(?:[^>]*?\s+)?href="([^"]*\.xml)"[^>]*>([^<]*)<\/a>/gi,
-      /<a\s+href="([^"]*\.xml)"[^>]*>([^<]*)<\/a>/gi,
-      /<A\s+HREF="([^"]*\.xml)"[^>]*>([^<]*)<\/A>/gi,
-      // More flexible pattern
-      /href=["']([^"']*\.xml)["']/gi,
-      // Pattern without quotes
-      /href=([^\s>]*\.xml)/gi,
-    ]
-
-    // Enhanced directory patterns - look for any folder-like links
-    const directoryPatterns = [
-      // Standard directory patterns (ending with /)
-      /<a\s+(?:[^>]*?\s+)?href="([^"#?]*\/)"[^>]*>([^<]*)<\/a>/gi,
-      /<a\s+href="([^"#?]*\/)"[^>]*>([^<]*)<\/a>/gi,
-      /<A\s+HREF="([^"#?]*\/)"[^>]*>([^<]*)<\/A>/gi,
-      // Directory patterns without trailing slash but with directory indicators
-      /<a\s+(?:[^>]*?\s+)?href="([^"#?./][^"#?]*)"[^>]*>\s*([^<]*)\s*<\/a>/gi,
-    ]
+    // Debug: Log first 500 characters to see the format
+    console.log(`HTML preview: ${html.substring(0, 500)}`)
 
     const files: RemoteFile[] = []
     const directories: string[] = []
 
-    // Extract XML files
-    for (const pattern of filePatterns) {
+    // Enhanced patterns for different server types
+    const linkPatterns = [
+      // Apache/Nginx standard format
+      /<a\s+href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/gi,
+      // IIS format
+      /<A\s+HREF=["']([^"']+)["'][^>]*>([^<]+)<\/A>/gi,
+      // Simple href without quotes
+      /<a\s+href=([^\s>]+)[^>]*>([^<]+)<\/a>/gi,
+      // More flexible pattern
+      /href\s*=\s*["']([^"']+)["'][^>]*>([^<]*)</gi,
+    ]
+
+    let foundLinks = false
+
+    for (const pattern of linkPatterns) {
+      pattern.lastIndex = 0 // Reset regex
       let match
+
       while ((match = pattern.exec(html)) !== null) {
-        const fileName = match[1]
+        const href = match[1]?.trim()
+        const linkText = match[2]?.trim()
 
-        // Skip parent directory links and current directory
-        if (fileName === "../" || fileName === "./" || fileName === ".." || fileName.startsWith("../")) {
-          continue
-        }
+        if (!href || !linkText) continue
 
-        // Skip if already found
-        if (files.some((f) => f.name === path.basename(fileName))) continue
-
-        // Handle relative URLs and ensure they're within base path
-        const fileUrl = new URL(fileName, url).toString()
-
-        if (!isWithinBasePath(baseUrl, fileUrl)) {
-          console.log(`Skipping file ${fileName} - outside base path`)
-          continue
-        }
-
-        files.push({
-          name: path.basename(fileName),
-          url: fileUrl,
-          directory: url,
-        })
-      }
-    }
-
-    // Extract directories
-    for (const pattern of directoryPatterns) {
-      let match
-      while ((match = pattern.exec(html)) !== null) {
-        let dirName = match[1]
-        const linkText = match[2] || ""
-
-        // Skip parent directory links, current directory, and any path starting with ../
+        // Skip parent directory and self references
         if (
-          dirName === "../" ||
-          dirName === "./" ||
-          dirName === ".." ||
-          dirName.startsWith("../") ||
-          linkText.includes("Parent Directory") ||
-          linkText.includes("..") ||
-          dirName.includes("?") ||
-          dirName.includes("#")
+          href === "../" ||
+          href === "./" ||
+          href === "." ||
+          href === ".." ||
+          linkText === "Parent Directory" ||
+          linkText === ".." ||
+          linkText === "." ||
+          href.startsWith("?") ||
+          href.startsWith("#")
         ) {
           continue
         }
 
-        // Normalize directory name
-        if (!dirName.endsWith("/")) {
-          dirName += "/"
-        }
-
-        // Skip if already found
-        if (directories.includes(dirName)) continue
-
-        // Check if the directory URL would be within base path
-        const dirUrl = new URL(dirName, url).toString()
-        if (!isWithinBasePath(baseUrl, dirUrl)) {
-          console.log(`Skipping directory ${dirName} - outside base path`)
+        // Skip common non-content files
+        if (linkText.match(/^(index\.|default\.|robots\.txt|favicon\.ico|\.htaccess)/i)) {
           continue
         }
 
-        directories.push(dirName)
+        foundLinks = true
+
+        // Determine if it's a directory or file
+        const isDirectory =
+          href.endsWith("/") || (!href.includes(".") && !linkText.includes(".")) || linkText.endsWith("/")
+
+        if (isDirectory) {
+          // It's a directory
+          const dirName = href.endsWith("/") ? href : href + "/"
+
+          // Skip if already found
+          if (directories.includes(dirName)) continue
+
+          // Check if the directory URL would be within base path
+          const dirUrl = new URL(dirName, url).toString()
+          if (!isWithinBasePath(baseUrl, dirUrl)) {
+            console.log(`Skipping directory ${dirName} - outside base path`)
+            continue
+          }
+
+          directories.push(dirName)
+        } else if (href.toLowerCase().endsWith(".xml")) {
+          // It's an XML file
+          const fileName = path.basename(href)
+
+          // Skip if already found
+          if (files.some((f) => f.name === fileName)) continue
+
+          // Handle relative URLs and ensure they're within base path
+          const fileUrl = new URL(href, url).toString()
+
+          if (!isWithinBasePath(baseUrl, fileUrl)) {
+            console.log(`Skipping file ${fileName} - outside base path`)
+            continue
+          }
+
+          files.push({
+            name: fileName,
+            url: fileUrl,
+          })
+        }
+      }
+
+      // If we found links with this pattern, use them
+      if (foundLinks) {
+        break
+      }
+    }
+
+    // If no links found with standard patterns, try alternative parsing
+    if (!foundLinks) {
+      console.log("No links found with standard patterns, trying alternative parsing...")
+
+      // Try to find directory names in the HTML content
+      const cityPatterns = [
+        // Look for common Indian city names or directory-like patterns
+        /(?:^|\s|>)([A-Z][a-zA-Z]+)(?:\/|\s|<|$)/gm,
+        // Look for year patterns (2010-2030)
+        /(?:^|\s|>)(20[1-3][0-9])(?:\/|\s|<|$)/gm,
+        // Look for month patterns (01-12)
+        /(?:^|\s|>)(0[1-9]|1[0-2])(?:\/|\s|<|$)/gm,
+      ]
+
+      for (const pattern of cityPatterns) {
+        pattern.lastIndex = 0
+        let match
+        while ((match = pattern.exec(html)) !== null) {
+          const dirName = match[1] + "/"
+          if (!directories.includes(dirName)) {
+            const dirUrl = new URL(dirName, url).toString()
+            if (isWithinBasePath(baseUrl, dirUrl)) {
+              directories.push(dirName)
+            }
+          }
+        }
       }
     }
 
@@ -168,7 +205,9 @@ export async function fetchDirectoryListing(
       console.log(`XML files found: ${files.map((f) => f.name).join(", ")}`)
     }
     if (directories.length > 0) {
-      console.log(`Directories found: ${directories.join(", ")}`)
+      console.log(
+        `Directories found: ${directories.slice(0, 10).join(", ")}${directories.length > 10 ? ` and ${directories.length - 10} more...` : ""}`,
+      )
     }
 
     return { files, directories }
@@ -341,11 +380,11 @@ export async function scanTopLevelFolders(
   }
 }
 
-// Scan remote directory
+// Enhanced remote directory scanner with better city/year detection
 export async function scanRemoteDirectory(
   baseUrl: string,
   onProgress?: (message: string) => void,
-  maxDepth = 3,
+  maxDepth = 4,
 ): Promise<RemoteFile[]> {
   const xmlFiles: RemoteFile[] = []
   const visitedUrls = new Set<string>()
@@ -359,65 +398,62 @@ export async function scanRemoteDirectory(
 
     try {
       if (onProgress) {
-        onProgress(`Scanning: ${url}`)
+        onProgress(`Scanning: ${url} (depth: ${depth})`)
       }
 
-      console.log(`Fetching directory listing from: ${url}`)
-      const response = await fetch(url)
+      const { files, directories } = await fetchDirectoryListing(url, baseUrl)
 
-      if (!response.ok) {
-        console.log(`Failed to fetch ${url}: ${response.status}`)
-        return
-      }
-
-      const html = await response.text()
-      console.log(`HTML response length: ${html.length}`)
-
-      // Parse HTML to find links
-      const links = parseDirectoryListing(html, url)
-
-      const xmlFilesInDir = links.filter((link) => link.name.toLowerCase().endsWith(".xml"))
-
-      const subdirectories = links.filter(
-        (link) => link.name.endsWith("/") && !link.name.startsWith("..") && link.name !== "/",
-      )
-
-      console.log(`Found ${xmlFilesInDir.length} XML files and ${subdirectories.length} directories in bounds`)
-
-      // Add XML files
-      for (const xmlFile of xmlFilesInDir) {
-        xmlFiles.push({
-          name: xmlFile.name,
-          url: xmlFile.url,
-          size: xmlFile.size,
-        })
-      }
-
-      if (xmlFilesInDir.length > 0) {
-        console.log(`XML files found: ${xmlFilesInDir.map((f) => f.name).join(", ")}`)
-      }
-
-      // Only scan subdirectories if we haven't found XML files in current directory
-      // This prevents infinite recursion through media folders
-      if (xmlFilesInDir.length === 0 && depth < maxDepth) {
-        if (subdirectories.length > 0) {
-          console.log(`Directories found: ${subdirectories.map((d) => d.name).join(", ")}`)
+      // Add XML files from current directory
+      for (const file of files) {
+        if (file.name.toLowerCase().endsWith(".xml")) {
+          xmlFiles.push(file)
+          if (onProgress) {
+            onProgress(`Found XML: ${file.name}`)
+          }
         }
+      }
 
-        // Prioritize 'processed' directories over 'media' directories
-        const processedDirs = subdirectories.filter((dir) => dir.name.toLowerCase().includes("processed"))
-        const otherDirs = subdirectories.filter(
-          (dir) => !dir.name.toLowerCase().includes("processed") && !dir.name.toLowerCase().includes("media"),
+      // If we found XML files, we're likely in a 'processed' directory
+      if (files.length > 0) {
+        if (onProgress) {
+          onProgress(`Found ${files.length} XML files in ${url}`)
+        }
+        return // Don't scan deeper if we found XML files
+      }
+
+      // Scan subdirectories with priority
+      if (depth < maxDepth) {
+        // Prioritize 'processed' directories
+        const processedDirs = directories.filter((dir) => dir.toLowerCase().includes("processed"))
+
+        // Then year directories (2010-2030)
+        const yearDirs = directories.filter((dir) => /^20[1-3][0-9]\/$/.test(dir))
+
+        // Then month directories (01-12)
+        const monthDirs = directories.filter((dir) => /^(0[1-9]|1[0-2])\/$/.test(dir))
+
+        // Then city directories (capitalized names)
+        const cityDirs = directories.filter(
+          (dir) =>
+            /^[A-Z][a-zA-Z]+\/$/.test(dir) &&
+            !dir.toLowerCase().includes("processed") &&
+            !dir.toLowerCase().includes("media"),
         )
 
-        // Scan processed directories first
-        for (const dir of processedDirs) {
-          await scanDirectory(dir.url, depth + 1)
-        }
+        // Scan in priority order
+        const prioritizedDirs = [...processedDirs, ...yearDirs, ...monthDirs, ...cityDirs]
 
-        // Then scan other directories (but skip media if we found XML files)
-        for (const dir of otherDirs) {
-          await scanDirectory(dir.url, depth + 1)
+        for (const dir of prioritizedDirs) {
+          const subUrl = new URL(dir, url).toString()
+          await scanDirectory(subUrl, depth + 1)
+
+          // If we've found a good number of files, we can stop scanning more cities
+          if (xmlFiles.length > 1000 && depth === 0) {
+            if (onProgress) {
+              onProgress(`Found ${xmlFiles.length} files, limiting scan to prevent timeout`)
+            }
+            break
+          }
         }
       }
     } catch (error) {
@@ -435,65 +471,6 @@ export async function scanRemoteDirectory(
   }
 
   return xmlFiles
-}
-
-function parseDirectoryListing(html: string, baseUrl: string): RemoteFile[] {
-  const files: RemoteFile[] = []
-
-  // Common patterns for directory listings
-  const patterns = [
-    // Apache directory listing
-    /<a href="([^"]+)"[^>]*>([^<]+)<\/a>/gi,
-    // Nginx directory listing
-    /<a href="([^"]+)">([^<]+)<\/a>/gi,
-    // IIS directory listing
-    /<A HREF="([^"]+)">([^<]+)<\/A>/gi,
-  ]
-
-  for (const pattern of patterns) {
-    let match
-    pattern.lastIndex = 0 // Reset regex
-
-    while ((match = pattern.exec(html)) !== null) {
-      const href = match[1]
-      const name = match[2].trim()
-
-      // Skip parent directory links and self references
-      if (href === "../" || href === "./" || name === "Parent Directory" || name === "..") {
-        continue
-      }
-
-      // Skip common non-content files
-      if (name.match(/^(index\.|default\.|robots\.txt|favicon\.ico)/i)) {
-        continue
-      }
-
-      // Create full URL
-      let fullUrl: string
-      if (href.startsWith("http://") || href.startsWith("https://")) {
-        fullUrl = href
-      } else {
-        const cleanBaseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/"
-        const cleanHref = href.startsWith("/") ? href.substring(1) : href
-        fullUrl = cleanBaseUrl + cleanHref
-      }
-
-      // Decode URL-encoded names
-      const decodedName = decodeURIComponent(name)
-
-      files.push({
-        name: decodedName,
-        url: fullUrl,
-      })
-    }
-
-    // If we found files with this pattern, use them
-    if (files.length > 0) {
-      break
-    }
-  }
-
-  return files
 }
 
 export async function fetchRemoteFile(url: string): Promise<string> {
@@ -516,7 +493,7 @@ export async function downloadRemoteFile(url: string, localPath: string): Promis
     }
 
     const buffer = await response.arrayBuffer()
-    await fsPromise.writeFile(localPath, Buffer.from(buffer))
+    await fs.writeFile(localPath, Buffer.from(buffer))
   } catch (error) {
     throw new Error(
       `Failed to download remote file ${url}: ${error instanceof Error ? error.message : "Unknown error"}`,
