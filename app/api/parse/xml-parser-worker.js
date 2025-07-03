@@ -1162,6 +1162,16 @@ function sendResult(result) {
   }
 }
 
+// Clean exit function
+function cleanExit(code = 0) {
+  logWorkerState("clean_exit", `code ${code}`)
+
+  // Give a small delay to ensure all logs are flushed
+  setTimeout(() => {
+    process.exit(code)
+  }, 50)
+}
+
 // Main worker execution with comprehensive error handling
 async function main() {
   try {
@@ -1225,6 +1235,9 @@ async function main() {
 
     logWorkerState("main_complete", "success")
     workerState.status = "completed"
+
+    // Clean exit after successful completion
+    cleanExit(0)
   } catch (error) {
     logWorkerError(error, "main")
     console.error(`[Worker ${workerState.id}] Fatal error in main:`, error.message)
@@ -1241,6 +1254,9 @@ async function main() {
     }
 
     sendResult(errorResult)
+
+    // Clean exit after error
+    cleanExit(0)
   }
 }
 
@@ -1261,11 +1277,7 @@ process.on("uncaughtException", (error) => {
   }
 
   sendResult(errorResult)
-
-  // Give time for message to be sent before exiting
-  setTimeout(() => {
-    process.exit(0) // Exit cleanly
-  }, 100)
+  cleanExit(0)
 })
 
 // Handle unhandled promise rejections gracefully
@@ -1286,25 +1298,21 @@ process.on("unhandledRejection", (reason, promise) => {
   }
 
   sendResult(errorResult)
-
-  // Give time for message to be sent before exiting
-  setTimeout(() => {
-    process.exit(0) // Exit cleanly
-  }, 100)
+  cleanExit(0)
 })
 
 // Handle SIGTERM gracefully
 process.on("SIGTERM", () => {
   console.log(`[Worker ${workerState.id}] Received SIGTERM, shutting down gracefully`)
   workerState.status = "terminated"
-  process.exit(0)
+  cleanExit(0)
 })
 
 // Handle SIGINT gracefully
 process.on("SIGINT", () => {
   console.log(`[Worker ${workerState.id}] Received SIGINT, shutting down gracefully`)
   workerState.status = "interrupted"
-  process.exit(0)
+  cleanExit(0)
 })
 
 // Execute main function
@@ -1325,9 +1333,5 @@ main().catch((error) => {
   }
 
   sendResult(errorResult)
-
-  // Exit cleanly after sending result
-  setTimeout(() => {
-    process.exit(0)
-  }, 100)
+  cleanExit(0)
 })
