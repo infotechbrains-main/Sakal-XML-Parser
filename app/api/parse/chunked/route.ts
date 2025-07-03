@@ -829,21 +829,421 @@ async function processRemoteFilesInChunks(
   sendMessage: (type: string, message: any) => void,
   rootDir: string,
 ): Promise<void> {
-  // Implementation for remote chunked processing
-  // This would follow the same pattern as local processing
-  // but work with remote URLs instead of local directories
-
   const totalChunks = Math.ceil(xmlFiles.length / chunkSize)
 
+  // Determine output path - handle both absolute and relative paths
+  let outputPath: string
+  if (outputFolder) {
+    if (path.isAbsolute(outputFolder)) {
+      outputPath = path.join(outputFolder, outputFile)
+    } else {
+      outputPath = path.resolve(process.cwd(), outputFolder, outputFile)
+    }
+  } else {
+    outputPath = path.join(process.cwd(), outputFile)
+  }
+
+  if (verbose) {
+    console.log(`[Chunked API] Remote processing - Output path: ${outputPath}`)
+  }
+
+  // Ensure output directory exists
+  const outputDir = path.dirname(outputPath)
+  await fs.mkdir(outputDir, { recursive: true })
+  if (verbose) {
+    console.log(`[Chunked API] Created output directory: ${outputDir}`)
+  }
+
+  // Initialize CSV file with headers
+  const headers =
+    [
+      "city",
+      "year",
+      "month",
+      "newsItemId",
+      "dateId",
+      "providerId",
+      "headline",
+      "byline",
+      "dateline",
+      "creditline",
+      "copyrightLine",
+      "slugline",
+      "keywords",
+      "edition",
+      "location",
+      "country",
+      "city_meta",
+      "pageNumber",
+      "status",
+      "urgency",
+      "language",
+      "subject",
+      "processed",
+      "published",
+      "usageType",
+      "rightsHolder",
+      "imageWidth",
+      "imageHeight",
+      "imageSize",
+      "actualFileSize",
+      "imageHref",
+      "xmlPath",
+      "imagePath",
+      "imageExists",
+      "creationDate",
+      "revisionDate",
+      "commentData",
+    ].join(",") + "\n"
+
+  await fs.writeFile(outputPath, headers, "utf8")
+
+  if (verbose) {
+    console.log(`[Chunked API] Initialized CSV file: ${outputPath}`)
+  }
+
+  const stats: ProcessingStats = {
+    totalFiles: xmlFiles.length,
+    processedFiles: 0,
+    successfulFiles: 0,
+    errorFiles: 0,
+    recordsWritten: 0,
+    filteredFiles: 0,
+    movedFiles: 0,
+  }
+
+  // Create processing state for remote files
+  const processingState: ChunkedProcessingState = {
+    sessionId,
+    config: {
+      rootDir,
+      outputFile,
+      outputFolder,
+      chunkSize,
+      pauseDuration,
+      numWorkers,
+      verbose,
+      filterConfig,
+    },
+    stats,
+    currentChunk: 0,
+    totalChunks,
+    chunkSize,
+    xmlFiles,
+    outputPath,
+    startTime: new Date().toISOString(),
+    processedChunks: [],
+  }
+
+  // Save initial processing state
+  await saveProcessingState(processingState)
+
+  // Create initial session record
+  const session = {
+    id: sessionId,
+    startTime: new Date().toISOString(),
+    status: "running" as const,
+    config: {
+      rootDir,
+      outputFile: outputPath,
+      chunkSize,
+      pauseDuration,
+      numWorkers,
+      verbose,
+      filterConfig,
+      processingMode: "chunked",
+      isRemote: true,
+    },
+    progress: {
+      totalFiles: stats.totalFiles,
+      processedFiles: 0,
+      successCount: 0,
+      errorCount: 0,
+      processedFilesList: [] as string[],
+    },
+  }
+
+  // Save initial session
+  await history.addSession(session)
+  await history.setCurrentSession(session)
+
+  sendMessage("log", `Processing ${xmlFiles.length} remote files in ${totalChunks} chunks`)
+
+  let wasInterrupted = false
+
+  // Process files in chunks
   for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    // Update current chunk in processing state
+    processingState.currentChunk = chunkIndex + 1
+    await saveProcessingState(processingState)
+
+    // Check for pause/stop before processing chunk
+    const pauseState = getPauseState()
+    if (pauseState.shouldStop) {
+      if (verbose) {
+        console.log(`[Chunked API] Stop requested before remote chunk ${chunkIndex + 1}`)
+      }
+      wasInterrupted = true
+      processingState.pauseTime = new Date().toISOString()
+      await saveProcessingState(processingState)
+      sendMessage("shutdown", {
+        reason: "Processing stopped by user",
+        stats,
+        outputFile: outputPath,
+        canResume: true,
+        currentChunk: chunkIndex + 1,
+        totalChunks,
+      })
+      return
+    }
+
+    if (pauseState.isPaused) {
+      if (verbose) {
+        console.log(`[Chunked API] Pause requested before remote chunk ${chunkIndex + 1}`)
+      }
+      processingState.pauseTime = new Date().toISOString()
+      await saveProcessingState(processingState)
+
+      // Update session status to paused
+      await history.updateSession(sessionId, {
+        status: "paused",
+        progress: {
+          totalFiles: stats.totalFiles,
+          processedFiles: stats.processedFiles,
+          successCount: stats.successfulFiles,
+          errorCount: stats.errorFiles,
+        },
+      })
+
+      sendMessage("paused", {
+        message: "Processing paused - state saved",
+        canResume: true,
+        currentChunk: chunkIndex + 1,
+        totalChunks,
+      })
+      return
+    }
+
     const startIndex = chunkIndex * chunkSize
     const endIndex = Math.min(startIndex + chunkSize, xmlFiles.length)
     const chunk = xmlFiles.slice(startIndex, endIndex)
 
-    sendMessage("chunk", `Processing remote chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} files)`)
+    sendMessage("chunk", `Starting remote chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} files)`)
 
-    // Process this chunk...
-    // (Similar logic to local processing but for remote files)
+    if (verbose) {
+      console.log(`[Chunked API] Processing remote chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} files)`)
+    }
+
+    // Process chunk with workers
+    const activeWorkers = new Set<Worker>()
+    const chunkPromises = chunk.map((xmlFile, index) =>
+      processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, startIndex + index + 1, true),
+    )
+
+    try {
+      const chunkResults = await Promise.all(chunkPromises)
+
+      // Check for pause/stop during batch processing
+      const midProcessPauseState = getPauseState()
+      if (midProcessPauseState.shouldStop || midProcessPauseState.isPaused) {
+        if (verbose) {
+          console.log(`[Chunked API] Pause/Stop requested during remote batch processing`)
+        }
+
+        // Cleanup workers
+        for (const worker of activeWorkers) {
+          try {
+            worker.terminate()
+          } catch (error) {
+            if (verbose) {
+              console.error("[Chunked API] Error terminating worker:", error)
+            }
+          }
+        }
+        activeWorkers.clear()
+
+        // Process results we got before interruption
+        await processChunkResults(chunkResults, outputPath, stats, verbose)
+
+        // Update processing state with current progress
+        processingState.stats = stats
+        processingState.pauseTime = new Date().toISOString()
+        processingState.processedChunks.push(chunk)
+        await saveProcessingState(processingState)
+
+        if (midProcessPauseState.shouldStop) {
+          wasInterrupted = true
+          sendMessage("shutdown", {
+            reason: "Processing stopped during remote batch",
+            stats,
+            outputFile: outputPath,
+            canResume: true,
+            currentChunk: chunkIndex + 1,
+            totalChunks,
+          })
+        } else {
+          sendMessage("paused", {
+            message: "Processing paused during remote batch - state saved",
+            canResume: true,
+            currentChunk: chunkIndex + 1,
+            totalChunks,
+          })
+        }
+
+        return
+      }
+
+      // Process results normally
+      await processChunkResults(chunkResults, outputPath, stats, verbose)
+
+      // Update processing state with current progress
+      processingState.stats = stats
+      processingState.processedChunks.push(chunk)
+      await saveProcessingState(processingState)
+
+      // Update session progress
+      await history.updateSession(sessionId, {
+        progress: {
+          totalFiles: stats.totalFiles,
+          processedFiles: stats.processedFiles,
+          successCount: stats.successfulFiles,
+          errorCount: stats.errorFiles,
+        },
+      })
+
+      // Cleanup workers
+      for (const worker of activeWorkers) {
+        try {
+          worker.terminate()
+        } catch (error) {
+          if (verbose) {
+            console.error("[Chunked API] Error terminating worker:", error)
+          }
+        }
+      }
+      activeWorkers.clear()
+
+      sendMessage("chunk", `Completed remote chunk ${chunkIndex + 1}/${totalChunks}`)
+
+      // Send progress update
+      const percentage = Math.round((stats.processedFiles / stats.totalFiles) * 100)
+      sendMessage("progress", {
+        percentage,
+        total: stats.totalFiles,
+        processed: stats.processedFiles,
+        successful: stats.successfulFiles,
+        errors: stats.errorFiles,
+        filtered: stats.filteredFiles,
+        moved: stats.movedFiles,
+        currentChunk: chunkIndex + 1,
+        totalChunks,
+      })
+
+      if (verbose) {
+        console.log(`[Chunked API] Remote chunk ${chunkIndex + 1}/${totalChunks} completed`)
+        console.log(`[Chunked API] Progress: ${stats.processedFiles}/${stats.totalFiles} (${percentage}%)`)
+        console.log(
+          `[Chunked API] Success: ${stats.successfulFiles}, Errors: ${stats.errorFiles}, Filtered: ${stats.filteredFiles}, Moved: ${stats.movedFiles}`,
+        )
+      }
+
+      // Pause between chunks (except for the last chunk)
+      if (chunkIndex < totalChunks - 1 && pauseDuration > 0) {
+        if (verbose) {
+          console.log(`[Chunked API] Pausing for ${pauseDuration}ms between remote chunks`)
+        }
+
+        // Check for pause/stop during the pause period
+        const pauseStartTime = Date.now()
+        while (Date.now() - pauseStartTime < pauseDuration) {
+          const pauseCheckState = getPauseState()
+          if (pauseCheckState.shouldStop || pauseCheckState.isPaused) {
+            if (verbose) {
+              console.log(`[Chunked API] Pause/Stop requested during remote chunk pause`)
+            }
+
+            processingState.pauseTime = new Date().toISOString()
+            await saveProcessingState(processingState)
+
+            if (pauseCheckState.shouldStop) {
+              wasInterrupted = true
+              sendMessage("shutdown", {
+                reason: "Processing stopped during remote chunk pause",
+                stats,
+                outputFile: outputPath,
+                canResume: true,
+                currentChunk: chunkIndex + 2, // Next chunk to process
+                totalChunks,
+              })
+            } else {
+              sendMessage("paused", {
+                message: "Processing paused during remote chunk pause - state saved",
+                canResume: true,
+                currentChunk: chunkIndex + 2, // Next chunk to process
+                totalChunks,
+              })
+            }
+
+            return
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200)) // Check every 200ms
+        }
+      }
+    } catch (error) {
+      const errorMsg = `Remote chunk ${chunkIndex + 1} processing error: ${error instanceof Error ? error.message : "Unknown error"}`
+      if (verbose) {
+        console.error(`[Chunked API] ${errorMsg}`)
+      }
+      sendMessage("error", errorMsg)
+      stats.errorFiles += chunk.length
+      stats.processedFiles += chunk.length
+
+      // Update processing state even on error
+      processingState.stats = stats
+      await saveProcessingState(processingState)
+    }
+  }
+
+  // Clear processing state file on successful completion
+  await clearProcessingState()
+
+  // Update final session status
+  const finalStatus = wasInterrupted ? "interrupted" : "completed"
+  const endTime = new Date().toISOString()
+
+  await history.updateSession(sessionId, {
+    status: finalStatus,
+    endTime,
+    progress: {
+      totalFiles: stats.totalFiles,
+      processedFiles: stats.processedFiles,
+      successCount: stats.successfulFiles,
+      errorCount: stats.errorFiles,
+    },
+    results: {
+      outputPath,
+    },
+  })
+
+  // Clear current session
+  await history.setCurrentSession(null)
+
+  // Send completion message
+  if (!wasInterrupted) {
+    const completionMessage = `Remote chunked processing completed! Processed ${stats.processedFiles} files in ${totalChunks} chunks, ${stats.successfulFiles} successful, ${stats.errorFiles} errors.`
+
+    if (verbose) {
+      console.log(`[Chunked API] ${completionMessage}`)
+      console.log(`[Chunked API] Final stats:`, stats)
+      console.log(`[Chunked API] Output file: ${outputPath}`)
+      console.log(`[Chunked API] Session ${sessionId} completed successfully`)
+    }
+
+    sendMessage("complete", {
+      stats,
+      outputFile: outputPath,
+      message: completionMessage,
+    })
   }
 }
 
