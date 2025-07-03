@@ -4,6 +4,7 @@ import path from "path"
 import { Worker } from "worker_threads"
 import { getPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
+import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
 
 interface ProcessingStats {
   totalFiles: number
@@ -141,8 +142,35 @@ export async function POST(request: NextRequest) {
           console.log(`  - Filters Enabled: ${filterConfig?.enabled || false}`)
         }
 
-        // Find all XML files
-        const xmlFiles = await findXMLFiles(rootDir)
+        // Check if this is a remote path and handle accordingly
+        const isRemote = await isRemotePath(rootDir)
+        let xmlFiles: string[] = []
+
+        if (isRemote) {
+          sendMessage("log", "Detected remote URL - scanning remote directory...")
+
+          try {
+            const remoteFiles = await scanRemoteDirectory(rootDir, (message) => {
+              sendMessage("log", message)
+            })
+
+            // Convert remote files to file paths for processing
+            xmlFiles = remoteFiles.map((file) => file.url)
+
+            if (verbose) {
+              console.log(`[Chunked API] Found ${xmlFiles.length} remote XML files`)
+            }
+          } catch (error) {
+            const errorMsg = `Failed to scan remote directory: ${error instanceof Error ? error.message : "Unknown error"}`
+            console.error(`[Chunked API] ${errorMsg}`)
+            sendMessage("error", errorMsg)
+            safeCloseController()
+            return
+          }
+        } else {
+          // Local file processing
+          xmlFiles = await findXMLFiles(rootDir)
+        }
 
         if (xmlFiles.length === 0) {
           sendMessage("error", "No XML files found in the specified directory")
@@ -350,7 +378,7 @@ export async function POST(request: NextRequest) {
           // Process chunk with workers
           const activeWorkers = new Set<Worker>()
           const chunkPromises = chunk.map((xmlFile, index) =>
-            processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, startIndex + index + 1),
+            processFile(xmlFile, filterConfig, verbose, activeWorkers, rootDir, startIndex + index + 1, isRemote),
           )
 
           try {
@@ -672,6 +700,7 @@ async function processFile(
   activeWorkers: Set<Worker>,
   originalRootDir: string,
   workerId: number,
+  isRemote = false,
 ): Promise<WorkerResult> {
   return new Promise((resolve) => {
     // Check for pause/stop before creating worker
@@ -688,7 +717,7 @@ async function processFile(
     }
 
     if (verbose) {
-      console.log(`[Chunked API] Creating worker ${workerId} for file: ${path.basename(xmlFile)}`)
+      console.log(`[Chunked API] Creating worker ${workerId} for file: ${isRemote ? xmlFile : path.basename(xmlFile)}`)
     }
 
     const worker = new Worker(path.join(process.cwd(), "app/api/parse/xml-parser-worker.js"), {
@@ -698,8 +727,8 @@ async function processFile(
         originalRootDir: originalRootDir,
         workerId: workerId,
         verbose: verbose,
-        isRemote: false,
-        originalRemoteXmlUrl: null,
+        isRemote: isRemote,
+        originalRemoteXmlUrl: isRemote ? xmlFile : null,
         associatedImagePath: null,
         isWatchMode: false,
       },
