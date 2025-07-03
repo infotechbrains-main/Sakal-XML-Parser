@@ -512,7 +512,7 @@ export async function POST(request: NextRequest) {
               )
             }
 
-            // Pause between chunks (except for the last chunk)
+            // Pause between chunks (except for the last chunk) - FIXED PAUSE CHECKING
             if (chunkIndex < totalChunks - 1 && pauseDuration > 0) {
               if (verbose) {
                 console.log(`[Chunked API] Pausing for ${pauseDuration}ms between chunks`)
@@ -520,6 +520,7 @@ export async function POST(request: NextRequest) {
 
               const pauseStartTime = Date.now()
               while (Date.now() - pauseStartTime < pauseDuration) {
+                // Check pause state more frequently during pause
                 const pauseCheckState = getPauseState()
                 if (pauseCheckState.shouldStop || pauseCheckState.isPaused) {
                   if (verbose) {
@@ -551,7 +552,8 @@ export async function POST(request: NextRequest) {
                   safeCloseController()
                   return
                 }
-                await new Promise((resolve) => setTimeout(resolve, 200))
+                // Check every 100ms instead of 200ms for more responsive pause
+                await new Promise((resolve) => setTimeout(resolve, 100))
               }
             }
           } catch (error) {

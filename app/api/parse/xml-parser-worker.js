@@ -1256,7 +1256,7 @@ async function main() {
     sendResult(errorResult)
 
     // Clean exit after error
-    cleanExit(0)
+    cleanExit(1)
   }
 }
 
@@ -1277,7 +1277,7 @@ process.on("uncaughtException", (error) => {
   }
 
   sendResult(errorResult)
-  cleanExit(0)
+  cleanExit(1)
 })
 
 // Handle unhandled promise rejections gracefully
@@ -1298,7 +1298,7 @@ process.on("unhandledRejection", (reason, promise) => {
   }
 
   sendResult(errorResult)
-  cleanExit(0)
+  cleanExit(1)
 })
 
 // Handle SIGTERM gracefully
@@ -1333,5 +1333,5 @@ main().catch((error) => {
   }
 
   sendResult(errorResult)
-  cleanExit(0)
+  cleanExit(1)
 })
