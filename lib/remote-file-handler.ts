@@ -22,11 +22,28 @@ export async function isRemotePath(filePath: string): Promise<boolean> {
   return filePath && (filePath.startsWith("http://") || filePath.startsWith("https://"))
 }
 
+// Helper function to normalize URLs for comparison
+function normalizeUrl(url: string): string {
+  try {
+    const urlObj = new URL(url)
+    // Ensure path ends with slash for directories
+    if (!urlObj.pathname.endsWith("/")) {
+      urlObj.pathname += "/"
+    }
+    return urlObj.toString()
+  } catch (error) {
+    return url.endsWith("/") ? url : url + "/"
+  }
+}
+
 // Helper function to check if a URL is within the allowed base path
 function isWithinBasePath(baseUrl: string, targetUrl: string): boolean {
   try {
-    const base = new URL(baseUrl)
-    const target = new URL(targetUrl)
+    const normalizedBase = normalizeUrl(baseUrl)
+    const normalizedTarget = normalizeUrl(targetUrl)
+
+    const base = new URL(normalizedBase)
+    const target = new URL(normalizedTarget)
 
     // Must be same origin (protocol + host + port)
     if (base.origin !== target.origin) {
@@ -34,10 +51,7 @@ function isWithinBasePath(baseUrl: string, targetUrl: string): boolean {
     }
 
     // Target path must start with base path
-    const basePath = base.pathname.endsWith("/") ? base.pathname : base.pathname + "/"
-    const targetPath = target.pathname.endsWith("/") ? target.pathname : target.pathname + "/"
-
-    return targetPath.startsWith(basePath)
+    return target.pathname.startsWith(base.pathname)
   } catch (error) {
     console.error("Error checking path bounds:", error)
     return false
@@ -49,9 +63,11 @@ export async function fetchDirectoryListing(
   baseUrl: string,
 ): Promise<{ files: RemoteFile[]; directories: string[] }> {
   try {
-    console.log(`Fetching directory listing from: ${url}`)
+    // Normalize the URL to ensure it ends with /
+    const normalizedUrl = normalizeUrl(url)
+    console.log(`Fetching directory listing from: ${normalizedUrl}`)
 
-    const response = await fetch(url, {
+    const response = await fetch(normalizedUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; XML-Parser/1.0)",
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -72,7 +88,7 @@ export async function fetchDirectoryListing(
     const files: RemoteFile[] = []
     const directories: string[] = []
 
-    // Enhanced patterns for IIS directory listing (which is what your server uses)
+    // Enhanced patterns for IIS directory listing
     const linkPatterns = [
       // IIS format: <A HREF="/photoapp/Akola/">Akola</A>
       /<A\s+HREF=["']([^"']+)["'][^>]*>([^<]+)<\/A>/gi,
@@ -80,8 +96,6 @@ export async function fetchDirectoryListing(
       /<a\s+href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/gi,
       // Simple href without quotes
       /<a\s+href=([^\s>]+)[^>]*>([^<]+)<\/a>/gi,
-      // More flexible pattern
-      /href\s*=\s*["']([^"']+)["'][^>]*>([^<]*)</gi,
     ]
 
     let foundLinks = false
@@ -120,48 +134,41 @@ export async function fetchDirectoryListing(
 
         foundLinks = true
 
-        // For IIS format, href is the full path like "/photoapp/Akola/"
-        // We need to convert this to relative path for URL construction
-        let relativePath = href
-
-        // If href is an absolute path starting with the base path, make it relative
-        const basePath = new URL(baseUrl).pathname
-        if (href.startsWith(basePath)) {
-          relativePath = href.substring(basePath.length)
-          // Remove leading slash if present
-          if (relativePath.startsWith("/")) {
-            relativePath = relativePath.substring(1)
-          }
-        } else if (href.startsWith("/")) {
-          // If it's an absolute path but doesn't start with base path, skip it
-          continue
-        }
-
-        // Determine if it's a directory or file
-        const isDirectory =
-          href.endsWith("/") || linkText.endsWith("/") || html.includes(`&lt;dir&gt; <A HREF="${href}">`)
+        // Determine if it's a directory or file based on the HTML content
+        const isDirectory = href.endsWith("/") || html.includes(`&lt;dir&gt; <A HREF="${href}">`)
 
         if (isDirectory) {
-          // It's a directory - use relative path
-          const dirName = relativePath.endsWith("/") ? relativePath : relativePath + "/"
+          // For directories, use the link text as the directory name
+          const dirName = linkText.endsWith("/") ? linkText : linkText + "/"
 
           // Skip if already found
           if (directories.includes(dirName)) continue
 
-          // Construct the full URL to verify it's valid
-          try {
-            const dirUrl = new URL(dirName, url).toString()
+          // Construct the full URL using the original href
+          let fullDirUrl: string
+          if (href.startsWith("http://") || href.startsWith("https://")) {
+            // Absolute URL
+            fullDirUrl = href
+          } else if (href.startsWith("/")) {
+            // Root-relative URL
+            const baseUrlObj = new URL(normalizedUrl)
+            fullDirUrl = `${baseUrlObj.protocol}//${baseUrlObj.host}${href}`
+          } else {
+            // Relative URL
+            fullDirUrl = new URL(href, normalizedUrl).toString()
+          }
 
-            // Basic sanity check - make sure it's within our domain
-            if (isWithinBasePath(baseUrl, dirUrl)) {
-              directories.push(dirName)
-              console.log(`Added directory: ${dirName} -> ${dirUrl}`)
-            } else {
-              console.log(`Skipping directory ${dirName} - outside base path`)
-            }
-          } catch (urlError) {
-            console.log(`Skipping directory ${dirName} - invalid URL construction`)
-            continue
+          // Ensure the directory URL ends with /
+          if (!fullDirUrl.endsWith("/")) {
+            fullDirUrl += "/"
+          }
+
+          // Check if it's within base path
+          if (isWithinBasePath(baseUrl, fullDirUrl)) {
+            directories.push(dirName)
+            console.log(`Added directory: ${dirName} -> ${fullDirUrl}`)
+          } else {
+            console.log(`Skipping directory ${dirName} - outside base path (${fullDirUrl} not within ${baseUrl})`)
           }
         } else if (href.toLowerCase().endsWith(".xml")) {
           // It's an XML file
@@ -170,22 +177,25 @@ export async function fetchDirectoryListing(
           // Skip if already found
           if (files.some((f) => f.name === fileName)) continue
 
-          try {
-            // Handle relative URLs and ensure they're within base path
-            const fileUrl = new URL(relativePath, url).toString()
+          // Construct the full URL
+          let fullFileUrl: string
+          if (href.startsWith("http://") || href.startsWith("https://")) {
+            fullFileUrl = href
+          } else if (href.startsWith("/")) {
+            const baseUrlObj = new URL(normalizedUrl)
+            fullFileUrl = `${baseUrlObj.protocol}//${baseUrlObj.host}${href}`
+          } else {
+            fullFileUrl = new URL(href, normalizedUrl).toString()
+          }
 
-            if (isWithinBasePath(baseUrl, fileUrl)) {
-              files.push({
-                name: fileName,
-                url: fileUrl,
-              })
-              console.log(`Added XML file: ${fileName} -> ${fileUrl}`)
-            } else {
-              console.log(`Skipping file ${fileName} - outside base path`)
-            }
-          } catch (urlError) {
-            console.log(`Skipping file ${fileName} - invalid URL construction`)
-            continue
+          if (isWithinBasePath(baseUrl, fullFileUrl)) {
+            files.push({
+              name: fileName,
+              url: fullFileUrl,
+            })
+            console.log(`Added XML file: ${fileName} -> ${fullFileUrl}`)
+          } else {
+            console.log(`Skipping file ${fileName} - outside base path`)
           }
         }
       }
@@ -193,52 +203,6 @@ export async function fetchDirectoryListing(
       // If we found links with this pattern, use them
       if (foundLinks) {
         break
-      }
-    }
-
-    // If no links found with standard patterns, try alternative parsing for IIS
-    if (!foundLinks) {
-      console.log("No links found with standard patterns, trying IIS-specific parsing...")
-
-      // Look for IIS directory listing pattern: <dir> <A HREF="/path/">name</A>
-      const iisPattern = /&lt;dir&gt;\s*<A\s+HREF=["']([^"']+)["'][^>]*>([^<]+)<\/A>/gi
-      let match
-      while ((match = iisPattern.exec(html)) !== null) {
-        const href = match[1]?.trim()
-        const linkText = match[2]?.trim()
-
-        if (!href || !linkText) continue
-
-        // Skip parent directory references
-        if (linkText === ".." || href === "../" || linkText === "[To Parent Directory]") {
-          continue
-        }
-
-        // Convert full path to relative path
-        let relativePath = href
-        const basePath = new URL(baseUrl).pathname
-        if (href.startsWith(basePath)) {
-          relativePath = href.substring(basePath.length)
-          if (relativePath.startsWith("/")) {
-            relativePath = relativePath.substring(1)
-          }
-        }
-
-        const dirName = relativePath.endsWith("/") ? relativePath : relativePath + "/"
-
-        if (!directories.includes(dirName)) {
-          try {
-            const dirUrl = new URL(dirName, url).toString()
-            if (isWithinBasePath(baseUrl, dirUrl)) {
-              directories.push(dirName)
-              foundLinks = true
-              console.log(`Added directory (IIS): ${dirName} -> ${dirUrl}`)
-            }
-          } catch (urlError) {
-            console.log(`Skipping directory (IIS) ${dirName} - invalid URL construction`)
-            continue
-          }
-        }
       }
     }
 
@@ -314,27 +278,23 @@ export async function scanFolderCompletely(
   }
 
   try {
-    // Ensure URL ends with a slash
-    if (!folderUrl.endsWith("/")) {
-      folderUrl += "/"
-    }
-
-    onProgress?.(`Deep scanning folder: ${folderUrl} (depth: ${currentDepth})`)
+    const normalizedFolderUrl = normalizeUrl(folderUrl)
+    onProgress?.(`Deep scanning folder: ${normalizedFolderUrl} (depth: ${currentDepth})`)
 
     // Get directory listing
-    const { files, directories } = await fetchDirectoryListing(folderUrl, baseUrl)
+    const { files, directories } = await fetchDirectoryListing(normalizedFolderUrl, baseUrl)
 
     // Add all XML files from current directory
     for (const file of files) {
       if (file.name.toLowerCase().endsWith(".xml")) {
         allXmlFiles.push(file)
-        onProgress?.(`Found XML file: ${file.name} in ${folderUrl}`)
+        onProgress?.(`Found XML file: ${file.name} in ${normalizedFolderUrl}`)
       }
     }
 
     // If we found XML files, we're likely in a 'processed' directory, so don't go deeper
     if (files.length > 0) {
-      onProgress?.(`Found ${files.length} XML files in ${folderUrl}, stopping deeper scan`)
+      onProgress?.(`Found ${files.length} XML files in ${normalizedFolderUrl}, stopping deeper scan`)
       return allXmlFiles
     }
 
@@ -359,7 +319,8 @@ export async function scanFolderCompletely(
 
     for (const dir of prioritizedDirs) {
       try {
-        const subDirUrl = new URL(dir, folderUrl).toString()
+        // Construct subdirectory URL by appending directory name to current URL
+        const subDirUrl = normalizedFolderUrl + dir
 
         onProgress?.(`Scanning subdirectory: ${dir} -> ${subDirUrl}`)
 
@@ -413,7 +374,8 @@ export async function scanTopLevelFolders(
     // Scan each top-level folder completely
     for (const dir of directories) {
       try {
-        const topLevelFolderUrl = new URL(dir, baseUrl).toString()
+        const normalizedBaseUrl = normalizeUrl(baseUrl)
+        const topLevelFolderUrl = normalizedBaseUrl + dir
         onProgress?.(`Scanning top-level folder: ${dir} -> ${topLevelFolderUrl}`)
 
         const folderFiles = await scanFolderCompletely(topLevelFolderUrl, baseUrl, 5, 0, onProgress)
@@ -457,18 +419,20 @@ export async function scanRemoteDirectory(
   const visitedUrls = new Set<string>()
 
   async function scanDirectory(url: string, depth = 0): Promise<void> {
-    if (depth > maxDepth || visitedUrls.has(url)) {
+    const normalizedUrl = normalizeUrl(url)
+
+    if (depth > maxDepth || visitedUrls.has(normalizedUrl)) {
       return
     }
 
-    visitedUrls.add(url)
+    visitedUrls.add(normalizedUrl)
 
     try {
       if (onProgress) {
-        onProgress(`Scanning: ${url} (depth: ${depth})`)
+        onProgress(`Scanning: ${normalizedUrl} (depth: ${depth})`)
       }
 
-      const { files, directories } = await fetchDirectoryListing(url, baseUrl)
+      const { files, directories } = await fetchDirectoryListing(normalizedUrl, baseUrl)
 
       // Add XML files from current directory
       for (const file of files) {
@@ -483,7 +447,7 @@ export async function scanRemoteDirectory(
       // If we found XML files, we're likely in a 'processed' directory
       if (files.length > 0) {
         if (onProgress) {
-          onProgress(`Found ${files.length} XML files in ${url}, stopping deeper scan`)
+          onProgress(`Found ${files.length} XML files in ${normalizedUrl}, stopping deeper scan`)
         }
         return // Don't scan deeper if we found XML files
       }
@@ -528,7 +492,8 @@ export async function scanRemoteDirectory(
         }
 
         for (const dir of prioritizedDirs) {
-          const subUrl = new URL(dir, url).toString()
+          // Construct subdirectory URL by appending directory name
+          const subUrl = normalizedUrl + dir
           await scanDirectory(subUrl, depth + 1)
 
           // If we're at the root level and found a good number of files, we can stop scanning more cities
@@ -544,7 +509,7 @@ export async function scanRemoteDirectory(
             const scannedCities = prioritizedDirs
               .slice(0, prioritizedDirs.indexOf(dir) + 1)
               .filter((d) => cityDirs.includes(d))
-            if (scannedCities.length >= 3 && xmlFiles.length > 1000) {
+            if (scannedCities.length >= 2 && xmlFiles.length > 500) {
               if (onProgress) {
                 onProgress(
                   `Scanned ${scannedCities.length} cities, found ${xmlFiles.length} files, stopping to prevent timeout`,
@@ -556,9 +521,9 @@ export async function scanRemoteDirectory(
         }
       }
     } catch (error) {
-      console.error(`Error scanning ${url}:`, error)
+      console.error(`Error scanning ${normalizedUrl}:`, error)
       if (onProgress) {
-        onProgress(`Error scanning ${url}: ${error instanceof Error ? error.message : "Unknown error"}`)
+        onProgress(`Error scanning ${normalizedUrl}: ${error instanceof Error ? error.message : "Unknown error"}`)
       }
     }
   }
