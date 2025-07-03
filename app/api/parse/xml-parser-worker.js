@@ -392,18 +392,29 @@ function passesFilter(record, filterConfig) {
     return result
   }
 
-  // File type filter - check allowedFileTypes OR fileTypes
+  // File type filter - FIXED to handle both .tif and .tiff
   const allowedTypes = filterConfig.allowedFileTypes || filterConfig.fileTypes || []
   if (allowedTypes && allowedTypes.length > 0) {
     const imageFileName = record.imageHref || ""
     if (imageFileName) {
       const fileExtension = imageFileName.split(".").pop()?.toLowerCase() || ""
-      const isAllowedType = allowedTypes.some((allowedType) => allowedType.toLowerCase() === fileExtension)
+
+      // Create a normalized list of allowed extensions
+      const normalizedAllowedTypes = allowedTypes.map((type) => type.toLowerCase())
+
+      // Handle special case for TIFF files - both .tif and .tiff should be accepted if either is allowed
+      let isAllowedType = normalizedAllowedTypes.includes(fileExtension)
+
+      // Special handling for TIFF files
+      if (!isAllowedType && (fileExtension === "tif" || fileExtension === "tiff")) {
+        isAllowedType = normalizedAllowedTypes.includes("tif") || normalizedAllowedTypes.includes("tiff")
+      }
 
       if (workerData.verbose) {
         console.log(`[Worker ${workerData.workerId}] File type check:`)
         console.log(`  - Image extension: .${fileExtension}`)
         console.log(`  - Allowed types: [${allowedTypes.join(", ")}]`)
+        console.log(`  - Normalized allowed types: [${normalizedAllowedTypes.join(", ")}]`)
         console.log(`  - Is allowed: ${isAllowedType}`)
       }
 
@@ -991,18 +1002,17 @@ async function processXmlFileInWorker(
       }
     }
 
-    // Return record based on filter results - ALWAYS return record if processing succeeded
-    const shouldReturnRecord = !filterConfig?.enabled || passed
+    // ALWAYS return the record - let the main process decide what to do with it
+    const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
 
     if (verbose) {
-      const fileName = isRemote ? new URL(xmlFilePath).pathname.split("/").pop() : path.basename(xmlFilePath)
       console.log(
-        `[Worker ${workerId}] File ${fileName} processed successfully. Passed filter: ${passed}, Image moved: ${moved}, Record included: ${shouldReturnRecord}`,
+        `[Worker ${workerId}] File ${fileName} processed successfully. Passed filter: ${passed}, Image moved: ${moved}, Record returned: true`,
       )
     }
 
     return {
-      record: shouldReturnRecord ? record : null,
+      record: record, // Always return the record
       passedFilter: passed,
       imageMoved: moved,
       workerId,
@@ -1092,7 +1102,7 @@ async function main() {
         workerId: workerData?.workerId || 0,
       })
     }
-    // Don't exit with code 1 - let the process complete normally
+    // Don't exit with error code - let the process complete normally
   }
 }
 
