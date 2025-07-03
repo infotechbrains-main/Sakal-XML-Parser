@@ -148,8 +148,26 @@ export async function POST(request: NextRequest) {
           movedFiles: 0,
         }
 
-        // Determine output path
-        const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
+        // Determine output path - handle both absolute and relative paths
+        let outputPath: string
+        if (outputFolder) {
+          // Check if outputFolder is an absolute path
+          if (path.isAbsolute(outputFolder)) {
+            outputPath = path.join(outputFolder, outputFile)
+          } else {
+            // Treat as relative to current working directory
+            outputPath = path.resolve(process.cwd(), outputFolder, outputFile)
+          }
+        } else {
+          outputPath = path.join(process.cwd(), outputFile)
+        }
+
+        // Log the resolved path for debugging
+        if (verbose) {
+          console.log(`[Stream API] Resolved output path: ${outputPath}`)
+          console.log(`[Stream API] Output folder provided: ${outputFolder || "none"}`)
+          console.log(`[Stream API] Is absolute path: ${outputFolder ? path.isAbsolute(outputFolder) : "N/A"}`)
+        }
 
         // Create initial session record
         const session = {
@@ -186,11 +204,10 @@ export async function POST(request: NextRequest) {
         sendMessage("log", `Processing ${xmlFiles.length} files with ${numWorkers} workers`)
 
         // Ensure output directory exists
-        if (outputFolder) {
-          await fs.mkdir(outputFolder, { recursive: true })
-          if (verbose) {
-            console.log(`[Stream API] Created output directory: ${outputFolder}`)
-          }
+        const outputDir = path.dirname(outputPath)
+        await fs.mkdir(outputDir, { recursive: true })
+        if (verbose) {
+          console.log(`[Stream API] Created output directory: ${outputDir}`)
         }
 
         // Initialize CSV file with headers
