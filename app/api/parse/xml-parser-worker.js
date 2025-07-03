@@ -1106,6 +1106,7 @@ async function main() {
   }
 }
 
+// Execute main function and handle any uncaught errors gracefully
 main().catch((error) => {
   console.error("Worker main function failed:", error)
   if (parentPort) {
@@ -1117,4 +1118,35 @@ main().catch((error) => {
       workerId: workerData?.workerId || 0,
     })
   }
+  // Don't exit with error code - complete normally
+})
+
+// Handle uncaught exceptions gracefully
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error)
+  if (parentPort) {
+    parentPort.postMessage({
+      record: null,
+      passedFilter: false,
+      imageMoved: false,
+      error: error.message,
+      workerId: workerData?.workerId || 0,
+    })
+  }
+  // Don't exit with error code
+})
+
+// Handle unhandled promise rejections gracefully
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason)
+  if (parentPort) {
+    parentPort.postMessage({
+      record: null,
+      passedFilter: false,
+      imageMoved: false,
+      error: String(reason),
+      workerId: workerData?.workerId || 0,
+    })
+  }
+  // Don't exit with error code
 })
