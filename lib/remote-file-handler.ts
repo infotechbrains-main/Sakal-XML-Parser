@@ -78,12 +78,12 @@ export async function fetchDirectoryListing(
     const files: RemoteFile[] = []
     const directories: string[] = []
 
-    // Enhanced patterns for different server types
+    // Enhanced patterns for IIS directory listing (which is what your server uses)
     const linkPatterns = [
+      // IIS format: <A HREF="/photoapp/Akola/">Akola</A>
+      /<A\s+HREF=["']([^"']+)["'][^>]*>([^<]+)<\/A>/gi,
       // Apache/Nginx standard format
       /<a\s+href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/gi,
-      // IIS format
-      /<A\s+HREF=["']([^"']+)["'][^>]*>([^<]+)<\/A>/gi,
       // Simple href without quotes
       /<a\s+href=([^\s>]+)[^>]*>([^<]+)<\/a>/gi,
       // More flexible pattern
@@ -108,9 +108,11 @@ export async function fetchDirectoryListing(
           href === "./" ||
           href === "." ||
           href === ".." ||
+          href === "/" ||
           linkText === "Parent Directory" ||
           linkText === ".." ||
           linkText === "." ||
+          linkText === "[To Parent Directory]" ||
           href.startsWith("?") ||
           href.startsWith("#")
         ) {
@@ -124,13 +126,27 @@ export async function fetchDirectoryListing(
 
         foundLinks = true
 
+        // For IIS format, href is the full path like "/photoapp/Akola/"
+        // We need to convert this to relative path
+        let relativePath = href
+        if (href.startsWith("/photoapp/")) {
+          // Extract the relative part after the base path
+          const basePath = new URL(baseUrl).pathname
+          if (href.startsWith(basePath)) {
+            relativePath = href.substring(basePath.length)
+            if (!relativePath.startsWith("/")) {
+              relativePath = "/" + relativePath
+            }
+          }
+        }
+
         // Determine if it's a directory or file
         const isDirectory =
-          href.endsWith("/") || (!href.includes(".") && !linkText.includes(".")) || linkText.endsWith("/")
+          href.endsWith("/") || linkText.endsWith("/") || html.includes(`&lt;dir&gt; <A HREF="${href}">`)
 
         if (isDirectory) {
           // It's a directory
-          const dirName = href.endsWith("/") ? href : href + "/"
+          const dirName = relativePath.endsWith("/") ? relativePath : relativePath + "/"
 
           // Skip if already found
           if (directories.includes(dirName)) continue
@@ -171,30 +187,43 @@ export async function fetchDirectoryListing(
       }
     }
 
-    // If no links found with standard patterns, try alternative parsing
+    // If no links found with standard patterns, try alternative parsing for IIS
     if (!foundLinks) {
-      console.log("No links found with standard patterns, trying alternative parsing...")
+      console.log("No links found with standard patterns, trying IIS-specific parsing...")
 
-      // Try to find directory names in the HTML content
-      const cityPatterns = [
-        // Look for common Indian city names or directory-like patterns
-        /(?:^|\s|>)([A-Z][a-zA-Z]+)(?:\/|\s|<|$)/gm,
-        // Look for year patterns (2010-2030)
-        /(?:^|\s|>)(20[1-3][0-9])(?:\/|\s|<|$)/gm,
-        // Look for month patterns (01-12)
-        /(?:^|\s|>)(0[1-9]|1[0-2])(?:\/|\s|<|$)/gm,
-      ]
+      // Look for IIS directory listing pattern: <dir> <A HREF="/path/">name</A>
+      const iisPattern = /&lt;dir&gt;\s*<A\s+HREF=["']([^"']+)["'][^>]*>([^<]+)<\/A>/gi
+      let match
+      while ((match = iisPattern.exec(html)) !== null) {
+        const href = match[1]?.trim()
+        const linkText = match[2]?.trim()
 
-      for (const pattern of cityPatterns) {
-        pattern.lastIndex = 0
-        let match
-        while ((match = pattern.exec(html)) !== null) {
-          const dirName = match[1] + "/"
-          if (!directories.includes(dirName)) {
-            const dirUrl = new URL(dirName, url).toString()
-            if (isWithinBasePath(baseUrl, dirUrl)) {
-              directories.push(dirName)
+        if (!href || !linkText) continue
+
+        // Skip parent directory references
+        if (linkText === ".." || href === "../" || linkText === "[To Parent Directory]") {
+          continue
+        }
+
+        // Convert full path to relative path
+        let relativePath = href
+        if (href.startsWith("/photoapp/")) {
+          const basePath = new URL(baseUrl).pathname
+          if (href.startsWith(basePath)) {
+            relativePath = href.substring(basePath.length)
+            if (relativePath.startsWith("/")) {
+              relativePath = relativePath.substring(1)
             }
+          }
+        }
+
+        const dirName = relativePath.endsWith("/") ? relativePath : relativePath + "/"
+
+        if (!directories.includes(dirName)) {
+          const dirUrl = new URL(dirName, url).toString()
+          if (isWithinBasePath(baseUrl, dirUrl)) {
+            directories.push(dirName)
+            foundLinks = true
           }
         }
       }
@@ -296,8 +325,32 @@ export async function scanFolderCompletely(
       }
     }
 
-    // Recursively scan all subdirectories
-    for (const dir of directories) {
+    // If we found XML files, we're likely in a 'processed' directory, so don't go deeper
+    if (files.length > 0) {
+      onProgress?.(`Found ${files.length} XML files in ${folderUrl}, stopping deeper scan`)
+      return allXmlFiles
+    }
+
+    // Recursively scan all subdirectories with priority
+    const processedDirs = directories.filter((dir) => dir.toLowerCase().includes("processed"))
+    const yearDirs = directories.filter((dir) => /^20[1-3][0-9]\/$/.test(dir))
+    const monthDirs = directories.filter((dir) => /^(0[1-9]|1[0-2])\/$/.test(dir))
+    const cityDirs = directories.filter(
+      (dir) =>
+        /^[A-Z][a-zA-Z]+\/$/.test(dir) &&
+        !dir.toLowerCase().includes("processed") &&
+        !dir.toLowerCase().includes("media") &&
+        !dir.toLowerCase().includes("select"),
+    )
+    const otherDirs = directories.filter(
+      (dir) =>
+        !processedDirs.includes(dir) && !yearDirs.includes(dir) && !monthDirs.includes(dir) && !cityDirs.includes(dir),
+    )
+
+    // Scan in priority order
+    const prioritizedDirs = [...processedDirs, ...yearDirs, ...monthDirs, ...cityDirs, ...otherDirs]
+
+    for (const dir of prioritizedDirs) {
       try {
         const subDirUrl = new URL(dir, folderUrl).toString()
 
@@ -314,6 +367,12 @@ export async function scanFolderCompletely(
 
         if (subDirFiles.length > 0) {
           onProgress?.(`Found ${subDirFiles.length} XML files in subdirectory: ${dir}`)
+        }
+
+        // If we're at the root level and found a good number of files, limit to prevent timeout
+        if (currentDepth === 0 && allXmlFiles.length > 5000) {
+          onProgress?.(`Found ${allXmlFiles.length} files, limiting scan to prevent timeout`)
+          break
         }
       } catch (error) {
         onProgress?.(`Error scanning subdirectory ${dir}: ${error instanceof Error ? error.message : "Unknown error"}`)
@@ -355,13 +414,19 @@ export async function scanTopLevelFolders(
         const topLevelFolderUrl = new URL(dir, baseUrl).toString()
         onProgress?.(`Scanning top-level folder: ${dir}`)
 
-        const folderFiles = await scanFolderCompletely(topLevelFolderUrl, baseUrl, 10, 0, onProgress)
+        const folderFiles = await scanFolderCompletely(topLevelFolderUrl, baseUrl, 5, 0, onProgress)
 
         if (folderFiles.length > 0) {
           allXmlFiles.push(...folderFiles)
           onProgress?.(`Found ${folderFiles.length} XML files in folder: ${dir}`)
         } else {
           onProgress?.(`No XML files found in folder: ${dir}, moving to next folder`)
+        }
+
+        // Limit to prevent timeout
+        if (allXmlFiles.length > 10000) {
+          onProgress?.(`Found ${allXmlFiles.length} files, stopping scan to prevent timeout`)
+          break
         }
       } catch (error) {
         onProgress?.(
@@ -384,7 +449,7 @@ export async function scanTopLevelFolders(
 export async function scanRemoteDirectory(
   baseUrl: string,
   onProgress?: (message: string) => void,
-  maxDepth = 4,
+  maxDepth = 5,
 ): Promise<RemoteFile[]> {
   const xmlFiles: RemoteFile[] = []
   const visitedUrls = new Set<string>()
@@ -416,13 +481,13 @@ export async function scanRemoteDirectory(
       // If we found XML files, we're likely in a 'processed' directory
       if (files.length > 0) {
         if (onProgress) {
-          onProgress(`Found ${files.length} XML files in ${url}`)
+          onProgress(`Found ${files.length} XML files in ${url}, stopping deeper scan`)
         }
         return // Don't scan deeper if we found XML files
       }
 
-      // Scan subdirectories with priority
-      if (depth < maxDepth) {
+      // Scan subdirectories with priority if we haven't reached max depth
+      if (depth < maxDepth && directories.length > 0) {
         // Prioritize 'processed' directories
         const processedDirs = directories.filter((dir) => dir.toLowerCase().includes("processed"))
 
@@ -432,27 +497,59 @@ export async function scanRemoteDirectory(
         // Then month directories (01-12)
         const monthDirs = directories.filter((dir) => /^(0[1-9]|1[0-2])\/$/.test(dir))
 
-        // Then city directories (capitalized names)
+        // Then city directories (capitalized names, excluding system directories)
         const cityDirs = directories.filter(
           (dir) =>
             /^[A-Z][a-zA-Z]+\/$/.test(dir) &&
             !dir.toLowerCase().includes("processed") &&
-            !dir.toLowerCase().includes("media"),
+            !dir.toLowerCase().includes("media") &&
+            !dir.toLowerCase().includes("select") &&
+            !dir.toLowerCase().includes("default"),
+        )
+
+        // Other directories
+        const otherDirs = directories.filter(
+          (dir) =>
+            !processedDirs.includes(dir) &&
+            !yearDirs.includes(dir) &&
+            !monthDirs.includes(dir) &&
+            !cityDirs.includes(dir),
         )
 
         // Scan in priority order
-        const prioritizedDirs = [...processedDirs, ...yearDirs, ...monthDirs, ...cityDirs]
+        const prioritizedDirs = [...processedDirs, ...yearDirs, ...monthDirs, ...cityDirs, ...otherDirs]
+
+        if (onProgress) {
+          onProgress(
+            `Found ${directories.length} directories to scan: ${prioritizedDirs.slice(0, 5).join(", ")}${prioritizedDirs.length > 5 ? "..." : ""}`,
+          )
+        }
 
         for (const dir of prioritizedDirs) {
           const subUrl = new URL(dir, url).toString()
           await scanDirectory(subUrl, depth + 1)
 
-          // If we've found a good number of files, we can stop scanning more cities
-          if (xmlFiles.length > 1000 && depth === 0) {
+          // If we're at the root level and found a good number of files, we can stop scanning more cities
+          if (depth === 0 && xmlFiles.length > 5000) {
             if (onProgress) {
               onProgress(`Found ${xmlFiles.length} files, limiting scan to prevent timeout`)
             }
             break
+          }
+
+          // Limit cities scanned at root level to prevent timeout
+          if (depth === 0 && cityDirs.includes(dir)) {
+            const scannedCities = prioritizedDirs
+              .slice(0, prioritizedDirs.indexOf(dir) + 1)
+              .filter((d) => cityDirs.includes(d))
+            if (scannedCities.length >= 5 && xmlFiles.length > 1000) {
+              if (onProgress) {
+                onProgress(
+                  `Scanned ${scannedCities.length} cities, found ${xmlFiles.length} files, stopping to prevent timeout`,
+                )
+              }
+              break
+            }
           }
         }
       }
