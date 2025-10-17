@@ -14,7 +14,9 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Toaster } from "sonner"
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
+import { Toaster, toast } from "sonner"
+import type { ConfigTemplate } from "@/lib/template-manager"
 
 interface Message {
   type: string
@@ -180,6 +182,13 @@ export default function Home() {
 
   // Tab management
   const [activeTab, setActiveTab] = useState("basic")
+
+  // Template management
+  const [templates, setTemplates] = useState<ConfigTemplate[]>([])
+  const [showSaveTemplateDialog, setShowSaveTemplateDialog] = useState(false)
+  const [templateName, setTemplateName] = useState("")
+  const [templateDescription, setTemplateDescription] = useState("")
+  const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null)
 
   const logsEndRef = useRef<HTMLDivElement>(null)
   const errorLogsEndRef = useRef<HTMLDivElement>(null)
@@ -555,6 +564,150 @@ export default function Home() {
     }))
   }
 
+  // Template management functions
+  const loadTemplates = async () => {
+    try {
+      const response = await fetch("/api/templates")
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success && Array.isArray(data.templates)) {
+          setTemplates(data.templates)
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load templates:", error)
+      toast.error("Failed to load templates")
+    }
+  }
+
+  const saveAsTemplate = async () => {
+    if (!templateName.trim()) {
+      toast.error("Please enter a template name")
+      return
+    }
+
+    const templateConfig = {
+      rootDir,
+      outputFile,
+      outputFolder,
+      numWorkers,
+      verbose,
+      processingMode,
+      chunkSize,
+      pauseBetweenChunks,
+      pauseDuration,
+      filterEnabled,
+      filterConfig,
+      watchMode,
+      watchInterval,
+      watchDirectory,
+      watchOutputFile,
+      watchOutputFolder,
+    }
+
+    try {
+      const response = await fetch("/api/templates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: templateName,
+          description: templateDescription,
+          config: templateConfig,
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success) {
+          toast.success("Template saved successfully!")
+          setShowSaveTemplateDialog(false)
+          setTemplateName("")
+          setTemplateDescription("")
+          await loadTemplates()
+        }
+      } else {
+        toast.error("Failed to save template")
+      }
+    } catch (error) {
+      console.error("Error saving template:", error)
+      toast.error("Error saving template")
+    }
+  }
+
+  const applyTemplate = async (templateId: string) => {
+    try {
+      const response = await fetch(`/api/templates/${templateId}`)
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success && data.template) {
+          const config = data.template.config
+
+          // Apply all configuration
+          setRootDir(config.rootDir || "")
+          setOutputFile(config.outputFile || "image_metadata.csv")
+          setOutputFolder(config.outputFolder || "")
+          setNumWorkers(config.numWorkers || 4)
+          setVerbose(config.verbose || false)
+          setProcessingMode(config.processingMode || "stream")
+          
+          // Chunked settings
+          if (config.chunkSize) setChunkSize(config.chunkSize)
+          if (config.pauseBetweenChunks !== undefined) setPauseBetweenChunks(config.pauseBetweenChunks)
+          if (config.pauseDuration) setPauseDuration(config.pauseDuration)
+
+          // Filter settings
+          setFilterEnabled(config.filterEnabled || false)
+          if (config.filterConfig) {
+            setFilterConfig(config.filterConfig)
+          }
+
+          // Watch mode settings
+          if (config.watchMode !== undefined) setWatchMode(config.watchMode)
+          if (config.watchInterval) setWatchInterval(config.watchInterval)
+          if (config.watchDirectory) setWatchDirectory(config.watchDirectory)
+          if (config.watchOutputFile) setWatchOutputFile(config.watchOutputFile)
+          if (config.watchOutputFolder) setWatchOutputFolder(config.watchOutputFolder)
+
+          setSelectedTemplate(templateId)
+          toast.success(`Template "${data.template.name}" applied successfully!`)
+        }
+      }
+    } catch (error) {
+      console.error("Error applying template:", error)
+      toast.error("Error applying template")
+    }
+  }
+
+  const deleteTemplate = async (templateId: string) => {
+    if (!confirm("Are you sure you want to delete this template?")) {
+      return
+    }
+
+    try {
+      const response = await fetch(`/api/templates/${templateId}`, {
+        method: "DELETE",
+      })
+
+      if (response.ok) {
+        toast.success("Template deleted successfully!")
+        await loadTemplates()
+        if (selectedTemplate === templateId) {
+          setSelectedTemplate(null)
+        }
+      } else {
+        toast.error("Failed to delete template")
+      }
+    } catch (error) {
+      console.error("Error deleting template:", error)
+      toast.error("Error deleting template")
+    }
+  }
+
+  // Load templates on mount
+  useEffect(() => {
+    loadTemplates()
+  }, [])
+
   const selectAllCommonTypes = () => {
     setFilterConfig((prev) => ({
       ...prev,
@@ -567,6 +720,18 @@ export default function Home() {
       ...prev,
       fileTypes: [],
     }))
+  }
+
+  const clearMetadataFilters = () => {
+    setFilterConfig((prev) => ({
+      ...prev,
+      creditLine: undefined,
+      copyright: undefined,
+      usageType: undefined,
+      rightsHolder: undefined,
+      location: undefined,
+    }))
+    toast.success("Metadata filters cleared")
   }
 
   // Update the startProcessing function to reset settings when starting new
@@ -1248,6 +1413,108 @@ export default function Home() {
                   </div>
                 </CardContent>
               </Card>
+
+              {/* Template Management Section */}
+              <Card>
+                <CardHeader>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <CardTitle>Configuration Templates</CardTitle>
+                      <CardDescription>Save and reuse your configurations</CardDescription>
+                    </div>
+                    <Button onClick={() => setShowSaveTemplateDialog(true)} variant="outline" size="sm">
+                      💾 Save Current as Template
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  {templates.length === 0 ? (
+                    <div className="text-center py-8 text-muted-foreground">
+                      <p>No templates saved yet.</p>
+                      <p className="text-sm mt-2">Click "Save Current as Template" to create your first template.</p>
+                    </div>
+                  ) : (
+                    <ScrollArea className="h-[300px]">
+                      <div className="space-y-3">
+                        {templates.map((template) => (
+                          <Card
+                            key={template.id}
+                            className={`cursor-pointer transition-all ${
+                              selectedTemplate === template.id
+                                ? "border-blue-500 bg-blue-50"
+                                : "hover:border-gray-400"
+                            }`}
+                          >
+                            <CardContent className="p-4">
+                              <div className="flex items-start justify-between">
+                                <div className="flex-1" onClick={() => applyTemplate(template.id)}>
+                                  <div className="flex items-center space-x-2 mb-2">
+                                    <h3 className="font-semibold text-lg">{template.name}</h3>
+                                    {selectedTemplate === template.id && (
+                                      <Badge variant="default" className="text-xs">
+                                        Active
+                                      </Badge>
+                                    )}
+                                  </div>
+                                  {template.description && (
+                                    <p className="text-sm text-muted-foreground mb-2">{template.description}</p>
+                                  )}
+                                  <div className="flex flex-wrap gap-2 text-xs">
+                                    <Badge variant="secondary">
+                                      📁 {template.config.rootDir || "No root dir"}
+                                    </Badge>
+                                    <Badge variant="secondary">
+                                      📄 {template.config.outputFile || "output.csv"}
+                                    </Badge>
+                                    <Badge variant="secondary">
+                                      ⚙️ {template.config.processingMode || "stream"}
+                                    </Badge>
+                                    <Badge variant="secondary">
+                                      👷 {template.config.numWorkers || 4} workers
+                                    </Badge>
+                                    {template.config.filterEnabled && (
+                                      <Badge variant="secondary" className="bg-orange-100 text-orange-700">
+                                        🔍 Filters ON
+                                      </Badge>
+                                    )}
+                                  </div>
+                                  <div className="text-xs text-muted-foreground mt-2">
+                                    Created: {new Date(template.createdAt).toLocaleDateString()}
+                                  </div>
+                                </div>
+                                <div className="flex space-x-2 ml-4">
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      applyTemplate(template.id)
+                                    }}
+                                    className="h-8 w-8 p-0"
+                                  >
+                                    ▶️
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      deleteTemplate(template.id)
+                                    }}
+                                    className="h-8 w-8 p-0 text-red-600 hover:text-red-700 hover:bg-red-50"
+                                  >
+                                    🗑️
+                                  </Button>
+                                </div>
+                              </div>
+                            </CardContent>
+                          </Card>
+                        ))}
+                      </div>
+                    </ScrollArea>
+                  )}
+                </CardContent>
+              </Card>
             </TabsContent>
 
             {/* Filters Configuration */}
@@ -1430,7 +1697,12 @@ export default function Home() {
                       </div>
 
                       <div className="space-y-4">
-                        <Label className="text-base font-semibold">Metadata Filters</Label>
+                        <div className="flex items-center justify-between">
+                          <Label className="text-base font-semibold">Metadata Filters</Label>
+                          <Button size="sm" variant="outline" onClick={clearMetadataFilters}>
+                            Clear All Metadata
+                          </Button>
+                        </div>
 
                         {/* Credit Line Filter */}
                         <div className="space-y-2">
@@ -2498,6 +2770,60 @@ export default function Home() {
           </Card>
         </div>
       )}
+
+      {/* Save Template Dialog */}
+      <Dialog open={showSaveTemplateDialog} onOpenChange={setShowSaveTemplateDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Save Configuration as Template</DialogTitle>
+            <DialogDescription>
+              Save your current configuration settings to reuse later. All settings including filters, chunked mode, and watch settings will be saved.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label htmlFor="templateName">Template Name *</Label>
+              <Input
+                id="templateName"
+                value={templateName}
+                onChange={(e) => setTemplateName(e.target.value)}
+                placeholder="e.g., Production Config, Test Setup, etc."
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="templateDescription">Description (optional)</Label>
+              <Input
+                id="templateDescription"
+                value={templateDescription}
+                onChange={(e) => setTemplateDescription(e.target.value)}
+                placeholder="Brief description of this template"
+              />
+            </div>
+            <div className="text-sm text-muted-foreground space-y-1">
+              <p className="font-medium">This template will save:</p>
+              <ul className="list-disc list-inside space-y-1 ml-2">
+                <li>Root directory and output settings</li>
+                <li>Processing mode and worker configuration</li>
+                <li>All filter settings (file types, dimensions, metadata)</li>
+                <li>Chunked processing settings</li>
+                <li>Watch mode configuration</li>
+              </ul>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => {
+              setShowSaveTemplateDialog(false)
+              setTemplateName("")
+              setTemplateDescription("")
+            }}>
+              Cancel
+            </Button>
+            <Button onClick={saveAsTemplate}>
+              Save Template
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

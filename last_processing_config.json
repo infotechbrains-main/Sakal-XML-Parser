@@ -1,0 +1,34 @@
+{
+  "rootDir": "/Users/amangupta/Desktop/ITB/Datasets/Sample_images",
+  "outputFile": "image_metadata.csv",
+  "outputFolder": "/Users/amangupta/Desktop/ITB/Datasets/result",
+  "processingMode": "stream",
+  "numWorkers": 4,
+  "verbose": true,
+  "filterConfig": {
+    "enabled": true,
+    "fileTypes": [
+      "jpg",
+      "jpeg",
+      "png",
+      "tiff",
+      "bmp"
+    ],
+    "customExtensions": "",
+    "allowedFileTypes": [
+      "jpg",
+      "jpeg",
+      "png",
+      "tiff",
+      "bmp"
+    ],
+    "moveImages": true,
+    "moveFolderStructureOption": "replicate",
+    "minWidth": 500,
+    "minHeight": 500,
+    "moveDestinationPath": "/Users/amangupta/Desktop/ITB/Datasets/filtered_image"
+  },
+  "chunkSize": 100,
+  "pauseBetweenChunks": false,
+  "pauseDuration": 5
+}
