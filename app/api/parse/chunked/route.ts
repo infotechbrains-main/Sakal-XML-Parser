@@ -35,12 +35,12 @@ interface ChunkedProcessingState {
   outputPath: string
   startTime: string
   pauseTime?: string
+  processedChunks: string[][]
 }
 
 const CHUNKED_STATE_FILE = path.join(process.cwd(), "chunked_processing_state.json")
 const history = new PersistentHistory()
 
-// Save processing state to file
 async function saveProcessingState(state: ChunkedProcessingState): Promise<void> {
   try {
     await fs.writeFile(CHUNKED_STATE_FILE, JSON.stringify(state, null, 2), "utf8")
@@ -50,7 +50,6 @@ async function saveProcessingState(state: ChunkedProcessingState): Promise<void>
   }
 }
 
-// Load processing state from file
 async function loadProcessingState(): Promise<ChunkedProcessingState | null> {
   try {
     const data = await fs.readFile(CHUNKED_STATE_FILE, "utf8")
@@ -63,7 +62,6 @@ async function loadProcessingState(): Promise<ChunkedProcessingState | null> {
   }
 }
 
-// Clear processing state file
 async function clearProcessingState(): Promise<void> {
   try {
     await fs.unlink(CHUNKED_STATE_FILE)
@@ -121,10 +119,7 @@ export async function POST(request: NextRequest) {
           filterConfig = null,
         } = body
 
-        // Reset pause state at the start of processing
         resetPauseState()
-
-        // Create session ID
         sessionId = `chunked_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
         sendMessage("start", "Starting chunked processing...")
@@ -142,23 +137,47 @@ export async function POST(request: NextRequest) {
           console.log(`  - Filters Enabled: ${filterConfig?.enabled || false}`)
         }
 
-        // Check if this is a remote path and handle accordingly
+        // Check if this is a remote path
         const isRemote = await isRemotePath(rootDir)
         let xmlFiles: string[] = []
 
         if (isRemote) {
-          sendMessage("log", "Detected remote URL - scanning remote directory...")
+          sendMessage("log", "Scanning remote directory for XML files...")
+          sendMessage("log", "This may take a few minutes for large directories...")
 
           try {
-            const remoteFiles = await scanRemoteDirectory(rootDir, (message) => {
-              sendMessage("log", message)
-            })
+            // Enhanced scanning with better progress reporting
+            const remoteFiles = await scanRemoteDirectory(
+              rootDir,
+              (message) => {
+                sendMessage("log", message)
+                console.log(`[Remote Scanner] ${message}`)
+              },
+              5, // Increased max depth to 5 for city/year/month/processed structure
+            )
 
-            // Convert remote files to file paths for processing
             xmlFiles = remoteFiles.map((file) => file.url)
 
             if (verbose) {
               console.log(`[Chunked API] Found ${xmlFiles.length} remote XML files`)
+            }
+
+            sendMessage("log", `Found ${xmlFiles.length} XML files in remote directory`)
+
+            if (xmlFiles.length === 0) {
+              sendMessage("log", "No XML files found. This could be due to:")
+              sendMessage("log", "1. Server directory listing format not recognized")
+              sendMessage("log", "2. XML files are in deeper nested directories")
+              sendMessage("log", "3. Access permissions or server configuration")
+              sendMessage("error", "No XML files found in the specified remote directory")
+              safeCloseController()
+              return
+            }
+
+            // Limit to first 10000 files to prevent memory issues
+            if (xmlFiles.length > 10000) {
+              sendMessage("log", `Limiting processing to first 10,000 files (found ${xmlFiles.length} total)`)
+              xmlFiles = xmlFiles.slice(0, 10000)
             }
           } catch (error) {
             const errorMsg = `Failed to scan remote directory: ${error instanceof Error ? error.message : "Unknown error"}`
@@ -169,6 +188,7 @@ export async function POST(request: NextRequest) {
           }
         } else {
           // Local file processing
+          sendMessage("log", "Scanning local directory for XML files...")
           xmlFiles = await findXMLFiles(rootDir)
         }
 
@@ -190,7 +210,16 @@ export async function POST(request: NextRequest) {
         }
 
         // Determine output path
-        const outputPath = outputFolder ? path.join(outputFolder, outputFile) : path.join(process.cwd(), outputFile)
+        let outputPath: string
+        if (outputFolder) {
+          if (path.isAbsolute(outputFolder)) {
+            outputPath = path.join(outputFolder, outputFile)
+          } else {
+            outputPath = path.resolve(process.cwd(), outputFolder, outputFile)
+          }
+        } else {
+          outputPath = path.join(process.cwd(), outputFile)
+        }
 
         // Create processing state
         processingState = {
@@ -212,12 +241,12 @@ export async function POST(request: NextRequest) {
           xmlFiles,
           outputPath,
           startTime: new Date().toISOString(),
+          processedChunks: [],
         }
 
-        // Save initial processing state
         await saveProcessingState(processingState)
 
-        // Create initial session record
+        // Create session
         const session = {
           id: sessionId,
           startTime: new Date().toISOString(),
@@ -241,7 +270,6 @@ export async function POST(request: NextRequest) {
           },
         }
 
-        // Save initial session
         await history.addSession(session)
         await history.setCurrentSession(session)
 
@@ -253,11 +281,10 @@ export async function POST(request: NextRequest) {
         sendMessage("log", `Processing ${xmlFiles.length} files in ${totalChunks} chunks of ${chunkSize}`)
 
         // Ensure output directory exists
-        if (outputFolder) {
-          await fs.mkdir(outputFolder, { recursive: true })
-          if (verbose) {
-            console.log(`[Chunked API] Created output directory: ${outputFolder}`)
-          }
+        const outputDir = path.dirname(outputPath)
+        await fs.mkdir(outputDir, { recursive: true })
+        if (verbose) {
+          console.log(`[Chunked API] Created output directory: ${outputDir}`)
         }
 
         // Initialize CSV file with headers
@@ -312,7 +339,6 @@ export async function POST(request: NextRequest) {
         let wasInterrupted = false
 
         for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-          // Update current chunk in processing state
           processingState.currentChunk = chunkIndex + 1
           await saveProcessingState(processingState)
 
@@ -344,7 +370,6 @@ export async function POST(request: NextRequest) {
             processingState.pauseTime = new Date().toISOString()
             await saveProcessingState(processingState)
 
-            // Update session status to paused
             await history.updateSession(sessionId, {
               status: "paused",
               progress: {
@@ -369,7 +394,7 @@ export async function POST(request: NextRequest) {
           const endIndex = Math.min(startIndex + chunkSize, xmlFiles.length)
           const chunk = xmlFiles.slice(startIndex, endIndex)
 
-          sendMessage("chunk", `Starting chunk ${chunkIndex + 1}/${totalChunks}`)
+          sendMessage("chunk", `Starting chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} files)`)
 
           if (verbose) {
             console.log(`[Chunked API] Processing chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} files)`)
@@ -404,43 +429,11 @@ export async function POST(request: NextRequest) {
               activeWorkers.clear()
 
               // Process results we got before interruption
-              for (const result of chunkResults) {
-                if (result) {
-                  stats.processedFiles++
+              await processChunkResults(chunkResults, outputPath, stats, verbose)
 
-                  if (result.record) {
-                    stats.successfulFiles++
-                    stats.recordsWritten++
-
-                    // Append to CSV file
-                    const csvLine =
-                      Object.values(result.record)
-                        .map((value) =>
-                          typeof value === "string" &&
-                          (value.includes(",") || value.includes('"') || value.includes("\n"))
-                            ? `"${String(value).replace(/"/g, '""')}"`
-                            : value || "",
-                        )
-                        .join(",") + "\n"
-
-                    await fs.appendFile(outputPath, csvLine, "utf8")
-                  } else {
-                    stats.errorFiles++
-                  }
-
-                  if (!result.passedFilter) {
-                    stats.filteredFiles++
-                  }
-
-                  if (result.imageMoved) {
-                    stats.movedFiles++
-                  }
-                }
-              }
-
-              // Update processing state with current progress
               processingState.stats = stats
               processingState.pauseTime = new Date().toISOString()
+              processingState.processedChunks.push(chunk)
               await saveProcessingState(processingState)
 
               if (midProcessPauseState.shouldStop) {
@@ -467,42 +460,10 @@ export async function POST(request: NextRequest) {
             }
 
             // Process results normally
-            for (const result of chunkResults) {
-              stats.processedFiles++
+            await processChunkResults(chunkResults, outputPath, stats, verbose)
 
-              if (result.record) {
-                stats.successfulFiles++
-                stats.recordsWritten++
-
-                // Append to CSV file
-                const csvLine =
-                  Object.values(result.record)
-                    .map((value) =>
-                      typeof value === "string" && (value.includes(",") || value.includes('"') || value.includes("\n"))
-                        ? `"${String(value).replace(/"/g, '""')}"`
-                        : value || "",
-                    )
-                    .join(",") + "\n"
-
-                await fs.appendFile(outputPath, csvLine, "utf8")
-              } else {
-                stats.errorFiles++
-                if (verbose && result.error) {
-                  console.log(`[Chunked API] Error processing file: ${result.error}`)
-                }
-              }
-
-              if (!result.passedFilter) {
-                stats.filteredFiles++
-              }
-
-              if (result.imageMoved) {
-                stats.movedFiles++
-              }
-            }
-
-            // Update processing state with current progress
             processingState.stats = stats
+            processingState.processedChunks.push(chunk)
             await saveProcessingState(processingState)
 
             // Update session progress
@@ -551,15 +512,15 @@ export async function POST(request: NextRequest) {
               )
             }
 
-            // Pause between chunks (except for the last chunk)
+            // Pause between chunks (except for the last chunk) - FIXED PAUSE CHECKING
             if (chunkIndex < totalChunks - 1 && pauseDuration > 0) {
               if (verbose) {
                 console.log(`[Chunked API] Pausing for ${pauseDuration}ms between chunks`)
               }
 
-              // Check for pause/stop during the pause period
               const pauseStartTime = Date.now()
               while (Date.now() - pauseStartTime < pauseDuration) {
+                // Check pause state more frequently during pause
                 const pauseCheckState = getPauseState()
                 if (pauseCheckState.shouldStop || pauseCheckState.isPaused) {
                   if (verbose) {
@@ -576,14 +537,14 @@ export async function POST(request: NextRequest) {
                       stats,
                       outputFile: outputPath,
                       canResume: true,
-                      currentChunk: chunkIndex + 2, // Next chunk to process
+                      currentChunk: chunkIndex + 2,
                       totalChunks,
                     })
                   } else {
                     sendMessage("paused", {
                       message: "Processing paused during chunk pause - state saved",
                       canResume: true,
-                      currentChunk: chunkIndex + 2, // Next chunk to process
+                      currentChunk: chunkIndex + 2,
                       totalChunks,
                     })
                   }
@@ -591,7 +552,8 @@ export async function POST(request: NextRequest) {
                   safeCloseController()
                   return
                 }
-                await new Promise((resolve) => setTimeout(resolve, 200)) // Check every 200ms
+                // Check every 100ms instead of 200ms for more responsive pause
+                await new Promise((resolve) => setTimeout(resolve, 100))
               }
             }
           } catch (error) {
@@ -603,7 +565,6 @@ export async function POST(request: NextRequest) {
             stats.errorFiles += chunk.length
             stats.processedFiles += chunk.length
 
-            // Update processing state even on error
             processingState.stats = stats
             await saveProcessingState(processingState)
           }
@@ -630,7 +591,6 @@ export async function POST(request: NextRequest) {
           },
         })
 
-        // Clear current session
         await history.setCurrentSession(null)
 
         // Send completion message
@@ -654,7 +614,6 @@ export async function POST(request: NextRequest) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
         console.error("[Chunked API] Fatal error:", errorMessage)
 
-        // Update session with error status
         if (sessionId) {
           await history.updateSession(sessionId, {
             status: "failed",
@@ -663,7 +622,6 @@ export async function POST(request: NextRequest) {
           await history.setCurrentSession(null)
         }
 
-        // Clear processing state on error
         await clearProcessingState()
 
         if (!controllerClosed) {
@@ -693,6 +651,46 @@ export async function POST(request: NextRequest) {
   })
 }
 
+async function processChunkResults(
+  chunkResults: WorkerResult[],
+  outputPath: string,
+  stats: ProcessingStats,
+  verbose: boolean,
+): Promise<void> {
+  for (const result of chunkResults) {
+    stats.processedFiles++
+
+    if (result.record) {
+      stats.successfulFiles++
+      stats.recordsWritten++
+
+      const csvLine =
+        Object.values(result.record)
+          .map((value) =>
+            typeof value === "string" && (value.includes(",") || value.includes('"') || value.includes("\n"))
+              ? `"${String(value).replace(/"/g, '""')}"`
+              : value || "",
+          )
+          .join(",") + "\n"
+
+      await fs.appendFile(outputPath, csvLine, "utf8")
+    } else {
+      stats.errorFiles++
+      if (verbose && result.error) {
+        console.log(`[Chunked API] Error processing file: ${result.error}`)
+      }
+    }
+
+    if (!result.passedFilter) {
+      stats.filteredFiles++
+    }
+
+    if (result.imageMoved) {
+      stats.movedFiles++
+    }
+  }
+}
+
 async function processFile(
   xmlFile: string,
   filterConfig: any,
@@ -703,7 +701,6 @@ async function processFile(
   isRemote = false,
 ): Promise<WorkerResult> {
   return new Promise((resolve) => {
-    // Check for pause/stop before creating worker
     const pauseState = getPauseState()
     if (pauseState.shouldStop) {
       resolve({
@@ -753,7 +750,7 @@ async function processFile(
       } catch (error) {
         console.error("Error during worker timeout:", error)
       }
-    }, 30000) // 30 second timeout
+    }, 30000)
 
     worker.on("message", (result: WorkerResult) => {
       try {
