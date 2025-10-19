@@ -5,6 +5,7 @@ import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
 import { PersistentHistory } from "@/lib/persistent-history"
 import { scanLocalDirectoryForAssets } from "@/lib/media-stats"
+import { processImagesWithoutXml } from "@/lib/no-xml-processor"
 
 export const CSV_HEADERS = [
   { id: "city", title: "City" },
@@ -41,6 +42,7 @@ export const CSV_HEADERS = [
   { id: "xmlPath", title: "XML Path" },
   { id: "imagePath", title: "Image Path" },
   { id: "imageExists", title: "Image Exists" },
+  { id: "haveXml", title: "Have XML" },
   { id: "creationDate", title: "Creation Date" },
   { id: "revisionDate", title: "Revision Date" },
   { id: "commentData", title: "Comment Data" },
@@ -172,19 +174,21 @@ export async function POST(request: NextRequest) {
       console.log(`[Regular API] Output path: ${outputPath}`)
     }
 
-  const allRecords: any[] = []
-  let processedCount = 0
-  let successCount = 0
-  let errorCount = 0
-  let filteredCount = 0
-  let movedCount = 0
-  let remoteMediaMatches = 0
-  let xmlWithMediaCount = 0
-  let xmlProcessedWithoutMediaCount = 0
+    const allRecords: any[] = []
+    let processedCount = 0
+    let successCount = 0
+    let errorCount = 0
+    let filteredCount = 0
+    let movedCount = 0
+    let remoteMediaMatches = 0
+    let xmlWithMediaCount = 0
+    let xmlProcessedWithoutMediaCount = 0
+    let noXmlStats = { considered: 0, recorded: 0, filteredOut: 0, moved: 0 }
+    let noXmlDestinationPath: string | undefined
     const errors: string[] = []
     const activeWorkers = new Set<Worker>()
-  const totalMediaFiles = mediaFiles.length
-  const matchedLocalMediaPaths = new Set<string>()
+    const totalMediaFiles = mediaFiles.length
+    const matchedLocalMediaPaths = new Set<string>()
 
     console.log(`Starting to process ${xmlFiles.length} XML files with ${numWorkers} worker(s)`)
     if (filterConfig?.enabled) {
@@ -346,6 +350,24 @@ export async function POST(request: NextRequest) {
       if (xmlFiles.length === 0) resolveAllFiles()
     })
 
+    const noXmlResult = await processImagesWithoutXml({
+      rootDir: normalizedRootDir,
+      mediaFiles,
+      matchedImagePaths: matchedLocalMediaPaths,
+      filterConfig,
+      verbose,
+      collectRecords: false,
+      onRecord: (record) => {
+        allRecords.push(record)
+      },
+    })
+
+    noXmlStats = noXmlResult.stats
+    noXmlDestinationPath = noXmlResult.destinationPath
+    if (noXmlResult.errors.length > 0) {
+      errors.push(...noXmlResult.errors)
+    }
+
     console.log(
       `Processing complete. ${successCount} successful, ${errorCount} errors, ${filteredCount} passed filter, ${movedCount} moved.`,
     )
@@ -383,6 +405,11 @@ export async function POST(request: NextRequest) {
       xmlFilesMissingMedia,
       xmlProcessedWithoutMedia: xmlProcessedWithoutMediaCount,
       mediaCountsByExtension,
+      noXmlImagesConsidered: noXmlStats.considered,
+      noXmlImagesRecorded: noXmlStats.recorded,
+      noXmlImagesFilteredOut: noXmlStats.filteredOut,
+      noXmlImagesMoved: noXmlStats.moved,
+      noXmlDestinationPath,
     }
 
     // Update final session status
@@ -401,6 +428,8 @@ export async function POST(request: NextRequest) {
           mediaFilesUnmatched,
           xmlFilesWithMedia: xmlWithMediaCount,
           xmlFilesMissingMedia,
+          noXmlImagesRecorded: noXmlStats.recorded,
+          noXmlImagesFilteredOut: noXmlStats.filteredOut,
         },
         results: {
           outputPath,
@@ -423,6 +452,8 @@ export async function POST(request: NextRequest) {
       outputFile: path.basename(outputPath),
       errors: verbose ? errors : errors.slice(0, 10),
       scanWarnings: scanErrors,
+      noXmlStats,
+      noXmlDestinationPath,
     })
   } catch (error: unknown) {
     console.error("Error in parse API:", error)

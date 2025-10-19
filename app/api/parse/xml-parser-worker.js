@@ -1083,6 +1083,7 @@ async function processXmlFileInWorker(
       xmlPath: xmlFilePath,
       imagePath: imagePath,
       imageExists: imageExists ? "Yes" : "No",
+      haveXml: "Yes",
       creationDate,
       revisionDate,
       commentData,

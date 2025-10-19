@@ -6,6 +6,7 @@ import { getPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
 import { scanLocalDirectoryForAssets } from "@/lib/media-stats"
+import { processImagesWithoutXml } from "@/lib/no-xml-processor"
 
 interface ProcessingStats {
   totalFiles: number
@@ -24,6 +25,11 @@ interface ProcessingStats {
   xmlFilesMissingMedia: number
   xmlProcessedWithoutMedia: number
   mediaCountsByExtension: Record<string, number>
+  noXmlImagesConsidered: number
+  noXmlImagesRecorded: number
+  noXmlImagesFilteredOut: number
+  noXmlImagesMoved: number
+  noXmlDestinationPath?: string
 }
 
 interface WorkerResult {
@@ -176,6 +182,10 @@ export async function POST(request: NextRequest) {
           xmlFilesMissingMedia: xmlFiles.length,
           xmlProcessedWithoutMedia: 0,
           mediaCountsByExtension,
+          noXmlImagesConsidered: 0,
+          noXmlImagesRecorded: 0,
+          noXmlImagesFilteredOut: 0,
+          noXmlImagesMoved: 0,
         }
 
         const matchedLocalMediaPaths = new Set<string>()
@@ -314,6 +324,7 @@ export async function POST(request: NextRequest) {
             "xmlPath",
             "imagePath",
             "imageExists",
+            "haveXml",
             "creationDate",
             "revisionDate",
             "commentData",
@@ -372,6 +383,8 @@ export async function POST(request: NextRequest) {
                   mediaFilesUnmatched: stats.mediaFilesUnmatched,
                   xmlFilesWithMedia: stats.xmlFilesWithMedia,
                   xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                  noXmlImagesRecorded: stats.noXmlImagesRecorded,
+                  noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
                 },
               })
             }
@@ -596,6 +609,11 @@ export async function POST(request: NextRequest) {
                 xmlFilesWithMedia: stats.xmlFilesWithMedia,
                 xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
                 xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
+                noXmlImagesConsidered: stats.noXmlImagesConsidered,
+                noXmlImagesRecorded: stats.noXmlImagesRecorded,
+                noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
+                noXmlImagesMoved: stats.noXmlImagesMoved,
+                noXmlDestinationPath: stats.noXmlDestinationPath,
               },
             })
 
@@ -662,6 +680,45 @@ export async function POST(request: NextRequest) {
         }
         activeWorkers.clear()
 
+  if (!wasInterrupted && !isRemote) {
+          const noXmlResult = await processImagesWithoutXml({
+            rootDir: path.resolve(rootDir),
+            mediaFiles,
+            matchedImagePaths: matchedLocalMediaPaths,
+            filterConfig,
+            verbose,
+            collectRecords: false,
+            onRecord: async (record) => {
+              const csvLine =
+                Object.values(record)
+                  .map((value) =>
+                    typeof value === "string" && (value.includes(",") || value.includes("\"") || value.includes("\n"))
+                      ? `"${String(value).replace(/"/g, '""')}"`
+                      : value || "",
+                  )
+                  .join(",") + "\n"
+
+              await fs.appendFile(outputPath, csvLine, "utf8")
+              stats.recordsWritten++
+            },
+            onLog: (message) => {
+              if (verbose) {
+                sendMessage("log", message)
+              }
+            },
+          })
+
+          stats.noXmlImagesConsidered = noXmlResult.stats.considered
+          stats.noXmlImagesRecorded = noXmlResult.stats.recorded
+          stats.noXmlImagesFilteredOut = noXmlResult.stats.filteredOut
+          stats.noXmlImagesMoved = noXmlResult.stats.moved
+          stats.noXmlDestinationPath = noXmlResult.destinationPath
+
+          if (noXmlResult.errors.length > 0 && verbose) {
+            noXmlResult.errors.forEach((err) => sendMessage("log", err))
+          }
+        }
+
         // Ensure derived stats are up to date before persisting
         stats.localMediaFilesMatched = matchedLocalMediaPaths.size
         stats.remoteMediaFilesMatched = remoteMediaMatches
@@ -687,6 +744,8 @@ export async function POST(request: NextRequest) {
               mediaFilesUnmatched: stats.mediaFilesUnmatched,
               xmlFilesWithMedia: stats.xmlFilesWithMedia,
               xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+              noXmlImagesRecorded: stats.noXmlImagesRecorded,
+              noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
             },
             results: {
               outputPath,
@@ -707,6 +766,11 @@ export async function POST(request: NextRequest) {
                 xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
                 xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
                 mediaCountsByExtension: stats.mediaCountsByExtension,
+                noXmlImagesConsidered: stats.noXmlImagesConsidered,
+                noXmlImagesRecorded: stats.noXmlImagesRecorded,
+                noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
+                noXmlImagesMoved: stats.noXmlImagesMoved,
+                noXmlDestinationPath: stats.noXmlDestinationPath,
               },
             },
           })

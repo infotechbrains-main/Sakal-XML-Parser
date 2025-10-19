@@ -41,6 +41,11 @@ interface ProcessingResultStats {
   xmlFilesMissingMedia?: number
   xmlProcessedWithoutMedia?: number
   mediaCountsByExtension?: Record<string, number>
+  noXmlImagesConsidered?: number
+  noXmlImagesRecorded?: number
+  noXmlImagesFilteredOut?: number
+  noXmlImagesMoved?: number
+  noXmlDestinationPath?: string
 }
 
 interface ProcessingStats {
@@ -60,6 +65,11 @@ interface ProcessingStats {
   xmlProcessedWithoutMedia: number
   currentFile?: string
   estimatedTimeRemaining?: string
+  noXmlImagesConsidered: number
+  noXmlImagesRecorded: number
+  noXmlImagesFilteredOut: number
+  noXmlImagesMoved: number
+  noXmlDestinationPath?: string
 }
 
 interface FilterConfig {
@@ -130,6 +140,8 @@ interface ProcessingSession {
     xmlFilesWithMedia?: number
     xmlFilesMissingMedia?: number
     processedFilesList?: string[]
+    noXmlImagesRecorded?: number
+    noXmlImagesFilteredOut?: number
   }
   results?: {
     outputPath: string
@@ -176,6 +188,10 @@ const DEFAULT_PROCESSING_STATS: ProcessingStats = {
   xmlFilesWithMedia: 0,
   xmlFilesMissingMedia: 0,
   xmlProcessedWithoutMedia: 0,
+  noXmlImagesConsidered: 0,
+  noXmlImagesRecorded: 0,
+  noXmlImagesFilteredOut: 0,
+  noXmlImagesMoved: 0,
 }
 
 const formatMetricValue = (value: number | string | undefined | null) => {
@@ -344,6 +360,23 @@ export default function Home() {
       { label: "XML Missing Media", value: resultStats.xmlFilesMissingMedia, accentClass: "text-yellow-600" },
       { label: "XML Without Media", value: resultStats.xmlProcessedWithoutMedia, accentClass: "text-red-600" },
     ]
+  }, [processingResults])
+
+  const processingResultNoXmlMetrics = useMemo(() => {
+    if (!processingResults) {
+      return []
+    }
+
+    const { stats: resultStats } = processingResults
+
+    const metrics = [
+      { label: "No-XML Considered", value: resultStats.noXmlImagesConsidered },
+      { label: "No-XML Recorded", value: resultStats.noXmlImagesRecorded, accentClass: "text-green-600" },
+      { label: "No-XML Filtered", value: resultStats.noXmlImagesFilteredOut, accentClass: "text-yellow-600" },
+      { label: "No-XML Moved", value: resultStats.noXmlImagesMoved },
+    ]
+
+    return metrics
   }, [processingResults])
 
   const mediaExtensionEntries = useMemo(() => {
@@ -656,6 +689,7 @@ export default function Home() {
           const statsPayload = data.message.stats ?? {}
 
           return {
+            ...prev,
             totalFiles: statsPayload.totalFiles ?? data.message.total ?? prev.totalFiles,
             processedFiles: statsPayload.processedFiles ?? data.message.processed ?? prev.processedFiles,
             successCount: statsPayload.successCount ?? data.message.successful ?? prev.successCount,
@@ -700,6 +734,26 @@ export default function Home() {
               data.message.estimatedTimeRemaining ??
               statsPayload.estimatedTimeRemaining ??
               prev.estimatedTimeRemaining,
+            noXmlImagesConsidered:
+              statsPayload.noXmlImagesConsidered ??
+              data.message.noXmlImagesConsidered ??
+              prev.noXmlImagesConsidered,
+            noXmlImagesRecorded:
+              statsPayload.noXmlImagesRecorded ??
+              data.message.noXmlImagesRecorded ??
+              prev.noXmlImagesRecorded,
+            noXmlImagesFilteredOut:
+              statsPayload.noXmlImagesFilteredOut ??
+              data.message.noXmlImagesFilteredOut ??
+              prev.noXmlImagesFilteredOut,
+            noXmlImagesMoved:
+              statsPayload.noXmlImagesMoved ??
+              data.message.noXmlImagesMoved ??
+              prev.noXmlImagesMoved,
+            noXmlDestinationPath:
+              statsPayload.noXmlDestinationPath ??
+              data.message.noXmlDestinationPath ??
+              prev.noXmlDestinationPath,
           }
         })
         if (data.message.currentChunk) {
@@ -2528,6 +2582,11 @@ export default function Home() {
                           const xmlWithoutMedia = summaryStats?.xmlProcessedWithoutMedia
                           const filteredFiles = summaryStats?.filteredFiles
                           const movedFiles = summaryStats?.movedFiles
+                          const noXmlConsidered = summaryStats?.noXmlImagesConsidered
+                          const noXmlRecorded = summaryStats?.noXmlImagesRecorded
+                          const noXmlFiltered = summaryStats?.noXmlImagesFilteredOut
+                          const noXmlMoved = summaryStats?.noXmlImagesMoved
+                          const noXmlDestination = summaryStats?.noXmlDestinationPath
                           const mediaMatchRate =
                             mediaTotal !== undefined && mediaTotal !== null && mediaTotal > 0 && mediaMatched !== undefined
                               ? `${((Number(mediaMatched) / Number(mediaTotal)) * 100).toFixed(1)}%`
@@ -2646,6 +2705,44 @@ export default function Home() {
                                           <div className="text-red-600">{formatMetricValue(xmlWithoutMedia)}</div>
                                         </div>
                                       )}
+                                    </div>
+                                  )}
+
+                                  {(noXmlConsidered !== undefined ||
+                                    noXmlRecorded !== undefined ||
+                                    noXmlFiltered !== undefined ||
+                                    noXmlMoved !== undefined) && (
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+                                      {noXmlConsidered !== undefined && (
+                                        <div>
+                                          <div className="font-medium">No-XML Considered</div>
+                                          <div>{formatMetricValue(noXmlConsidered)}</div>
+                                        </div>
+                                      )}
+                                      {noXmlRecorded !== undefined && (
+                                        <div>
+                                          <div className="font-medium">No-XML Recorded</div>
+                                          <div className="text-green-600">{formatMetricValue(noXmlRecorded)}</div>
+                                        </div>
+                                      )}
+                                      {noXmlFiltered !== undefined && (
+                                        <div>
+                                          <div className="font-medium">No-XML Filtered</div>
+                                          <div className="text-yellow-600">{formatMetricValue(noXmlFiltered)}</div>
+                                        </div>
+                                      )}
+                                      {noXmlMoved !== undefined && (
+                                        <div>
+                                          <div className="font-medium">No-XML Moved</div>
+                                          <div>{formatMetricValue(noXmlMoved)}</div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {noXmlDestination && (
+                                    <div className="text-xs text-muted-foreground break-all">
+                                      <span className="font-medium text-foreground">No-XML Destination:</span> {noXmlDestination}
                                     </div>
                                   )}
                                 </div>
@@ -2777,6 +2874,23 @@ export default function Home() {
                             ))}
                           </div>
                         </div>
+                        {processingResultNoXmlMetrics.length > 0 && (
+                          <div className="space-y-2">
+                            <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                              No-XML Pipeline
+                            </Label>
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                              {processingResultNoXmlMetrics.map((metric) => (
+                                <div key={metric.label} className="text-center">
+                                  <div className={`text-2xl font-bold ${metric.accentClass ?? ""}`.trim()}>
+                                    {formatMetricValue(metric.value)}
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">{metric.label}</div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
@@ -2789,6 +2903,19 @@ export default function Home() {
                           <div className="font-medium text-foreground">{formatTimestamp(resultEndTime)}</div>
                         </div>
                       </div>
+
+                      {processingResults.stats.noXmlDestinationPath && (
+                        <div className="grid grid-cols-1 gap-2 text-sm">
+                          <div>
+                            <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                              No-XML Destination
+                            </Label>
+                            <div className="font-medium text-foreground break-all">
+                              {processingResults.stats.noXmlDestinationPath}
+                            </div>
+                          </div>
+                        </div>
+                      )}
 
                       {mediaExtensionEntries.length > 0 && (
                         <div className="space-y-2">
@@ -2863,6 +2990,64 @@ export default function Home() {
 
         {/* Quick Stats Sidebar */}
         <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg">Controls</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {!isRunning && !canResume && (
+                <>
+                  <Button onClick={startProcessing} disabled={!rootDir} className="w-full">
+                    Start Processing
+                  </Button>
+                  <div className="flex space-x-2">
+                    <Button onClick={loadSavedConfig} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Load Saved
+                    </Button>
+                    <Button onClick={resetToDefaults} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Reset All
+                    </Button>
+                  </div>
+                </>
+              )}
+
+              {canResume && !isRunning && (
+                <>
+                  <Button onClick={resumeProcessing} className="w-full">
+                    Resume Processing
+                  </Button>
+                  <Button
+                    onClick={startProcessing}
+                    disabled={!rootDir}
+                    variant="outline"
+                    className="w-full bg-transparent"
+                  >
+                    Start New Processing
+                  </Button>
+                  <div className="flex space-x-2">
+                    <Button onClick={loadSavedConfig} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Load Saved
+                    </Button>
+                    <Button onClick={resetToDefaults} variant="outline" size="sm" className="flex-1 bg-transparent">
+                      Reset All
+                    </Button>
+                  </div>
+                </>
+              )}
+
+              {isRunning && (
+                <>
+                  <Button onClick={pauseProcessing} variant="outline" className="w-full bg-transparent">
+                    Pause & Save State
+                  </Button>
+                  <Button onClick={stopProcessing} variant="destructive" className="w-full">
+                    Stop & Save State
+                  </Button>
+                </>
+              )}
+            </CardContent>
+          </Card>
+
           <Card>
             <CardHeader>
               <CardTitle className="text-lg">Quick Stats</CardTitle>
@@ -2971,64 +3156,6 @@ export default function Home() {
                   ))}
                 </div>
               </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">Controls</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {!isRunning && !canResume && (
-                <>
-                  <Button onClick={startProcessing} disabled={!rootDir} className="w-full">
-                    Start Processing
-                  </Button>
-                  <div className="flex space-x-2">
-                    <Button onClick={loadSavedConfig} variant="outline" size="sm" className="flex-1 bg-transparent">
-                      Load Saved
-                    </Button>
-                    <Button onClick={resetToDefaults} variant="outline" size="sm" className="flex-1 bg-transparent">
-                      Reset All
-                    </Button>
-                  </div>
-                </>
-              )}
-
-              {canResume && !isRunning && (
-                <>
-                  <Button onClick={resumeProcessing} className="w-full">
-                    Resume Processing
-                  </Button>
-                  <Button
-                    onClick={startProcessing}
-                    disabled={!rootDir}
-                    variant="outline"
-                    className="w-full bg-transparent"
-                  >
-                    Start New Processing
-                  </Button>
-                  <div className="flex space-x-2">
-                    <Button onClick={loadSavedConfig} variant="outline" size="sm" className="flex-1 bg-transparent">
-                      Load Saved
-                    </Button>
-                    <Button onClick={resetToDefaults} variant="outline" size="sm" className="flex-1 bg-transparent">
-                      Reset All
-                    </Button>
-                  </div>
-                </>
-              )}
-
-              {isRunning && (
-                <>
-                  <Button onClick={pauseProcessing} variant="outline" className="w-full bg-transparent">
-                    Pause & Save State
-                  </Button>
-                  <Button onClick={stopProcessing} variant="destructive" className="w-full">
-                    Stop & Save State
-                  </Button>
-                </>
-              )}
             </CardContent>
           </Card>
 

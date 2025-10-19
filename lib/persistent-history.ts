@@ -25,6 +25,8 @@ export interface ProcessingSession {
     mediaFilesUnmatched?: number
     xmlFilesWithMedia?: number
     xmlFilesMissingMedia?: number
+    noXmlImagesRecorded?: number
+    noXmlImagesFilteredOut?: number
   }
   results?: {
     outputPath: string
@@ -45,6 +47,11 @@ export interface ProcessingSession {
       xmlFilesMissingMedia?: number
       xmlProcessedWithoutMedia?: number
       mediaCountsByExtension?: Record<string, number>
+      noXmlImagesConsidered?: number
+      noXmlImagesRecorded?: number
+      noXmlImagesFilteredOut?: number
+      noXmlImagesMoved?: number
+      noXmlDestinationPath?: string
     }
   }
 }

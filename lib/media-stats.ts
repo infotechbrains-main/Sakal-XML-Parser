@@ -52,6 +52,9 @@ export async function scanLocalDirectoryForAssets(rootDir: string): Promise<Dire
           if (entry.isSymbolicLink()) {
             return
           }
+          if (entry.name.toLowerCase().endsWith("_noxml")) {
+            return
+          }
           await traverse(fullPath)
           return
         }

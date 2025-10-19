@@ -24,6 +24,8 @@ export interface ProcessingSession {
     currentFileIndex?: number
     processedFilesList?: string[]
     remainingFiles?: string[]
+    noXmlImagesRecorded?: number
+    noXmlImagesFilteredOut?: number
   }
   results?: {
     outputPath: string
@@ -35,6 +37,11 @@ export interface ProcessingSession {
       recordsWritten: number
       filteredFiles: number
       movedFiles: number
+      noXmlImagesConsidered?: number
+      noXmlImagesRecorded?: number
+      noXmlImagesFilteredOut?: number
+      noXmlImagesMoved?: number
+      noXmlDestinationPath?: string
     }
     errors?: string[]
   }

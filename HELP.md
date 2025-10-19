@@ -44,6 +44,7 @@
 - ✅ **Session History** - Track and resume previous processing sessions
 - ✅ **Pause/Resume Capability** - Interrupt and continue long-running processes
 - ✅ **Export & Download** - Download processed CSV files directly
+- ✅ **Image-Only Fallback** - Automatically process orphaned media without XML files, extract EXIF metadata, and route them to a dedicated `_noxml` destination
 
 ### Data Extraction
 The parser extracts comprehensive metadata including:
@@ -54,6 +55,7 @@ The parser extracts comprehensive metadata including:
 - **Image Data**: Width, Height, File Size, Path, Existence verification
 - **Technical Details**: Creation Date, Revision Date, Usage Type, Rights Holder
 - **EXIF Data**: Camera settings, GPS data, and other embedded information
+- **Source Flags**: `Have XML` indicator to distinguish XML-backed records from image-only fallbacks
 
 ---
 

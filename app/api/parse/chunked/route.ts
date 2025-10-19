@@ -6,6 +6,7 @@ import { getPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
 import { scanLocalDirectoryForAssets } from "@/lib/media-stats"
+import { processImagesWithoutXml } from "@/lib/no-xml-processor"
 
 interface ProcessingStats {
   totalFiles: number
@@ -24,6 +25,11 @@ interface ProcessingStats {
   xmlFilesMissingMedia: number
   xmlProcessedWithoutMedia: number
   mediaCountsByExtension: Record<string, number>
+  noXmlImagesConsidered: number
+  noXmlImagesRecorded: number
+  noXmlImagesFilteredOut: number
+  noXmlImagesMoved: number
+  noXmlDestinationPath?: string
 }
 
 interface WorkerResult {
@@ -42,10 +48,14 @@ interface ChunkedProcessingState {
   totalChunks: number
   chunkSize: number
   xmlFiles: string[]
+  mediaFiles: string[]
+  matchedImagePaths: string[]
+  remoteMediaMatches: number
   outputPath: string
   startTime: string
   pauseTime?: string
   processedChunks: string[][]
+  scanWarnings?: string[]
 }
 
 const CHUNKED_STATE_FILE = path.join(process.cwd(), "chunked_processing_state.json")
@@ -87,8 +97,8 @@ export async function POST(request: NextRequest) {
 
   const stream = new ReadableStream({
     async start(controller) {
-      let sessionId: string | null = null
-      let processingState: ChunkedProcessingState | null = null
+  let sessionId: string | null = null
+  let processingState: ChunkedProcessingState | null = null
 
       const safeCloseController = () => {
         if (!controllerClosed) {
@@ -238,6 +248,10 @@ export async function POST(request: NextRequest) {
           xmlFilesMissingMedia: xmlFiles.length,
           xmlProcessedWithoutMedia: 0,
           mediaCountsByExtension,
+          noXmlImagesConsidered: 0,
+          noXmlImagesRecorded: 0,
+          noXmlImagesFilteredOut: 0,
+          noXmlImagesMoved: 0,
         }
 
         const matchedLocalMediaPaths = new Set<string>()
@@ -296,18 +310,38 @@ export async function POST(request: NextRequest) {
             numWorkers,
             verbose,
             filterConfig,
+            isRemote,
           },
           stats,
           currentChunk: 0,
           totalChunks,
           chunkSize,
           xmlFiles,
+          mediaFiles,
+          matchedImagePaths: [],
+          remoteMediaMatches: 0,
           outputPath,
           startTime: new Date().toISOString(),
           processedChunks: [],
+          scanWarnings,
         }
 
-        await saveProcessingState(processingState)
+        const updateProcessingState = (mutator: (state: ChunkedProcessingState) => void) => {
+          if (processingState) {
+            mutator(processingState)
+          }
+        }
+
+        const persistProcessingState = async () => {
+          if (!processingState) return
+          processingState.matchedImagePaths = Array.from(matchedLocalMediaPaths)
+          processingState.mediaFiles = mediaFiles
+          processingState.remoteMediaMatches = remoteMediaMatches
+          processingState.scanWarnings = scanWarnings
+          await saveProcessingState(processingState)
+        }
+
+        await persistProcessingState()
 
         // Create session
         const session = {
@@ -323,6 +357,7 @@ export async function POST(request: NextRequest) {
             verbose,
             filterConfig,
             processingMode: "chunked",
+            isRemote,
           },
           progress: {
             totalFiles: stats.totalFiles,
@@ -392,6 +427,7 @@ export async function POST(request: NextRequest) {
             "xmlPath",
             "imagePath",
             "imageExists",
+            "haveXml",
             "creationDate",
             "revisionDate",
             "commentData",
@@ -407,8 +443,10 @@ export async function POST(request: NextRequest) {
         let wasInterrupted = false
 
         for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-          processingState.currentChunk = chunkIndex + 1
-          await saveProcessingState(processingState)
+          updateProcessingState((state) => {
+            state.currentChunk = chunkIndex + 1
+          })
+          await persistProcessingState()
 
           // Check for pause/stop before processing chunk
           const pauseState = getPauseState()
@@ -417,8 +455,10 @@ export async function POST(request: NextRequest) {
               console.log(`[Chunked API] Stop requested before chunk ${chunkIndex + 1}`)
             }
             wasInterrupted = true
-            processingState.pauseTime = new Date().toISOString()
-            await saveProcessingState(processingState)
+            updateProcessingState((state) => {
+              state.pauseTime = new Date().toISOString()
+            })
+            await persistProcessingState()
             sendMessage("shutdown", {
               reason: "Processing stopped by user",
               stats,
@@ -435,8 +475,10 @@ export async function POST(request: NextRequest) {
             if (verbose) {
               console.log(`[Chunked API] Pause requested before chunk ${chunkIndex + 1}`)
             }
-            processingState.pauseTime = new Date().toISOString()
-            await saveProcessingState(processingState)
+            updateProcessingState((state) => {
+              state.pauseTime = new Date().toISOString()
+            })
+            await persistProcessingState()
 
             if (sessionId) {
               await history.updateSession(sessionId, {
@@ -506,10 +548,12 @@ export async function POST(request: NextRequest) {
               // Process results we got before interruption
               await processChunkResults(chunkResults, outputPath, stats, verbose, updateMediaStatsFromRecord)
 
-              processingState.stats = stats
-              processingState.pauseTime = new Date().toISOString()
-              processingState.processedChunks.push(chunk)
-              await saveProcessingState(processingState)
+              updateProcessingState((state) => {
+                state.stats = stats
+                state.pauseTime = new Date().toISOString()
+                state.processedChunks.push(chunk)
+              })
+              await persistProcessingState()
 
               if (midProcessPauseState.shouldStop) {
                 wasInterrupted = true
@@ -537,9 +581,11 @@ export async function POST(request: NextRequest) {
             // Process results normally
             await processChunkResults(chunkResults, outputPath, stats, verbose, updateMediaStatsFromRecord)
 
-            processingState.stats = stats
-            processingState.processedChunks.push(chunk)
-            await saveProcessingState(processingState)
+            updateProcessingState((state) => {
+              state.stats = stats
+              state.processedChunks.push(chunk)
+            })
+            await persistProcessingState()
 
             // Update session progress
             if (sessionId) {
@@ -597,6 +643,11 @@ export async function POST(request: NextRequest) {
                 xmlFilesWithMedia: stats.xmlFilesWithMedia,
                 xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
                 xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
+                noXmlImagesConsidered: stats.noXmlImagesConsidered,
+                noXmlImagesRecorded: stats.noXmlImagesRecorded,
+                noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
+                noXmlImagesMoved: stats.noXmlImagesMoved,
+                noXmlDestinationPath: stats.noXmlDestinationPath,
               },
             })
 
@@ -623,8 +674,10 @@ export async function POST(request: NextRequest) {
                     console.log(`[Chunked API] Pause/Stop requested during chunk pause`)
                   }
 
-                  processingState.pauseTime = new Date().toISOString()
-                  await saveProcessingState(processingState)
+                  updateProcessingState((state) => {
+                    state.pauseTime = new Date().toISOString()
+                  })
+                  await persistProcessingState()
 
                   if (pauseCheckState.shouldStop) {
                     wasInterrupted = true
@@ -661,13 +714,54 @@ export async function POST(request: NextRequest) {
             stats.errorFiles += chunk.length
             stats.processedFiles += chunk.length
 
-            processingState.stats = stats
-            await saveProcessingState(processingState)
+            updateProcessingState((state) => {
+              state.stats = stats
+            })
+            await persistProcessingState()
           }
         }
 
         // Clear processing state file on successful completion
         await clearProcessingState()
+
+  if (!wasInterrupted && !isRemote) {
+          const noXmlResult = await processImagesWithoutXml({
+            rootDir: path.resolve(rootDir),
+            mediaFiles,
+            matchedImagePaths: matchedLocalMediaPaths,
+            filterConfig,
+            verbose,
+            collectRecords: false,
+            onRecord: async (record) => {
+              const csvLine =
+                Object.values(record)
+                  .map((value) =>
+                    typeof value === "string" && (value.includes(",") || value.includes("\"") || value.includes("\n"))
+                      ? `"${String(value).replace(/"/g, '""')}"`
+                      : value || "",
+                  )
+                  .join(",") + "\n"
+
+              await fs.appendFile(outputPath, csvLine, "utf8")
+              stats.recordsWritten++
+            },
+            onLog: (message) => {
+              if (verbose) {
+                sendMessage("log", message)
+              }
+            },
+          })
+
+          stats.noXmlImagesConsidered = noXmlResult.stats.considered
+          stats.noXmlImagesRecorded = noXmlResult.stats.recorded
+          stats.noXmlImagesFilteredOut = noXmlResult.stats.filteredOut
+          stats.noXmlImagesMoved = noXmlResult.stats.moved
+          stats.noXmlDestinationPath = noXmlResult.destinationPath
+
+          if (noXmlResult.errors.length > 0 && verbose) {
+            noXmlResult.errors.forEach((err) => sendMessage("log", err))
+          }
+        }
 
         // Update final session status
         const finalStatus = wasInterrupted ? "interrupted" : "completed"
@@ -696,6 +790,11 @@ export async function POST(request: NextRequest) {
           xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
           xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
           mediaCountsByExtension: stats.mediaCountsByExtension,
+          noXmlImagesConsidered: stats.noXmlImagesConsidered,
+          noXmlImagesRecorded: stats.noXmlImagesRecorded,
+          noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
+          noXmlImagesMoved: stats.noXmlImagesMoved,
+          noXmlDestinationPath: stats.noXmlDestinationPath,
         }
 
         if (sessionId) {
@@ -712,6 +811,8 @@ export async function POST(request: NextRequest) {
               mediaFilesUnmatched: stats.mediaFilesUnmatched,
               xmlFilesWithMedia: stats.xmlFilesWithMedia,
               xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+              noXmlImagesRecorded: stats.noXmlImagesRecorded,
+              noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
             },
             results: {
               outputPath,
