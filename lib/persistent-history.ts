@@ -20,9 +20,32 @@ export interface ProcessingSession {
     successCount: number
     errorCount: number
     processedFilesList?: string[]
+    mediaFilesTotal?: number
+    mediaFilesMatched?: number
+    mediaFilesUnmatched?: number
+    xmlFilesWithMedia?: number
+    xmlFilesMissingMedia?: number
   }
   results?: {
     outputPath: string
+    stats?: {
+      totalFiles: number
+      processedFiles: number
+      successfulFiles: number
+      errorFiles: number
+      recordsWritten: number
+      filteredFiles: number
+      movedFiles: number
+      totalMediaFiles?: number
+      mediaFilesMatched?: number
+      localMediaFilesMatched?: number
+      remoteMediaFilesMatched?: number
+      mediaFilesUnmatched?: number
+      xmlFilesWithMedia?: number
+      xmlFilesMissingMedia?: number
+      xmlProcessedWithoutMedia?: number
+      mediaCountsByExtension?: Record<string, number>
+    }
   }
 }
 

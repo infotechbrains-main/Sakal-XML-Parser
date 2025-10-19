@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import { useState, useRef, useEffect, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -24,11 +24,40 @@ interface Message {
   timestamp?: string
 }
 
+interface ProcessingResultStats {
+  totalFiles: number
+  processedFiles: number
+  successfulFiles: number
+  errorFiles: number
+  recordsWritten: number
+  filteredFiles: number
+  movedFiles: number
+  totalMediaFiles?: number
+  mediaFilesMatched?: number
+  localMediaFilesMatched?: number
+  remoteMediaFilesMatched?: number
+  mediaFilesUnmatched?: number
+  xmlFilesWithMedia?: number
+  xmlFilesMissingMedia?: number
+  xmlProcessedWithoutMedia?: number
+  mediaCountsByExtension?: Record<string, number>
+}
+
 interface ProcessingStats {
   totalFiles: number
   processedFiles: number
   successCount: number
   errorCount: number
+  filteredCount: number
+  movedCount: number
+  totalMediaFiles: number
+  mediaFilesMatched: number
+  localMediaFilesMatched: number
+  remoteMediaFilesMatched: number
+  mediaFilesUnmatched: number
+  xmlFilesWithMedia: number
+  xmlFilesMissingMedia: number
+  xmlProcessedWithoutMedia: number
   currentFile?: string
   estimatedTimeRemaining?: string
 }
@@ -95,27 +124,76 @@ interface ProcessingSession {
     processedFiles: number
     successCount: number
     errorCount: number
+    mediaFilesTotal?: number
+    mediaFilesMatched?: number
+    mediaFilesUnmatched?: number
+    xmlFilesWithMedia?: number
+    xmlFilesMissingMedia?: number
+    processedFilesList?: string[]
   }
   results?: {
     outputPath: string
+    stats?: ProcessingResultStats
   }
 }
 
 interface ProcessingResults {
-  stats: {
-    totalFiles: number
-    processedFiles: number
-    successfulFiles: number
-    errorFiles: number
-    recordsWritten: number
-    filteredFiles: number
-    movedFiles: number
-  }
+  stats: ProcessingResultStats
   outputFile: string
   errors: string[]
   processingTime?: string
   startTime?: string
   endTime?: string
+  scanWarnings?: string[]
+}
+
+const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error) {
+    return error.message
+  }
+  if (typeof error === "string") {
+    return error
+  }
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
+}
+
+const DEFAULT_PROCESSING_STATS: ProcessingStats = {
+  totalFiles: 0,
+  processedFiles: 0,
+  successCount: 0,
+  errorCount: 0,
+  filteredCount: 0,
+  movedCount: 0,
+  totalMediaFiles: 0,
+  mediaFilesMatched: 0,
+  localMediaFilesMatched: 0,
+  remoteMediaFilesMatched: 0,
+  mediaFilesUnmatched: 0,
+  xmlFilesWithMedia: 0,
+  xmlFilesMissingMedia: 0,
+  xmlProcessedWithoutMedia: 0,
+}
+
+const formatMetricValue = (value: number | string | undefined | null) => {
+  if (value === undefined || value === null || value === "") {
+    return "—"
+  }
+  return typeof value === "number" ? value.toLocaleString() : value
+}
+
+const formatTimestamp = (value?: string | null) => {
+  if (!value) {
+    return "—"
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+  return date.toLocaleString()
 }
 
 export default function Home() {
@@ -134,12 +212,7 @@ export default function Home() {
   const [isPaused, setIsPaused] = useState(false)
   const [canResume, setCanResume] = useState(false)
   const [progress, setProgress] = useState(0)
-  const [stats, setStats] = useState<ProcessingStats>({
-    totalFiles: 0,
-    processedFiles: 0,
-    successCount: 0,
-    errorCount: 0,
-  })
+  const [stats, setStats] = useState<ProcessingStats>({ ...DEFAULT_PROCESSING_STATS })
 
   // Chunked processing
   const [chunkSize, setChunkSize] = useState(100)
@@ -193,6 +266,97 @@ export default function Home() {
   const logsEndRef = useRef<HTMLDivElement>(null)
   const errorLogsEndRef = useRef<HTMLDivElement>(null)
   const ws = useRef<WebSocket | null>(null)
+
+  const quickProcessingMetrics = useMemo(
+    () => [
+      { label: "Total Files", value: stats.totalFiles },
+      { label: "Processed", value: stats.processedFiles },
+      { label: "Success", value: stats.successCount, accentClass: "text-green-600" },
+      { label: "Errors", value: stats.errorCount, accentClass: "text-red-600" },
+      { label: "Filtered", value: stats.filteredCount },
+      { label: "Moved", value: stats.movedCount },
+    ],
+    [stats],
+  )
+
+  const mediaQuickMetrics = useMemo(() => {
+    const matchRate =
+      stats.totalMediaFiles > 0
+        ? `${((stats.mediaFilesMatched / stats.totalMediaFiles) * 100).toFixed(1)}%`
+        : "—"
+
+    return [
+      { label: "Total Media", value: stats.totalMediaFiles },
+      { label: "Matched", value: stats.mediaFilesMatched, accentClass: "text-green-600" },
+      { label: "Local Matches", value: stats.localMediaFilesMatched },
+      { label: "Remote Matches", value: stats.remoteMediaFilesMatched },
+      { label: "Unmatched", value: stats.mediaFilesUnmatched, accentClass: "text-red-600" },
+      { label: "Match Rate", value: matchRate },
+    ]
+  }, [stats])
+
+  const xmlQuickMetrics = useMemo(
+    () => [
+      { label: "XML With Media", value: stats.xmlFilesWithMedia },
+      { label: "XML Missing Media", value: stats.xmlFilesMissingMedia, accentClass: "text-yellow-600" },
+      { label: "XML Without Media", value: stats.xmlProcessedWithoutMedia, accentClass: "text-red-600" },
+    ],
+    [stats],
+  )
+
+  const processingResultMetrics = useMemo(() => {
+    if (!processingResults) {
+      return []
+    }
+
+    const { stats: resultStats, processingTime } = processingResults
+
+    return [
+      { label: "Total Files", value: resultStats.totalFiles },
+      { label: "Processed", value: resultStats.processedFiles },
+      { label: "Success", value: resultStats.successfulFiles, accentClass: "text-green-600" },
+      { label: "Errors", value: resultStats.errorFiles, accentClass: "text-red-600" },
+      { label: "Records Written", value: resultStats.recordsWritten },
+      { label: "Filtered", value: resultStats.filteredFiles },
+      { label: "Moved", value: resultStats.movedFiles },
+      { label: "Duration", value: processingTime ?? "—" },
+    ]
+  }, [processingResults])
+
+  const processingResultMediaMetrics = useMemo(() => {
+    if (!processingResults) {
+      return []
+    }
+
+    const { stats: resultStats } = processingResults
+    const totalMedia = resultStats.totalMediaFiles ?? 0
+    const matchedMedia = resultStats.mediaFilesMatched ?? 0
+    const matchRate = totalMedia > 0 ? `${((matchedMedia / totalMedia) * 100).toFixed(1)}%` : "—"
+
+    return [
+      { label: "Total Media", value: resultStats.totalMediaFiles },
+      { label: "Matched", value: resultStats.mediaFilesMatched, accentClass: "text-green-600" },
+      { label: "Local Matches", value: resultStats.localMediaFilesMatched },
+      { label: "Remote Matches", value: resultStats.remoteMediaFilesMatched },
+      { label: "Unmatched", value: resultStats.mediaFilesUnmatched, accentClass: "text-red-600" },
+      { label: "Match Rate", value: matchRate },
+      { label: "XML With Media", value: resultStats.xmlFilesWithMedia },
+      { label: "XML Missing Media", value: resultStats.xmlFilesMissingMedia, accentClass: "text-yellow-600" },
+      { label: "XML Without Media", value: resultStats.xmlProcessedWithoutMedia, accentClass: "text-red-600" },
+    ]
+  }, [processingResults])
+
+  const mediaExtensionEntries = useMemo(() => {
+    if (!processingResults?.stats.mediaCountsByExtension) {
+      return [] as Array<[string, number]>
+    }
+
+    return Object.entries(processingResults.stats.mediaCountsByExtension).sort(([, a], [, b]) => Number(b) - Number(a))
+  }, [processingResults])
+
+  const scanWarnings = processingResults?.scanWarnings ?? []
+  const resultStartTime = processingResults?.startTime ?? processingStartTime
+  const resultEndTime = processingResults?.endTime ?? processingEndTime
 
   // Update filterConfig.enabled when filterEnabled changes
   useEffect(() => {
@@ -305,7 +469,7 @@ export default function Home() {
     } catch (error) {
       console.error("Failed to load history:", error)
       setHistory([])
-      addMessage("error", `Failed to load history: ${error.message}`)
+      addMessage("error", `Failed to load history: ${getErrorMessage(error)}`)
     }
   }
 
@@ -488,14 +652,56 @@ export default function Home() {
         break
       case "progress":
         setProgress(data.message.percentage || 0)
-        if (data.message.stats) {
-          setStats({
-            totalFiles: data.message.stats.totalFiles || data.message.total || 0,
-            processedFiles: data.message.stats.processedFiles || data.message.processed || 0,
-            successCount: data.message.stats.successCount || data.message.successful || 0,
-            errorCount: data.message.stats.errorCount || data.message.errors || 0,
-          })
-        }
+        setStats((prev) => {
+          const statsPayload = data.message.stats ?? {}
+
+          return {
+            totalFiles: statsPayload.totalFiles ?? data.message.total ?? prev.totalFiles,
+            processedFiles: statsPayload.processedFiles ?? data.message.processed ?? prev.processedFiles,
+            successCount: statsPayload.successCount ?? data.message.successful ?? prev.successCount,
+            errorCount: statsPayload.errorCount ?? data.message.errors ?? prev.errorCount,
+            filteredCount:
+              statsPayload.filteredCount ??
+              statsPayload.filteredFiles ??
+              data.message.filtered ??
+              prev.filteredCount,
+            movedCount:
+              statsPayload.movedCount ??
+              statsPayload.movedFiles ??
+              data.message.moved ??
+              prev.movedCount,
+            totalMediaFiles:
+              statsPayload.totalMediaFiles ??
+              statsPayload.mediaFilesTotal ??
+              data.message.mediaFilesTotal ??
+              prev.totalMediaFiles,
+            mediaFilesMatched:
+              statsPayload.mediaFilesMatched ?? data.message.mediaFilesMatched ?? prev.mediaFilesMatched,
+            localMediaFilesMatched:
+              statsPayload.localMediaFilesMatched ??
+              data.message.localMediaFilesMatched ??
+              prev.localMediaFilesMatched,
+            remoteMediaFilesMatched:
+              statsPayload.remoteMediaFilesMatched ??
+              data.message.remoteMediaFilesMatched ??
+              prev.remoteMediaFilesMatched,
+            mediaFilesUnmatched:
+              statsPayload.mediaFilesUnmatched ?? data.message.mediaFilesUnmatched ?? prev.mediaFilesUnmatched,
+            xmlFilesWithMedia:
+              statsPayload.xmlFilesWithMedia ?? data.message.xmlFilesWithMedia ?? prev.xmlFilesWithMedia,
+            xmlFilesMissingMedia:
+              statsPayload.xmlFilesMissingMedia ?? data.message.xmlFilesMissingMedia ?? prev.xmlFilesMissingMedia,
+            xmlProcessedWithoutMedia:
+              statsPayload.xmlProcessedWithoutMedia ??
+              data.message.xmlProcessedWithoutMedia ??
+              prev.xmlProcessedWithoutMedia,
+            currentFile: data.message.currentFile ?? statsPayload.currentFile ?? prev.currentFile,
+            estimatedTimeRemaining:
+              data.message.estimatedTimeRemaining ??
+              statsPayload.estimatedTimeRemaining ??
+              prev.estimatedTimeRemaining,
+          }
+        })
         if (data.message.currentChunk) {
           setCurrentChunk(data.message.currentChunk)
         }
@@ -535,7 +741,7 @@ export default function Home() {
           outputFile: data.message.outputFile || outputFile,
           errors: data.message.errors || [],
           processingTime,
-          startTime: processingStartTime,
+          startTime: processingStartTime ?? undefined,
           endTime: new Date().toISOString(),
         })
 
@@ -752,12 +958,7 @@ export default function Home() {
     setProcessingEndTime(null)
     setCanResume(false)
     setIsPaused(false)
-    setStats({
-      totalFiles: 0,
-      processedFiles: 0,
-      successCount: 0,
-      errorCount: 0,
-    })
+    setStats({ ...DEFAULT_PROCESSING_STATS })
 
     // Auto-switch to logs tab
     setActiveTab("logs")
@@ -825,7 +1026,7 @@ export default function Home() {
           outputFile: data.outputFile || outputFile,
           errors: data.errors || [],
           processingTime,
-          startTime: processingStartTime,
+          startTime: processingStartTime ?? undefined,
           endTime: new Date().toISOString(),
         })
 
@@ -846,7 +1047,7 @@ export default function Home() {
 
           partialData += textDecoder.decode(value)
 
-          let completeLines
+          let completeLines: string[]
           if (partialData.includes("\n")) {
             completeLines = partialData.split("\n")
             partialData = completeLines.pop() || ""
@@ -876,7 +1077,7 @@ export default function Home() {
         }
       }
     } catch (error: any) {
-      addMessage("error", `Error: ${error.message}`)
+      addMessage("error", `Error: ${getErrorMessage(error)}`)
       setActiveTab("logs") // Show logs on error
     } finally {
       setIsRunning(false)
@@ -1008,7 +1209,7 @@ export default function Home() {
 
             partialData += textDecoder.decode(value)
 
-            let completeLines
+            let completeLines: string[]
             if (partialData.includes("\n")) {
               completeLines = partialData.split("\n")
               partialData = completeLines.pop() || ""
@@ -1119,7 +1320,7 @@ export default function Home() {
         startProcessing()
       }, 500)
     } catch (error: any) {
-      addMessage("error", `Resume error: ${error.message}`)
+      addMessage("error", `Resume error: ${getErrorMessage(error)}`)
       setActiveTab("logs")
     } finally {
       setIsRunning(false)
@@ -1136,7 +1337,7 @@ export default function Home() {
       setWatchMode(false)
       setWatcherStatus(null)
     } catch (error: any) {
-      addMessage("error", `❌ Error stopping watcher: ${error.message}`)
+      addMessage("error", `❌ Error stopping watcher: ${getErrorMessage(error)}`)
     }
   }
 
@@ -1192,7 +1393,7 @@ export default function Home() {
         setWatchMode(false)
       }
     } catch (error: any) {
-      addMessage("error", `❌ Error starting watcher: ${error.message}`)
+      addMessage("error", `❌ Error starting watcher: ${getErrorMessage(error)}`)
       setWatchMode(false)
     }
   }
@@ -1215,29 +1416,7 @@ export default function Home() {
       }
     } catch (error) {
       console.error("Failed to delete session:", error)
-      addMessage("error", `Failed to delete session: ${error.message}`)
-    }
-  }
-
-  const clearHistory = async () => {
-    try {
-      const response = await fetch("/api/history", { method: "DELETE" })
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
-
-      const data = await response.json()
-
-      if (data.success) {
-        await loadHistory()
-        addMessage("system", "History cleared successfully")
-      } else {
-        addMessage("error", `Failed to clear history: ${data.error}`)
-      }
-    } catch (error) {
-      console.error("Failed to clear history:", error)
-      addMessage("error", `Failed to clear history: ${error.message}`)
+      addMessage("error", `Failed to delete session: ${getErrorMessage(error)}`)
     }
   }
 
@@ -1274,7 +1453,7 @@ export default function Home() {
       }
     } catch (error) {
       console.error("Failed to prepare resume:", error)
-      addMessage("error", `Failed to prepare resume: ${error.message}`)
+      addMessage("error", `Failed to prepare resume: ${getErrorMessage(error)}`)
     }
   }
 
@@ -1431,7 +1610,9 @@ export default function Home() {
                   {templates.length === 0 ? (
                     <div className="text-center py-8 text-muted-foreground">
                       <p>No templates saved yet.</p>
-                      <p className="text-sm mt-2">Click "Save Current as Template" to create your first template.</p>
+                      <p className="text-sm mt-2">
+                        Click &ldquo;Save Current as Template&rdquo; to create your first template.
+                      </p>
                     </div>
                   ) : (
                     <ScrollArea className="h-[300px]">
@@ -1600,8 +1781,8 @@ export default function Home() {
                                 onClick={() => {
                                   setFilterConfig((prev) => ({
                                     ...prev,
-                                    minWidth: preset.width,
-                                    minHeight: preset.height,
+                                    minWidth: preset.width ?? undefined,
+                                    minHeight: preset.height ?? undefined,
                                   }))
                                 }}
                                 className="text-xs"
@@ -2177,7 +2358,8 @@ export default function Home() {
                   ) : (
                     <Alert>
                       <AlertDescription>
-                        Chunked processing is only available when "Chunked" mode is selected in Basic Configuration.
+                        Chunked processing is only available when &ldquo;Chunked&rdquo; mode is selected in Basic
+                        Configuration.
                       </AlertDescription>
                     </Alert>
                   )}
@@ -2294,14 +2476,14 @@ export default function Home() {
                     </div>
                   )}
 
-                  <Alert>
-                    <AlertDescription>
-                      <strong>How it works:</strong> The watcher monitors the specified directory for new XML and image
-                      files. When both files with matching base names are detected (e.g., "image.xml" and "image.jpg"),
-                      they are automatically processed as a pair and results are appended to the CSV file. If filters
-                      are enabled, only pairs that pass the filters will be processed and moved.
-                    </AlertDescription>
-                  </Alert>
+                    <Alert>
+                      <AlertDescription>
+                        <strong>How it works:</strong> The watcher monitors the specified directory for new XML and image
+                        files. When both files with matching base names are detected (e.g., &ldquo;image.xml&rdquo; and
+                        &ldquo;image.jpg&rdquo;), they are automatically processed as a pair and results are appended to the CSV
+                        file. If filters are enabled, only pairs that pass the filters will be processed and moved.
+                      </AlertDescription>
+                    </Alert>
                 </CardContent>
               </Card>
             </TabsContent>
@@ -2314,20 +2496,21 @@ export default function Home() {
                   <CardDescription>View and manage previous processing sessions</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="flex justify-between items-center">
+                  <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                     <div className="flex space-x-2">
                       <Button onClick={loadHistory} variant="outline" size="sm">
                         Refresh
                       </Button>
-                      <Button onClick={clearHistory} variant="destructive" size="sm">
-                        Clear All
-                      </Button>
                     </div>
-                    {canResume && (
-                      <Badge variant="outline" className="text-orange-600">
-                        Resume Available
-                      </Badge>
-                    )}
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <Badge variant="secondary">Persistent History</Badge>
+                      <span className="hidden sm:inline">Sessions are kept for auditing and resume support.</span>
+                      {canResume && (
+                        <Badge variant="outline" className="text-orange-600">
+                          Resume Available
+                        </Badge>
+                      )}
+                    </div>
                   </div>
 
                   <ScrollArea className="h-96">
@@ -2335,84 +2518,164 @@ export default function Home() {
                       {!Array.isArray(history) || history.length === 0 ? (
                         <div className="text-center text-muted-foreground py-8">No processing history found</div>
                       ) : (
-                        history.map((session) => (
-                          <Card key={session.id} className="p-4">
-                            <div className="flex justify-between items-start">
-                              <div className="space-y-2 flex-1">
-                                <div className="flex items-center space-x-2">
-                                  <Badge variant="outline" className={getStatusColor(session.status)}>
-                                    {session.status.toUpperCase()}
-                                  </Badge>
-                                  <span className="text-sm text-muted-foreground">
-                                    {new Date(session.startTime).toLocaleString()}
-                                  </span>
-                                </div>
+                        history.map((session) => {
+                          const summaryStats = session.results?.stats
+                          const mediaTotal = summaryStats?.totalMediaFiles ?? session.progress.mediaFilesTotal
+                          const mediaMatched = summaryStats?.mediaFilesMatched ?? session.progress.mediaFilesMatched
+                          const mediaUnmatched = summaryStats?.mediaFilesUnmatched ?? session.progress.mediaFilesUnmatched
+                          const xmlWithMedia = summaryStats?.xmlFilesWithMedia ?? session.progress.xmlFilesWithMedia
+                          const xmlMissingMedia = summaryStats?.xmlFilesMissingMedia ?? session.progress.xmlFilesMissingMedia
+                          const xmlWithoutMedia = summaryStats?.xmlProcessedWithoutMedia
+                          const filteredFiles = summaryStats?.filteredFiles
+                          const movedFiles = summaryStats?.movedFiles
+                          const mediaMatchRate =
+                            mediaTotal !== undefined && mediaTotal !== null && mediaTotal > 0 && mediaMatched !== undefined
+                              ? `${((Number(mediaMatched) / Number(mediaTotal)) * 100).toFixed(1)}%`
+                              : undefined
 
-                                <div className="text-sm">
-                                  <div>
-                                    <strong>Directory:</strong> {session.config.rootDir}
+                          return (
+                            <Card key={session.id} className="p-4">
+                              <div className="flex justify-between items-start">
+                                <div className="space-y-2 flex-1">
+                                  <div className="flex items-center space-x-2">
+                                    <Badge variant="outline" className={getStatusColor(session.status)}>
+                                      {session.status.toUpperCase()}
+                                    </Badge>
+                                    <span className="text-sm text-muted-foreground">
+                                      {formatTimestamp(session.startTime)}
+                                    </span>
                                   </div>
-                                  <div>
-                                    <strong>Output:</strong> {session.config.outputFile}
-                                  </div>
-                                  <div>
-                                    <strong>Mode:</strong> {session.config.processingMode}
-                                  </div>
-                                  <div>
-                                    <strong>Duration:</strong> {formatDuration(session.startTime, session.endTime)}
-                                  </div>
-                                </div>
 
-                                <div className="grid grid-cols-3 gap-4 text-sm">
-                                  <div>
-                                    <div className="font-medium">Progress</div>
+                                  <div className="text-sm">
                                     <div>
-                                      {session.progress.processedFiles}/{session.progress.totalFiles}
+                                      <strong>Directory:</strong> {session.config.rootDir}
+                                    </div>
+                                    <div>
+                                      <strong>Output:</strong> {session.config.outputFile}
+                                    </div>
+                                    <div>
+                                      <strong>Mode:</strong> {session.config.processingMode}
+                                    </div>
+                                    <div>
+                                      <strong>Duration:</strong> {formatDuration(session.startTime, session.endTime)}
                                     </div>
                                   </div>
-                                  <div>
-                                    <div className="font-medium">Success</div>
-                                    <div className="text-green-600">{session.progress.successCount}</div>
+
+                                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                                    <div>
+                                      <div className="font-medium">Progress</div>
+                                      <div>
+                                        {session.progress.processedFiles}/{session.progress.totalFiles}
+                                      </div>
+                                    </div>
+                                    <div>
+                                      <div className="font-medium">Success</div>
+                                      <div className="text-green-600">{session.progress.successCount}</div>
+                                    </div>
+                                    <div>
+                                      <div className="font-medium">Errors</div>
+                                      <div className="text-red-600">{session.progress.errorCount}</div>
+                                    </div>
+                                    {filteredFiles !== undefined && (
+                                      <div>
+                                        <div className="font-medium">Filtered</div>
+                                        <div>{formatMetricValue(filteredFiles)}</div>
+                                      </div>
+                                    )}
+                                    {movedFiles !== undefined && (
+                                      <div>
+                                        <div className="font-medium">Moved</div>
+                                        <div>{formatMetricValue(movedFiles)}</div>
+                                      </div>
+                                    )}
                                   </div>
-                                  <div>
-                                    <div className="font-medium">Errors</div>
-                                    <div className="text-red-600">{session.progress.errorCount}</div>
-                                  </div>
+
+                                  {session.progress.totalFiles > 0 && (
+                                    <Progress
+                                      value={(session.progress.processedFiles / session.progress.totalFiles) * 100}
+                                      className="h-2"
+                                    />
+                                  )}
+
+                                  {(mediaTotal !== undefined || mediaMatched !== undefined || mediaUnmatched !== undefined) && (
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+                                      {mediaTotal !== undefined && (
+                                        <div>
+                                          <div className="font-medium">Media Total</div>
+                                          <div>{formatMetricValue(mediaTotal)}</div>
+                                        </div>
+                                      )}
+                                      {mediaMatched !== undefined && (
+                                        <div>
+                                          <div className="font-medium">Media Matched</div>
+                                          <div className="text-green-600">{formatMetricValue(mediaMatched)}</div>
+                                        </div>
+                                      )}
+                                      {mediaUnmatched !== undefined && (
+                                        <div>
+                                          <div className="font-medium">Media Unmatched</div>
+                                          <div className="text-red-600">{formatMetricValue(mediaUnmatched)}</div>
+                                        </div>
+                                      )}
+                                      {mediaMatchRate && (
+                                        <div>
+                                          <div className="font-medium">Match Rate</div>
+                                          <div className="text-blue-600">{mediaMatchRate}</div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {(xmlWithMedia !== undefined || xmlMissingMedia !== undefined || xmlWithoutMedia !== undefined) && (
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+                                      {xmlWithMedia !== undefined && (
+                                        <div>
+                                          <div className="font-medium">XML With Media</div>
+                                          <div>{formatMetricValue(xmlWithMedia)}</div>
+                                        </div>
+                                      )}
+                                      {xmlMissingMedia !== undefined && (
+                                        <div>
+                                          <div className="font-medium">XML Missing Media</div>
+                                          <div className="text-yellow-600">{formatMetricValue(xmlMissingMedia)}</div>
+                                        </div>
+                                      )}
+                                      {xmlWithoutMedia !== undefined && (
+                                        <div>
+                                          <div className="font-medium">XML Without Media</div>
+                                          <div className="text-red-600">{formatMetricValue(xmlWithoutMedia)}</div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
 
-                                {session.progress.totalFiles > 0 && (
-                                  <Progress
-                                    value={(session.progress.processedFiles / session.progress.totalFiles) * 100}
-                                    className="h-2"
-                                  />
-                                )}
-                              </div>
-
-                              <div className="flex flex-col space-y-2 ml-4">
-                                {(session.status === "interrupted" || session.status === "paused") && (
-                                  <Button size="sm" onClick={() => resumeFromSession(session.id)} className="text-xs">
-                                    Resume
+                                <div className="flex flex-col space-y-2 ml-4">
+                                  {(session.status === "interrupted" || session.status === "paused") && (
+                                    <Button size="sm" onClick={() => resumeFromSession(session.id)} className="text-xs">
+                                      Resume
+                                    </Button>
+                                  )}
+                                  {session.results?.outputPath && (
+                                    <Button size="sm" variant="outline" asChild className="text-xs bg-transparent">
+                                      <a href={`/api/download?file=${encodeURIComponent(session.results.outputPath)}`}>
+                                        Download
+                                      </a>
+                                    </Button>
+                                  )}
+                                  <Button
+                                    size="sm"
+                                    variant="destructive"
+                                    onClick={() => deleteSession(session.id)}
+                                    className="text-xs"
+                                  >
+                                    Delete
                                   </Button>
-                                )}
-                                {session.results?.outputPath && (
-                                  <Button size="sm" variant="outline" asChild className="text-xs bg-transparent">
-                                    <a href={`/api/download?file=${encodeURIComponent(session.results.outputPath)}`}>
-                                      Download
-                                    </a>
-                                  </Button>
-                                )}
-                                <Button
-                                  size="sm"
-                                  variant="destructive"
-                                  onClick={() => deleteSession(session.id)}
-                                  className="text-xs"
-                                >
-                                  Delete
-                                </Button>
+                                </div>
                               </div>
-                            </div>
-                          </Card>
-                        ))
+                            </Card>
+                          )
+                        })
                       )}
                     </div>
                   </ScrollArea>
@@ -2483,42 +2746,83 @@ export default function Home() {
                         <Progress value={progress} />
                       </div>
 
-                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                        <div className="text-center">
-                          <div className="text-2xl font-bold">{processingResults.stats.totalFiles}</div>
-                          <div className="text-sm text-muted-foreground">Total Files</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-2xl font-bold">{processingResults.stats.processedFiles}</div>
-                          <div className="text-sm text-muted-foreground">Processed</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-2xl font-bold text-green-600">
-                            {processingResults.stats.successfulFiles}
+                      <div className="space-y-4">
+                        <div className="space-y-2">
+                          <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                            File Processing
+                          </Label>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            {processingResultMetrics.map((metric) => (
+                              <div key={metric.label} className="text-center">
+                                <div className={`text-2xl font-bold ${metric.accentClass ?? ""}`.trim()}>
+                                  {formatMetricValue(metric.value)}
+                                </div>
+                                <div className="text-xs text-muted-foreground">{metric.label}</div>
+                              </div>
+                            ))}
                           </div>
-                          <div className="text-sm text-muted-foreground">Success</div>
                         </div>
-                        <div className="text-center">
-                          <div className="text-2xl font-bold text-red-600">{processingResults.stats.errorFiles}</div>
-                          <div className="text-sm text-muted-foreground">Errors</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-2xl font-bold">{processingResults.stats.recordsWritten}</div>
-                          <div className="text-sm text-muted-foreground">Records Written</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-2xl font-bold">{processingResults.stats.filteredFiles}</div>
-                          <div className="text-sm text-muted-foreground">Filtered</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-2xl font-bold">{processingResults.stats.movedFiles}</div>
-                          <div className="text-sm text-muted-foreground">Moved</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="text-2xl font-bold">{processingResults.processingTime}</div>
-                          <div className="text-sm text-muted-foreground">Duration</div>
+                        <div className="space-y-2">
+                          <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                            Media Coverage
+                          </Label>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            {processingResultMediaMetrics.map((metric) => (
+                              <div key={metric.label} className="text-center">
+                                <div className={`text-2xl font-bold ${metric.accentClass ?? ""}`.trim()}>
+                                  {formatMetricValue(metric.value)}
+                                </div>
+                                <div className="text-xs text-muted-foreground">{metric.label}</div>
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                        <div>
+                          <Label className="text-xs uppercase tracking-wide text-muted-foreground">Started</Label>
+                          <div className="font-medium text-foreground">{formatTimestamp(resultStartTime)}</div>
+                        </div>
+                        <div>
+                          <Label className="text-xs uppercase tracking-wide text-muted-foreground">Completed</Label>
+                          <div className="font-medium text-foreground">{formatTimestamp(resultEndTime)}</div>
+                        </div>
+                      </div>
+
+                      {mediaExtensionEntries.length > 0 && (
+                        <div className="space-y-2">
+                          <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                            Media by Extension
+                          </Label>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                            {mediaExtensionEntries.map(([extension, count]) => (
+                              <div
+                                key={extension}
+                                className="flex items-center justify-between rounded-md border px-2 py-1"
+                              >
+                                <span className="uppercase text-muted-foreground">{extension}</span>
+                                <span className="font-semibold text-foreground">{formatMetricValue(count)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {scanWarnings.length > 0 && (
+                        <Alert variant="destructive">
+                          <AlertDescription>
+                            <div className="space-y-1">
+                              <div className="font-medium">Directory scan warnings</div>
+                              <ul className="list-disc list-inside space-y-1 text-sm">
+                                {scanWarnings.map((warning, index) => (
+                                  <li key={index}>{warning}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          </AlertDescription>
+                        </Alert>
+                      )}
 
                       {processingResults.errors && processingResults.errors.length > 0 && (
                         <div className="space-y-2">
@@ -2563,7 +2867,7 @@ export default function Home() {
             <CardHeader>
               <CardTitle className="text-lg">Quick Stats</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-3">
+            <CardContent className="space-y-4">
               <div className="flex justify-between">
                 <span className="text-sm">Status:</span>
                 <Badge variant={isRunning ? "default" : "secondary"}>{isRunning ? "Running" : "Idle"}</Badge>
@@ -2575,6 +2879,10 @@ export default function Home() {
               <div className="flex justify-between">
                 <span className="text-sm">Workers:</span>
                 <span className="text-sm font-medium">{numWorkers}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm">Progress:</span>
+                <span className="text-sm font-medium">{progress}%</span>
               </div>
               {filterEnabled && (
                 <div className="flex justify-between">
@@ -2596,6 +2904,73 @@ export default function Home() {
                   </Badge>
                 </div>
               )}
+
+              <div className="border-t border-dashed pt-3 space-y-3">
+                <div>
+                  <Label className="text-xs uppercase tracking-wide text-muted-foreground">Files</Label>
+                  <div className="grid grid-cols-2 gap-3 pt-2 text-sm">
+                    {quickProcessingMetrics.map((metric) => (
+                      <div key={metric.label} className="flex flex-col">
+                        <span className={`text-base font-semibold ${metric.accentClass ?? ""}`.trim()}>
+                          {formatMetricValue(metric.value)}
+                        </span>
+                        <span className="text-xs text-muted-foreground">{metric.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {(stats.currentFile || stats.estimatedTimeRemaining) && (
+                  <div className="grid gap-1 text-xs text-muted-foreground">
+                    {stats.currentFile && (
+                      <div>
+                        <span className="font-medium text-foreground">Current:</span> {stats.currentFile}
+                      </div>
+                    )}
+                    {stats.estimatedTimeRemaining && (
+                      <div>
+                        <span className="font-medium text-foreground">ETA:</span> {stats.estimatedTimeRemaining}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg">Media Overview</CardTitle>
+              <CardDescription>How assets line up with the discovered XML</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">Media Files</Label>
+                <div className="grid grid-cols-2 gap-3 pt-2 text-sm">
+                  {mediaQuickMetrics.map((metric) => (
+                    <div key={metric.label} className="flex flex-col">
+                      <span className={`text-base font-semibold ${metric.accentClass ?? ""}`.trim()}>
+                        {formatMetricValue(metric.value)}
+                      </span>
+                      <span className="text-xs text-muted-foreground">{metric.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">XML Status</Label>
+                <div className="grid grid-cols-2 gap-3 pt-2 text-sm">
+                  {xmlQuickMetrics.map((metric) => (
+                    <div key={metric.label} className="flex flex-col">
+                      <span className={`text-base font-semibold ${metric.accentClass ?? ""}`.trim()}>
+                        {formatMetricValue(metric.value)}
+                      </span>
+                      <span className="text-xs text-muted-foreground">{metric.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </CardContent>
           </Card>
 

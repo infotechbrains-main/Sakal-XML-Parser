@@ -5,6 +5,7 @@ import { Worker } from "worker_threads"
 import { getPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
+import { scanLocalDirectoryForAssets } from "@/lib/media-stats"
 
 interface ProcessingStats {
   totalFiles: number
@@ -14,6 +15,15 @@ interface ProcessingStats {
   recordsWritten: number
   filteredFiles: number
   movedFiles: number
+  totalMediaFiles: number
+  mediaFilesMatched: number
+  localMediaFilesMatched: number
+  remoteMediaFilesMatched: number
+  mediaFilesUnmatched: number
+  xmlFilesWithMedia: number
+  xmlFilesMissingMedia: number
+  xmlProcessedWithoutMedia: number
+  mediaCountsByExtension: Record<string, number>
 }
 
 interface WorkerResult {
@@ -98,8 +108,11 @@ export async function POST(request: NextRequest) {
           console.log(`[Stream API] Processing mode: ${isRemote ? "Remote" : "Local"}`)
         }
 
-        // Find all XML files (local or remote)
-        let xmlFiles: any[] = []
+        // Find all XML files (local or remote) and collect media stats
+        let xmlFiles: string[] = []
+        let mediaFiles: string[] = []
+        let mediaCountsByExtension: Record<string, number> = {}
+        let scanWarnings: string[] = []
 
         if (isRemote) {
           sendMessage("log", `Scanning remote directory: ${rootDir}`)
@@ -129,7 +142,15 @@ export async function POST(request: NextRequest) {
             return
           }
         } else {
-          xmlFiles = await findXMLFiles(rootDir)
+          const scanResult = await scanLocalDirectoryForAssets(path.resolve(rootDir))
+          xmlFiles = scanResult.xmlFiles
+          mediaFiles = scanResult.mediaFiles
+          mediaCountsByExtension = scanResult.mediaCountsByExtension
+          scanWarnings = scanResult.errors
+
+          if (scanWarnings.length > 0) {
+            console.warn("[Stream API] Directory scan completed with warnings:", scanWarnings)
+          }
         }
 
         if (xmlFiles.length === 0) {
@@ -146,6 +167,47 @@ export async function POST(request: NextRequest) {
           recordsWritten: 0,
           filteredFiles: 0,
           movedFiles: 0,
+          totalMediaFiles: mediaFiles.length,
+          mediaFilesMatched: 0,
+          localMediaFilesMatched: 0,
+          remoteMediaFilesMatched: 0,
+          mediaFilesUnmatched: mediaFiles.length,
+          xmlFilesWithMedia: 0,
+          xmlFilesMissingMedia: xmlFiles.length,
+          xmlProcessedWithoutMedia: 0,
+          mediaCountsByExtension,
+        }
+
+        const matchedLocalMediaPaths = new Set<string>()
+        let remoteMediaMatches = 0
+
+        const updateMediaStatsFromRecord = (record: any) => {
+          if (!record) return
+
+          const imageExistsValue =
+            typeof record.imageExists === "string"
+              ? record.imageExists.toLowerCase() === "yes"
+              : Boolean(record.imageExists)
+
+          if (imageExistsValue) {
+            stats.xmlFilesWithMedia++
+            const imagePath = typeof record.imagePath === "string" ? record.imagePath : ""
+            if (imagePath) {
+              if (imagePath.startsWith("http://") || imagePath.startsWith("https://")) {
+                remoteMediaMatches++
+              } else {
+                matchedLocalMediaPaths.add(path.normalize(imagePath))
+              }
+            }
+          } else {
+            stats.xmlProcessedWithoutMedia++
+          }
+
+          stats.localMediaFilesMatched = matchedLocalMediaPaths.size
+          stats.remoteMediaFilesMatched = remoteMediaMatches
+          stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
+          stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+          stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
         }
 
         // Determine output path - handle both absolute and relative paths
@@ -175,7 +237,7 @@ export async function POST(request: NextRequest) {
           startTime: new Date().toISOString(),
           status: "running" as const,
           config: {
-            rootDir,
+            rootDir: path.resolve(rootDir),
             outputFile: outputPath,
             numWorkers,
             verbose,
@@ -189,6 +251,11 @@ export async function POST(request: NextRequest) {
             successCount: 0,
             errorCount: 0,
             processedFilesList: [] as string[],
+            mediaFilesTotal: stats.totalMediaFiles,
+            mediaFilesMatched: 0,
+            mediaFilesUnmatched: stats.totalMediaFiles,
+            xmlFilesWithMedia: 0,
+            xmlFilesMissingMedia: stats.totalFiles,
           },
         }
 
@@ -292,15 +359,22 @@ export async function POST(request: NextRequest) {
             })
 
             // Update session status to paused
-            await history.updateSession(sessionId, {
-              status: "paused",
-              progress: {
-                totalFiles: stats.totalFiles,
-                processedFiles: stats.processedFiles,
-                successCount: stats.successfulFiles,
-                errorCount: stats.errorFiles,
-              },
-            })
+            if (sessionId) {
+              await history.updateSession(sessionId, {
+                status: "paused",
+                progress: {
+                  totalFiles: stats.totalFiles,
+                  processedFiles: stats.processedFiles,
+                  successCount: stats.successfulFiles,
+                  errorCount: stats.errorFiles,
+                  mediaFilesTotal: stats.totalMediaFiles,
+                  mediaFilesMatched: stats.mediaFilesMatched,
+                  mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                  xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                  xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                },
+              })
+            }
 
             break
           }
@@ -351,6 +425,7 @@ export async function POST(request: NextRequest) {
                   stats.processedFiles++
                   stats.successfulFiles++
                   stats.recordsWritten++
+                  updateMediaStatsFromRecord(result.record)
 
                   // Append to CSV file
                   const csvLine =
@@ -379,16 +454,23 @@ export async function POST(request: NextRequest) {
               }
 
               // Update session with current progress
-              await history.updateSession(sessionId, {
-                status:
-                  midProcessPauseState.shouldStop || midProcessPauseState.stopRequested ? "interrupted" : "paused",
-                progress: {
-                  totalFiles: stats.totalFiles,
-                  processedFiles: stats.processedFiles,
-                  successCount: stats.successfulFiles,
-                  errorCount: stats.errorFiles,
-                },
-              })
+              if (sessionId) {
+                await history.updateSession(sessionId, {
+                  status:
+                    midProcessPauseState.shouldStop || midProcessPauseState.stopRequested ? "interrupted" : "paused",
+                  progress: {
+                    totalFiles: stats.totalFiles,
+                    processedFiles: stats.processedFiles,
+                    successCount: stats.successfulFiles,
+                    errorCount: stats.errorFiles,
+                    mediaFilesTotal: stats.totalMediaFiles,
+                    mediaFilesMatched: stats.mediaFilesMatched,
+                    mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                    xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                    xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                  },
+                })
+              }
 
               wasInterrupted = true
               if (midProcessPauseState.shouldStop || midProcessPauseState.stopRequested) {
@@ -417,6 +499,7 @@ export async function POST(request: NextRequest) {
               if (result.record) {
                 stats.successfulFiles++
                 stats.recordsWritten++
+                updateMediaStatsFromRecord(result.record)
 
                 // Append to CSV file
                 const csvLine =
@@ -444,7 +527,7 @@ export async function POST(request: NextRequest) {
                 }
               }
 
-              if (!result.passedFilter) {
+                  if (!result.passedFilter) {
                 stats.filteredFiles++
                 if (verbose) {
                   sendMessage("log", `File filtered out: ${result.workerId}`)
@@ -461,14 +544,21 @@ export async function POST(request: NextRequest) {
 
             // Update session progress periodically
             if (stats.processedFiles % 50 === 0 || stats.processedFiles === stats.totalFiles) {
-              await history.updateSession(sessionId, {
-                progress: {
-                  totalFiles: stats.totalFiles,
-                  processedFiles: stats.processedFiles,
-                  successCount: stats.successfulFiles,
-                  errorCount: stats.errorFiles,
-                },
-              })
+              if (sessionId) {
+                await history.updateSession(sessionId, {
+                  progress: {
+                    totalFiles: stats.totalFiles,
+                    processedFiles: stats.processedFiles,
+                    successCount: stats.successfulFiles,
+                    errorCount: stats.errorFiles,
+                    mediaFilesTotal: stats.totalMediaFiles,
+                    mediaFilesMatched: stats.mediaFilesMatched,
+                    mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                    xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                    xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                  },
+                })
+              }
             }
 
             // Cleanup workers
@@ -498,6 +588,14 @@ export async function POST(request: NextRequest) {
                 processedFiles: stats.processedFiles,
                 successCount: stats.successfulFiles,
                 errorCount: stats.errorFiles,
+                totalMediaFiles: stats.totalMediaFiles,
+                mediaFilesMatched: stats.mediaFilesMatched,
+                localMediaFilesMatched: stats.localMediaFilesMatched,
+                remoteMediaFilesMatched: stats.remoteMediaFilesMatched,
+                mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
               },
             })
 
@@ -564,23 +662,55 @@ export async function POST(request: NextRequest) {
         }
         activeWorkers.clear()
 
+        // Ensure derived stats are up to date before persisting
+        stats.localMediaFilesMatched = matchedLocalMediaPaths.size
+        stats.remoteMediaFilesMatched = remoteMediaMatches
+        stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
+        stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+        stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
+
         // Update final session status
         const finalStatus = wasInterrupted ? "interrupted" : "completed"
         const endTime = new Date().toISOString()
 
-        await history.updateSession(sessionId, {
-          status: finalStatus,
-          endTime,
-          progress: {
-            totalFiles: stats.totalFiles,
-            processedFiles: stats.processedFiles,
-            successCount: stats.successfulFiles,
-            errorCount: stats.errorFiles,
-          },
-          results: {
-            outputPath,
-          },
-        })
+        if (sessionId) {
+          await history.updateSession(sessionId, {
+            status: finalStatus,
+            endTime,
+            progress: {
+              totalFiles: stats.totalFiles,
+              processedFiles: stats.processedFiles,
+              successCount: stats.successfulFiles,
+              errorCount: stats.errorFiles,
+              mediaFilesTotal: stats.totalMediaFiles,
+              mediaFilesMatched: stats.mediaFilesMatched,
+              mediaFilesUnmatched: stats.mediaFilesUnmatched,
+              xmlFilesWithMedia: stats.xmlFilesWithMedia,
+              xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+            },
+            results: {
+              outputPath,
+              stats: {
+                totalFiles: stats.totalFiles,
+                processedFiles: stats.processedFiles,
+                successfulFiles: stats.successfulFiles,
+                errorFiles: stats.errorFiles,
+                recordsWritten: stats.recordsWritten,
+                filteredFiles: stats.filteredFiles,
+                movedFiles: stats.movedFiles,
+                totalMediaFiles: stats.totalMediaFiles,
+                mediaFilesMatched: stats.mediaFilesMatched,
+                localMediaFilesMatched: stats.localMediaFilesMatched,
+                remoteMediaFilesMatched: stats.remoteMediaFilesMatched,
+                mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
+                mediaCountsByExtension: stats.mediaCountsByExtension,
+              },
+            },
+          })
+        }
 
         // Clear current session
         await history.setCurrentSession(null)
@@ -600,6 +730,7 @@ export async function POST(request: NextRequest) {
             stats,
             outputFile: outputPath,
             message: completionMessage,
+            scanWarnings,
           })
         }
       } catch (error) {

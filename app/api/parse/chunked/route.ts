@@ -5,6 +5,7 @@ import { Worker } from "worker_threads"
 import { getPauseState, resetPauseState } from "../pause/route"
 import { PersistentHistory } from "@/lib/persistent-history"
 import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
+import { scanLocalDirectoryForAssets } from "@/lib/media-stats"
 
 interface ProcessingStats {
   totalFiles: number
@@ -14,6 +15,15 @@ interface ProcessingStats {
   recordsWritten: number
   filteredFiles: number
   movedFiles: number
+  totalMediaFiles: number
+  mediaFilesMatched: number
+  localMediaFilesMatched: number
+  remoteMediaFilesMatched: number
+  mediaFilesUnmatched: number
+  xmlFilesWithMedia: number
+  xmlFilesMissingMedia: number
+  xmlProcessedWithoutMedia: number
+  mediaCountsByExtension: Record<string, number>
 }
 
 interface WorkerResult {
@@ -139,7 +149,10 @@ export async function POST(request: NextRequest) {
 
         // Check if this is a remote path
         const isRemote = await isRemotePath(rootDir)
-        let xmlFiles: string[] = []
+  let xmlFiles: string[] = []
+  let mediaFiles: string[] = []
+  let mediaCountsByExtension: Record<string, number> = {}
+  let scanWarnings: string[] = []
 
         if (isRemote) {
           sendMessage("log", "Scanning remote directory for XML files...")
@@ -188,8 +201,17 @@ export async function POST(request: NextRequest) {
           }
         } else {
           // Local file processing
-          sendMessage("log", "Scanning local directory for XML files...")
-          xmlFiles = await findXMLFiles(rootDir)
+          sendMessage("log", "Scanning local directory for XML and media files...")
+          const scanResult = await scanLocalDirectoryForAssets(path.resolve(rootDir))
+          xmlFiles = scanResult.xmlFiles
+          mediaFiles = scanResult.mediaFiles
+          mediaCountsByExtension = scanResult.mediaCountsByExtension
+          scanWarnings = scanResult.errors
+
+          if (scanWarnings.length > 0) {
+            console.warn("[Chunked API] Directory scan completed with warnings:", scanWarnings)
+            scanWarnings.forEach((warning) => sendMessage("log", `Scan warning: ${warning}`))
+          }
         }
 
         if (xmlFiles.length === 0) {
@@ -207,6 +229,47 @@ export async function POST(request: NextRequest) {
           recordsWritten: 0,
           filteredFiles: 0,
           movedFiles: 0,
+          totalMediaFiles: mediaFiles.length,
+          mediaFilesMatched: 0,
+          localMediaFilesMatched: 0,
+          remoteMediaFilesMatched: 0,
+          mediaFilesUnmatched: mediaFiles.length,
+          xmlFilesWithMedia: 0,
+          xmlFilesMissingMedia: xmlFiles.length,
+          xmlProcessedWithoutMedia: 0,
+          mediaCountsByExtension,
+        }
+
+        const matchedLocalMediaPaths = new Set<string>()
+        let remoteMediaMatches = 0
+
+        const updateMediaStatsFromRecord = (record: any) => {
+          if (!record) return
+
+          const imageExistsValue =
+            typeof record.imageExists === "string"
+              ? record.imageExists.toLowerCase() === "yes"
+              : Boolean(record.imageExists)
+
+          if (imageExistsValue) {
+            stats.xmlFilesWithMedia++
+            const imagePath = typeof record.imagePath === "string" ? record.imagePath : ""
+            if (imagePath) {
+              if (imagePath.startsWith("http://") || imagePath.startsWith("https://")) {
+                remoteMediaMatches++
+              } else {
+                matchedLocalMediaPaths.add(path.normalize(imagePath))
+              }
+            }
+          } else {
+            stats.xmlProcessedWithoutMedia++
+          }
+
+          stats.localMediaFilesMatched = matchedLocalMediaPaths.size
+          stats.remoteMediaFilesMatched = remoteMediaMatches
+          stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
+          stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+          stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
         }
 
         // Determine output path
@@ -252,7 +315,7 @@ export async function POST(request: NextRequest) {
           startTime: new Date().toISOString(),
           status: "running" as const,
           config: {
-            rootDir,
+            rootDir: path.resolve(rootDir),
             outputFile: outputPath,
             chunkSize,
             pauseDuration,
@@ -267,6 +330,11 @@ export async function POST(request: NextRequest) {
             successCount: 0,
             errorCount: 0,
             processedFilesList: [] as string[],
+            mediaFilesTotal: stats.totalMediaFiles,
+            mediaFilesMatched: 0,
+            mediaFilesUnmatched: stats.totalMediaFiles,
+            xmlFilesWithMedia: 0,
+            xmlFilesMissingMedia: stats.totalFiles,
           },
         }
 
@@ -370,15 +438,22 @@ export async function POST(request: NextRequest) {
             processingState.pauseTime = new Date().toISOString()
             await saveProcessingState(processingState)
 
-            await history.updateSession(sessionId, {
-              status: "paused",
-              progress: {
-                totalFiles: stats.totalFiles,
-                processedFiles: stats.processedFiles,
-                successCount: stats.successfulFiles,
-                errorCount: stats.errorFiles,
-              },
-            })
+            if (sessionId) {
+              await history.updateSession(sessionId, {
+                status: "paused",
+                progress: {
+                  totalFiles: stats.totalFiles,
+                  processedFiles: stats.processedFiles,
+                  successCount: stats.successfulFiles,
+                  errorCount: stats.errorFiles,
+                  mediaFilesTotal: stats.totalMediaFiles,
+                  mediaFilesMatched: stats.mediaFilesMatched,
+                  mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                  xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                  xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                },
+              })
+            }
 
             sendMessage("paused", {
               message: "Processing paused - state saved",
@@ -429,7 +504,7 @@ export async function POST(request: NextRequest) {
               activeWorkers.clear()
 
               // Process results we got before interruption
-              await processChunkResults(chunkResults, outputPath, stats, verbose)
+              await processChunkResults(chunkResults, outputPath, stats, verbose, updateMediaStatsFromRecord)
 
               processingState.stats = stats
               processingState.pauseTime = new Date().toISOString()
@@ -460,21 +535,28 @@ export async function POST(request: NextRequest) {
             }
 
             // Process results normally
-            await processChunkResults(chunkResults, outputPath, stats, verbose)
+            await processChunkResults(chunkResults, outputPath, stats, verbose, updateMediaStatsFromRecord)
 
             processingState.stats = stats
             processingState.processedChunks.push(chunk)
             await saveProcessingState(processingState)
 
             // Update session progress
-            await history.updateSession(sessionId, {
-              progress: {
-                totalFiles: stats.totalFiles,
-                processedFiles: stats.processedFiles,
-                successCount: stats.successfulFiles,
-                errorCount: stats.errorFiles,
-              },
-            })
+            if (sessionId) {
+              await history.updateSession(sessionId, {
+                progress: {
+                  totalFiles: stats.totalFiles,
+                  processedFiles: stats.processedFiles,
+                  successCount: stats.successfulFiles,
+                  errorCount: stats.errorFiles,
+                  mediaFilesTotal: stats.totalMediaFiles,
+                  mediaFilesMatched: stats.mediaFilesMatched,
+                  mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                  xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                  xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                },
+              })
+            }
 
             // Cleanup workers
             for (const worker of activeWorkers) {
@@ -502,6 +584,20 @@ export async function POST(request: NextRequest) {
               moved: stats.movedFiles,
               currentChunk: chunkIndex + 1,
               totalChunks,
+              stats: {
+                totalFiles: stats.totalFiles,
+                processedFiles: stats.processedFiles,
+                successCount: stats.successfulFiles,
+                errorCount: stats.errorFiles,
+                totalMediaFiles: stats.totalMediaFiles,
+                mediaFilesMatched: stats.mediaFilesMatched,
+                localMediaFilesMatched: stats.localMediaFilesMatched,
+                remoteMediaFilesMatched: stats.remoteMediaFilesMatched,
+                mediaFilesUnmatched: stats.mediaFilesUnmatched,
+                xmlFilesWithMedia: stats.xmlFilesWithMedia,
+                xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
+              },
             })
 
             if (verbose) {
@@ -577,19 +673,52 @@ export async function POST(request: NextRequest) {
         const finalStatus = wasInterrupted ? "interrupted" : "completed"
         const endTime = new Date().toISOString()
 
-        await history.updateSession(sessionId, {
-          status: finalStatus,
-          endTime,
-          progress: {
-            totalFiles: stats.totalFiles,
-            processedFiles: stats.processedFiles,
-            successCount: stats.successfulFiles,
-            errorCount: stats.errorFiles,
-          },
-          results: {
-            outputPath,
-          },
-        })
+        stats.localMediaFilesMatched = matchedLocalMediaPaths.size
+        stats.remoteMediaFilesMatched = remoteMediaMatches
+        stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
+        stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+        stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
+
+        const statsSummary = {
+          totalFiles: stats.totalFiles,
+          processedFiles: stats.processedFiles,
+          successfulFiles: stats.successfulFiles,
+          errorFiles: stats.errorFiles,
+          recordsWritten: stats.recordsWritten,
+          filteredFiles: stats.filteredFiles,
+          movedFiles: stats.movedFiles,
+          totalMediaFiles: stats.totalMediaFiles,
+          mediaFilesMatched: stats.mediaFilesMatched,
+          localMediaFilesMatched: stats.localMediaFilesMatched,
+          remoteMediaFilesMatched: stats.remoteMediaFilesMatched,
+          mediaFilesUnmatched: stats.mediaFilesUnmatched,
+          xmlFilesWithMedia: stats.xmlFilesWithMedia,
+          xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+          xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
+          mediaCountsByExtension: stats.mediaCountsByExtension,
+        }
+
+        if (sessionId) {
+          await history.updateSession(sessionId, {
+            status: finalStatus,
+            endTime,
+            progress: {
+              totalFiles: stats.totalFiles,
+              processedFiles: stats.processedFiles,
+              successCount: stats.successfulFiles,
+              errorCount: stats.errorFiles,
+              mediaFilesTotal: stats.totalMediaFiles,
+              mediaFilesMatched: stats.mediaFilesMatched,
+              mediaFilesUnmatched: stats.mediaFilesUnmatched,
+              xmlFilesWithMedia: stats.xmlFilesWithMedia,
+              xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+            },
+            results: {
+              outputPath,
+              stats: statsSummary,
+            },
+          })
+        }
 
         await history.setCurrentSession(null)
 
@@ -608,6 +737,7 @@ export async function POST(request: NextRequest) {
             stats,
             outputFile: outputPath,
             message: completionMessage,
+            scanWarnings,
           })
         }
       } catch (error) {
@@ -656,6 +786,7 @@ async function processChunkResults(
   outputPath: string,
   stats: ProcessingStats,
   verbose: boolean,
+  updateMediaStatsFromRecord: (record: any) => void,
 ): Promise<void> {
   for (const result of chunkResults) {
     stats.processedFiles++
@@ -663,6 +794,7 @@ async function processChunkResults(
     if (result.record) {
       stats.successfulFiles++
       stats.recordsWritten++
+      updateMediaStatsFromRecord(result.record)
 
       const csvLine =
         Object.values(result.record)

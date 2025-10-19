@@ -4,6 +4,7 @@ import path from "path"
 import { createObjectCsvWriter } from "csv-writer"
 import { Worker } from "worker_threads"
 import { PersistentHistory } from "@/lib/persistent-history"
+import { scanLocalDirectoryForAssets } from "@/lib/media-stats"
 
 export const CSV_HEADERS = [
   { id: "city", title: "City" },
@@ -47,27 +48,6 @@ export const CSV_HEADERS = [
 
 const history = new PersistentHistory()
 
-async function findXmlFilesManually(rootDir: string): Promise<string[]> {
-  const xmlFiles: string[] = []
-  async function traverse(dir: string) {
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true })
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name)
-        if (entry.isDirectory()) {
-          await traverse(fullPath)
-        } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".xml")) {
-          xmlFiles.push(fullPath)
-        }
-      }
-    } catch (error) {
-      console.log(`Error traversing ${dir}:`, error)
-    }
-  }
-  await traverse(rootDir)
-  return xmlFiles
-}
-
 export async function POST(request: NextRequest) {
   let sessionId: string | null = null
 
@@ -94,31 +74,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Move destination path is required when moving images." }, { status: 400 })
     }
 
+    const normalizedRootDir = path.resolve(rootDir)
+
     // Create full output path - FIXED: Use full path including output folder
     const fullOutputPath = outputFolder ? path.join(outputFolder, outputFile) : outputFile
     const outputPath = path.resolve(fullOutputPath)
-
-    // Create initial session record
-    const session = {
-      id: sessionId,
-      startTime: new Date().toISOString(),
-      status: "running" as const,
-      config: {
-        rootDir,
-        outputFile: outputPath, // Store full path in session
-        numWorkers,
-        verbose,
-        filterConfig,
-        processingMode: "regular",
-      },
-      progress: {
-        totalFiles: 0,
-        processedFiles: 0,
-        successCount: 0,
-        errorCount: 0,
-        processedFilesList: [] as string[],
-      },
-    }
 
     // Ensure output directory exists
     if (outputFolder) {
@@ -133,13 +93,22 @@ export async function POST(request: NextRequest) {
 
     console.log("Output path:", outputPath)
 
-    console.log("Searching for XML files...")
-    const xmlFiles = await findXmlFilesManually(rootDir)
-    console.log(`Found ${xmlFiles.length} XML files`)
+    console.log("Scanning directory for XML and media files...")
+    const { xmlFiles, mediaFiles, mediaCountsByExtension, errors: scanErrors } = await scanLocalDirectoryForAssets(
+      normalizedRootDir,
+    )
+
+    if (scanErrors.length > 0) {
+      console.warn("Directory scan completed with warnings:", scanErrors)
+    }
+
+    console.log(
+      `Found ${xmlFiles.length} XML files and ${mediaFiles.length} media files in ${normalizedRootDir}`,
+    )
 
     if (xmlFiles.length === 0) {
       try {
-        const dirContents = await fs.readdir(rootDir, { recursive: true })
+        const dirContents = await fs.readdir(normalizedRootDir, { recursive: true })
         const allFiles = dirContents.map((f) => f.toString())
         const xmlInDir = allFiles.filter((file) => file.toLowerCase().endsWith(".xml"))
         const sampleFiles = allFiles.slice(0, 20)
@@ -147,7 +116,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(
           {
             error: "No XML files found",
-            message: `Searched in: ${rootDir}`,
+            message: `Searched in: ${normalizedRootDir}`,
             debug: {
               totalFiles: allFiles.length,
               xmlFiles: xmlInDir.length,
@@ -161,15 +130,40 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(
           {
             error: "Directory read error",
-            message: `Could not read directory: ${rootDir}`,
+            message: `Could not read directory: ${normalizedRootDir}`,
           },
           { status: 404 },
         )
       }
     }
 
-    // Update session with total files and save
-    session.progress.totalFiles = xmlFiles.length
+    // Create initial session record with discovered counts
+    const session = {
+      id: sessionId,
+      startTime: new Date().toISOString(),
+      status: "running" as const,
+      config: {
+        rootDir: normalizedRootDir,
+        outputFile: outputPath, // Store full path in session
+        numWorkers,
+        verbose,
+        filterConfig,
+        processingMode: "regular",
+      },
+      progress: {
+        totalFiles: xmlFiles.length,
+        processedFiles: 0,
+        successCount: 0,
+        errorCount: 0,
+        processedFilesList: [] as string[],
+        mediaFilesTotal: mediaFiles.length,
+        mediaFilesMatched: 0,
+        mediaFilesUnmatched: mediaFiles.length,
+        xmlFilesWithMedia: 0,
+        xmlFilesMissingMedia: xmlFiles.length,
+      },
+    }
+
     await history.addSession(session)
     await history.setCurrentSession(session)
 
@@ -178,14 +172,19 @@ export async function POST(request: NextRequest) {
       console.log(`[Regular API] Output path: ${outputPath}`)
     }
 
-    const allRecords: any[] = []
-    let processedCount = 0
-    let successCount = 0
-    let errorCount = 0
-    let filteredCount = 0
-    let movedCount = 0
+  const allRecords: any[] = []
+  let processedCount = 0
+  let successCount = 0
+  let errorCount = 0
+  let filteredCount = 0
+  let movedCount = 0
+  let remoteMediaMatches = 0
+  let xmlWithMediaCount = 0
+  let xmlProcessedWithoutMediaCount = 0
     const errors: string[] = []
     const activeWorkers = new Set<Worker>()
+  const totalMediaFiles = mediaFiles.length
+  const matchedLocalMediaPaths = new Set<string>()
 
     console.log(`Starting to process ${xmlFiles.length} XML files with ${numWorkers} worker(s)`)
     if (filterConfig?.enabled) {
@@ -229,7 +228,7 @@ export async function POST(request: NextRequest) {
             workerData: {
               xmlFilePath: currentFile,
               filterConfig,
-              originalRootDir: rootDir,
+              originalRootDir: normalizedRootDir,
               workerId,
               verbose,
             },
@@ -240,11 +239,34 @@ export async function POST(request: NextRequest) {
 
           worker.on("message", (result: any) => {
             processedCount++
-            if (result.record) {
-              allRecords.push(result.record)
+            const record = result.record
+
+            if (record) {
+              allRecords.push(record)
               successCount++
+
+              const imageExistsValue =
+                typeof record.imageExists === "string"
+                  ? record.imageExists.toLowerCase() === "yes"
+                  : Boolean(record.imageExists)
+
+              if (imageExistsValue) {
+                xmlWithMediaCount++
+                const imagePath = typeof record.imagePath === "string" ? record.imagePath : ""
+
+                if (imagePath) {
+                  if (imagePath.startsWith("http://") || imagePath.startsWith("https://")) {
+                    remoteMediaMatches++
+                  } else {
+                    matchedLocalMediaPaths.add(path.normalize(imagePath))
+                  }
+                }
+              } else {
+                xmlProcessedWithoutMediaCount++
+              }
             }
-            if (result.passedFilter && result.record) {
+
+            if (result.passedFilter && record) {
               filteredCount++
             }
             if (result.imageMoved) {
@@ -266,14 +288,24 @@ export async function POST(request: NextRequest) {
               lastProgressReport = processedCount
 
               // Update session progress
-              history.updateSession(sessionId, {
-                progress: {
-                  totalFiles: xmlFiles.length,
-                  processedFiles: processedCount,
-                  successCount: successCount,
-                  errorCount: errorCount,
-                },
-              })
+              const mediaFilesMatchedCount = matchedLocalMediaPaths.size + remoteMediaMatches
+              const mediaFilesUnmatched = Math.max(totalMediaFiles - matchedLocalMediaPaths.size, 0)
+
+              if (sessionId) {
+                history.updateSession(sessionId, {
+                  progress: {
+                    totalFiles: xmlFiles.length,
+                    processedFiles: processedCount,
+                    successCount: successCount,
+                    errorCount: errorCount,
+                    mediaFilesTotal: totalMediaFiles,
+                    mediaFilesMatched: mediaFilesMatchedCount,
+                    mediaFilesUnmatched,
+                    xmlFilesWithMedia: xmlWithMediaCount,
+                    xmlFilesMissingMedia: Math.max(xmlFiles.length - xmlWithMediaCount, 0),
+                  },
+                })
+              }
             }
 
             activeWorkers.delete(worker)
@@ -329,21 +361,53 @@ export async function POST(request: NextRequest) {
       console.log("No records to write to CSV")
     }
 
+    const localMediaMatchedCount = matchedLocalMediaPaths.size
+    const mediaFilesMatchedCount = localMediaMatchedCount + remoteMediaMatches
+    const mediaFilesUnmatched = Math.max(totalMediaFiles - localMediaMatchedCount, 0)
+    const xmlFilesMissingMedia = Math.max(xmlFiles.length - xmlWithMediaCount, 0)
+
+    const statsSummary = {
+      totalFiles: xmlFiles.length,
+      processedFiles: processedCount,
+      successfulFiles: successCount,
+      errorFiles: errorCount,
+      recordsWritten: allRecords.length,
+      filteredFiles: filteredCount,
+      movedFiles: movedCount,
+      totalMediaFiles,
+      mediaFilesMatched: mediaFilesMatchedCount,
+      localMediaFilesMatched: localMediaMatchedCount,
+      remoteMediaFilesMatched: remoteMediaMatches,
+      mediaFilesUnmatched,
+      xmlFilesWithMedia: xmlWithMediaCount,
+      xmlFilesMissingMedia,
+      xmlProcessedWithoutMedia: xmlProcessedWithoutMediaCount,
+      mediaCountsByExtension,
+    }
+
     // Update final session status
     const endTime = new Date().toISOString()
-    await history.updateSession(sessionId, {
-      status: "completed",
-      endTime,
-      progress: {
-        totalFiles: xmlFiles.length,
-        processedFiles: processedCount,
-        successCount: successCount,
-        errorCount: errorCount,
-      },
-      results: {
-        outputPath,
-      },
-    })
+    if (sessionId) {
+      await history.updateSession(sessionId, {
+        status: "completed",
+        endTime,
+        progress: {
+          totalFiles: xmlFiles.length,
+          processedFiles: processedCount,
+          successCount: successCount,
+          errorCount: errorCount,
+          mediaFilesTotal: totalMediaFiles,
+          mediaFilesMatched: mediaFilesMatchedCount,
+          mediaFilesUnmatched,
+          xmlFilesWithMedia: xmlWithMediaCount,
+          xmlFilesMissingMedia,
+        },
+        results: {
+          outputPath,
+          stats: statsSummary,
+        },
+      })
+    }
 
     // Clear current session
     await history.setCurrentSession(null)
@@ -355,19 +419,12 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      stats: {
-        totalFiles: xmlFiles.length,
-        processedFiles: processedCount,
-        successfulFiles: successCount,
-        errorFiles: errorCount,
-        recordsWritten: allRecords.length,
-        filteredFiles: filteredCount,
-        movedFiles: movedCount,
-      },
+      stats: statsSummary,
       outputFile: path.basename(outputPath),
       errors: verbose ? errors : errors.slice(0, 10),
+      scanWarnings: scanErrors,
     })
-  } catch (error) {
+  } catch (error: unknown) {
     console.error("Error in parse API:", error)
 
     // Update session with error status
