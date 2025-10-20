@@ -170,22 +170,37 @@ export async function POST(request: NextRequest) {
 
           try {
             // Enhanced scanning with better progress reporting
-            const remoteFiles = await scanRemoteDirectory(
+            const remoteScan = await scanRemoteDirectory(
               rootDir,
               (message) => {
                 sendMessage("log", message)
                 console.log(`[Remote Scanner] ${message}`)
               },
-              5, // Increased max depth to 5 for city/year/month/processed structure
+              {
+                maxDepth: 5, // City/year/month/processed structure
+                includeMedia: true,
+              },
             )
 
-            xmlFiles = remoteFiles.map((file) => file.url)
+            xmlFiles = remoteScan.xmlFiles.map((file) => file.url)
+            mediaFiles = remoteScan.mediaFiles.map((file) => file.url)
+            mediaCountsByExtension = remoteScan.mediaCountsByExtension
+            scanWarnings = remoteScan.warnings
 
-            if (verbose) {
-              console.log(`[Chunked API] Found ${xmlFiles.length} remote XML files`)
+            if (scanWarnings.length > 0) {
+              scanWarnings.forEach((warning) => sendMessage("log", `Scan warning: ${warning}`))
             }
 
-            sendMessage("log", `Found ${xmlFiles.length} XML files in remote directory`)
+            if (verbose) {
+              console.log(
+                `[Chunked API] Found ${xmlFiles.length} remote XML files and ${mediaFiles.length} media files`,
+              )
+            }
+
+            sendMessage(
+              "log",
+              `Found ${xmlFiles.length} XML files and ${mediaFiles.length} media files in remote directory`,
+            )
 
             if (xmlFiles.length === 0) {
               sendMessage("log", "No XML files found. This could be due to:")
@@ -282,7 +297,7 @@ export async function POST(request: NextRequest) {
           stats.localMediaFilesMatched = matchedLocalMediaPaths.size
           stats.remoteMediaFilesMatched = remoteMediaMatches
           stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
-          stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+          stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - stats.mediaFilesMatched, 0)
           stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
         }
 
@@ -724,7 +739,7 @@ export async function POST(request: NextRequest) {
         // Clear processing state file on successful completion
         await clearProcessingState()
 
-  if (!wasInterrupted && !isRemote) {
+        if (!wasInterrupted && !isRemote) {
           const noXmlResult = await processImagesWithoutXml({
             rootDir: path.resolve(rootDir),
             mediaFiles,
@@ -770,7 +785,7 @@ export async function POST(request: NextRequest) {
         stats.localMediaFilesMatched = matchedLocalMediaPaths.size
         stats.remoteMediaFilesMatched = remoteMediaMatches
         stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
-        stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+        stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - stats.mediaFilesMatched, 0)
         stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
 
         const statsSummary = {

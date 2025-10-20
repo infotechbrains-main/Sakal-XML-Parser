@@ -124,20 +124,36 @@ export async function POST(request: NextRequest) {
           sendMessage("log", `Scanning remote directory: ${rootDir}`)
 
           try {
-            const remoteFiles = await scanRemoteDirectory(rootDir, (message) => {
-              if (verbose) {
-                console.log(`[Stream API] Remote scan: ${message}`)
+            const remoteScan = await scanRemoteDirectory(
+              rootDir,
+              (message) => {
+                if (verbose) {
+                  console.log(`[Stream API] Remote scan: ${message}`)
+                }
                 sendMessage("log", `Remote scan: ${message}`)
-              }
-            })
+              },
+              {
+                maxDepth: 5,
+                includeMedia: true,
+              },
+            )
 
-            // Convert RemoteFile objects to file paths (URLs)
-            xmlFiles = remoteFiles.map((file) => file.url)
+            xmlFiles = remoteScan.xmlFiles.map((file) => file.url)
+            mediaFiles = remoteScan.mediaFiles.map((file) => file.url)
+            mediaCountsByExtension = remoteScan.mediaCountsByExtension
+            scanWarnings = remoteScan.warnings
+
+            if (scanWarnings.length > 0) {
+              console.warn("[Stream API] Remote scan completed with warnings:", scanWarnings)
+              scanWarnings.forEach((warning) => sendMessage("log", `Scan warning: ${warning}`))
+            }
 
             if (verbose) {
-              console.log(`[Stream API] Found ${xmlFiles.length} remote XML files`)
+              console.log(
+                `[Stream API] Found ${xmlFiles.length} remote XML files and ${mediaFiles.length} media files`,
+              )
               if (xmlFiles.length > 0) {
-                console.log(`[Stream API] Sample files:`, xmlFiles.slice(0, 3))
+                console.log(`[Stream API] Sample XML files:`, xmlFiles.slice(0, 3))
               }
             }
           } catch (error) {
@@ -216,7 +232,7 @@ export async function POST(request: NextRequest) {
           stats.localMediaFilesMatched = matchedLocalMediaPaths.size
           stats.remoteMediaFilesMatched = remoteMediaMatches
           stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
-          stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+          stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - stats.mediaFilesMatched, 0)
           stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
         }
 
@@ -680,7 +696,7 @@ export async function POST(request: NextRequest) {
         }
         activeWorkers.clear()
 
-  if (!wasInterrupted && !isRemote) {
+        if (!wasInterrupted && !isRemote) {
           const noXmlResult = await processImagesWithoutXml({
             rootDir: path.resolve(rootDir),
             mediaFiles,
@@ -723,7 +739,7 @@ export async function POST(request: NextRequest) {
         stats.localMediaFilesMatched = matchedLocalMediaPaths.size
         stats.remoteMediaFilesMatched = remoteMediaMatches
         stats.mediaFilesMatched = matchedLocalMediaPaths.size + remoteMediaMatches
-        stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - matchedLocalMediaPaths.size, 0)
+        stats.mediaFilesUnmatched = Math.max(stats.totalMediaFiles - stats.mediaFilesMatched, 0)
         stats.xmlFilesMissingMedia = Math.max(stats.totalFiles - stats.xmlFilesWithMedia, 0)
 
         // Update final session status

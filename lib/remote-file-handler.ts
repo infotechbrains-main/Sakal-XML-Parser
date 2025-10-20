@@ -4,6 +4,8 @@ import os from "os"
 import { createWriteStream } from "fs"
 import { pipeline } from "stream/promises"
 
+import { MEDIA_EXTENSIONS } from "./media-stats"
+
 export interface RemoteFile {
   name: string
   url: string
@@ -18,8 +20,25 @@ export interface RemoteDirectory {
   subdirectories: RemoteDirectory[]
 }
 
+interface DirectoryListingOptions {
+  allowedExtensions?: string[]
+}
+
+export interface RemoteDirectoryScanOptions {
+  maxDepth?: number
+  includeMedia?: boolean
+  mediaExtensions?: string[]
+}
+
+export interface RemoteDirectoryScanResult {
+  xmlFiles: RemoteFile[]
+  mediaFiles: RemoteFile[]
+  mediaCountsByExtension: Record<string, number>
+  warnings: string[]
+}
+
 export async function isRemotePath(filePath: string): Promise<boolean> {
-  return filePath && (filePath.startsWith("http://") || filePath.startsWith("https://"))
+  return Boolean(filePath && (filePath.startsWith("http://") || filePath.startsWith("https://")))
 }
 
 // Helper function to normalize URLs for comparison
@@ -61,6 +80,7 @@ function isWithinBasePath(baseUrl: string, targetUrl: string): boolean {
 export async function fetchDirectoryListing(
   url: string,
   baseUrl: string,
+  options: DirectoryListingOptions = {},
 ): Promise<{ files: RemoteFile[]; directories: string[] }> {
   try {
     // Normalize the URL to ensure it ends with /
@@ -87,6 +107,10 @@ export async function fetchDirectoryListing(
 
     const files: RemoteFile[] = []
     const directories: string[] = []
+
+    const normalizedExtensions = (options.allowedExtensions || [".xml"]).map((ext) => ext.toLowerCase())
+    const allowedExtensions = new Set(normalizedExtensions)
+    const allowAllExtensions = options.allowedExtensions == null || options.allowedExtensions.length === 0
 
     // Enhanced patterns for IIS directory listing
     const linkPatterns = [
@@ -170,9 +194,13 @@ export async function fetchDirectoryListing(
           } else {
             console.log(`Skipping directory ${dirName} - outside base path (${fullDirUrl} not within ${baseUrl})`)
           }
-        } else if (href.toLowerCase().endsWith(".xml")) {
-          // It's an XML file
+        } else {
           const fileName = path.basename(href)
+          const extension = path.extname(fileName).toLowerCase()
+
+          if (!allowAllExtensions && extension && !allowedExtensions.has(extension)) {
+            continue
+          }
 
           // Skip if already found
           if (files.some((f) => f.name === fileName)) continue
@@ -193,7 +221,7 @@ export async function fetchDirectoryListing(
               name: fileName,
               url: fullFileUrl,
             })
-            console.log(`Added XML file: ${fileName} -> ${fullFileUrl}`)
+            console.log(`Added file (${extension || "no-ext"}): ${fileName} -> ${fullFileUrl}`)
           } else {
             console.log(`Skipping file ${fileName} - outside base path`)
           }
@@ -206,9 +234,9 @@ export async function fetchDirectoryListing(
       }
     }
 
-    console.log(`Found ${files.length} XML files and ${directories.length} directories in bounds`)
+    console.log(`Found ${files.length} matching file(s) and ${directories.length} directories in bounds`)
     if (files.length > 0) {
-      console.log(`XML files found: ${files.map((f) => f.name).join(", ")}`)
+      console.log(`Files found: ${files.map((f) => f.name).join(", ")}`)
     }
     if (directories.length > 0) {
       console.log(
@@ -409,132 +437,161 @@ export async function scanTopLevelFolders(
   }
 }
 
-// Enhanced remote directory scanner with better city/year detection
+// Enhanced remote directory scanner with better city/year detection and media support
 export async function scanRemoteDirectory(
   baseUrl: string,
   onProgress?: (message: string) => void,
-  maxDepth = 5,
-): Promise<RemoteFile[]> {
+  options: RemoteDirectoryScanOptions = {},
+): Promise<RemoteDirectoryScanResult> {
+  const maxDepth = options.maxDepth ?? 5
+  const includeMedia = options.includeMedia ?? true
+
+  const mediaExtensionsFromOptions = options.mediaExtensions ?? Array.from(MEDIA_EXTENSIONS)
+  const normalizedMediaExtensions = Array.from(
+    new Set(
+      mediaExtensionsFromOptions
+        .map((ext) => ext.trim().toLowerCase())
+        .filter(Boolean)
+        .map((ext) => (ext.startsWith(".") ? ext : `.${ext}`)),
+    ),
+  )
+
+  const allowedExtensions = includeMedia ? [".xml", ...normalizedMediaExtensions] : [".xml"]
+
   const xmlFiles: RemoteFile[] = []
+  const mediaFiles: RemoteFile[] = []
+  const mediaCountsByExtension: Record<string, number> = {}
+  const warnings: string[] = []
   const visitedUrls = new Set<string>()
 
   async function scanDirectory(url: string, depth = 0): Promise<void> {
     const normalizedUrl = normalizeUrl(url)
 
-    if (depth > maxDepth || visitedUrls.has(normalizedUrl)) {
+    if (depth > maxDepth) {
+      warnings.push(`Max depth ${maxDepth} reached at ${normalizedUrl}`)
+      return
+    }
+
+    if (visitedUrls.has(normalizedUrl)) {
       return
     }
 
     visitedUrls.add(normalizedUrl)
 
     try {
-      if (onProgress) {
-        onProgress(`Scanning: ${normalizedUrl} (depth: ${depth})`)
-      }
+      onProgress?.(`Scanning: ${normalizedUrl} (depth: ${depth})`)
 
-      const { files, directories } = await fetchDirectoryListing(normalizedUrl, baseUrl)
+      const { files, directories } = await fetchDirectoryListing(normalizedUrl, baseUrl, {
+        allowedExtensions,
+      })
 
-      // Add XML files from current directory
+      let xmlFoundHere = 0
+
       for (const file of files) {
-        if (file.name.toLowerCase().endsWith(".xml")) {
+        const extension = path.extname(file.name).toLowerCase()
+
+        if (extension === ".xml") {
           xmlFiles.push(file)
-          if (onProgress) {
-            onProgress(`Found XML: ${file.name}`)
-          }
+          xmlFoundHere += 1
+          onProgress?.(`Found XML: ${file.name}`)
+          continue
         }
+
+        if (includeMedia && normalizedMediaExtensions.includes(extension)) {
+          mediaFiles.push(file)
+          mediaCountsByExtension[extension] = (mediaCountsByExtension[extension] || 0) + 1
+          onProgress?.(`Found media (${extension}): ${file.name}`)
+          continue
+        }
+
+        warnings.push(`Skipped unsupported file ${file.name} at ${normalizedUrl}`)
       }
 
-      // If we found XML files, we're likely in a 'processed' directory
-      if (files.length > 0) {
-        if (onProgress) {
-          onProgress(`Found ${files.length} XML files in ${normalizedUrl}, stopping deeper scan`)
-        }
-        return // Don't scan deeper if we found XML files
+      if (xmlFoundHere > 0) {
+        onProgress?.(
+          `Found ${xmlFoundHere} XML file(s) in ${normalizedUrl}, stopping deeper scan from this branch`,
+        )
+        return
       }
 
-      // Scan subdirectories with priority if we haven't reached max depth
-      if (depth < maxDepth && directories.length > 0) {
-        // Prioritize 'processed' directories
-        const processedDirs = directories.filter((dir) => dir.toLowerCase().includes("processed"))
+      if (depth >= maxDepth || directories.length === 0) {
+        return
+      }
 
-        // Then year directories (2010-2030)
-        const yearDirs = directories.filter((dir) => /^20[1-3][0-9]\/$/.test(dir))
+      const processedDirs = directories.filter((dir) => dir.toLowerCase().includes("processed"))
+      const yearDirs = directories.filter((dir) => /^20[1-3][0-9]\/$/.test(dir))
+      const monthDirs = directories.filter((dir) => /^(0[1-9]|1[0-2])\/$/.test(dir))
+      const cityDirs = directories.filter(
+        (dir) =>
+          /^[A-Z][a-zA-Z]+\/$/.test(dir) &&
+          !dir.toLowerCase().includes("processed") &&
+          !dir.toLowerCase().includes("media") &&
+          !dir.toLowerCase().includes("select") &&
+          !dir.toLowerCase().includes("default"),
+      )
+      const otherDirs = directories.filter(
+        (dir) =>
+          !processedDirs.includes(dir) &&
+          !yearDirs.includes(dir) &&
+          !monthDirs.includes(dir) &&
+          !cityDirs.includes(dir),
+      )
 
-        // Then month directories (01-12)
-        const monthDirs = directories.filter((dir) => /^(0[1-9]|1[0-2])\/$/.test(dir))
+      const prioritizedDirs = [...processedDirs, ...yearDirs, ...monthDirs, ...cityDirs, ...otherDirs]
 
-        // Then city directories (capitalized names, excluding system directories)
-        const cityDirs = directories.filter(
-          (dir) =>
-            /^[A-Z][a-zA-Z]+\/$/.test(dir) &&
-            !dir.toLowerCase().includes("processed") &&
-            !dir.toLowerCase().includes("media") &&
-            !dir.toLowerCase().includes("select") &&
-            !dir.toLowerCase().includes("default"),
-        )
+      onProgress?.(
+        `Found ${directories.length} directories to scan: ${prioritizedDirs.slice(0, 5).join(", ")}${
+          prioritizedDirs.length > 5 ? "..." : ""
+        }`,
+      )
 
-        // Other directories
-        const otherDirs = directories.filter(
-          (dir) =>
-            !processedDirs.includes(dir) &&
-            !yearDirs.includes(dir) &&
-            !monthDirs.includes(dir) &&
-            !cityDirs.includes(dir),
-        )
+      for (const dir of prioritizedDirs) {
+        const subUrl = normalizedUrl + dir
+        await scanDirectory(subUrl, depth + 1)
 
-        // Scan in priority order
-        const prioritizedDirs = [...processedDirs, ...yearDirs, ...monthDirs, ...cityDirs, ...otherDirs]
-
-        if (onProgress) {
-          onProgress(
-            `Found ${directories.length} directories to scan: ${prioritizedDirs.slice(0, 5).join(", ")}${prioritizedDirs.length > 5 ? "..." : ""}`,
+        if (depth === 0 && xmlFiles.length > 5000) {
+          warnings.push(
+            `Stopping scan early at root after collecting ${xmlFiles.length} XML files to avoid timeouts`,
           )
+          break
         }
 
-        for (const dir of prioritizedDirs) {
-          // Construct subdirectory URL by appending directory name
-          const subUrl = normalizedUrl + dir
-          await scanDirectory(subUrl, depth + 1)
+        if (depth === 0 && cityDirs.includes(dir)) {
+          const scannedCities = prioritizedDirs
+            .slice(0, prioritizedDirs.indexOf(dir) + 1)
+            .filter((d) => cityDirs.includes(d))
 
-          // If we're at the root level and found a good number of files, we can stop scanning more cities
-          if (depth === 0 && xmlFiles.length > 5000) {
-            if (onProgress) {
-              onProgress(`Found ${xmlFiles.length} files, limiting scan to prevent timeout`)
-            }
+          if (scannedCities.length >= 2 && xmlFiles.length > 500) {
+            warnings.push(
+              `Stopping scan after ${scannedCities.length} city directories and ${xmlFiles.length} XML files to avoid timeouts`,
+            )
             break
-          }
-
-          // Limit cities scanned at root level to prevent timeout
-          if (depth === 0 && cityDirs.includes(dir)) {
-            const scannedCities = prioritizedDirs
-              .slice(0, prioritizedDirs.indexOf(dir) + 1)
-              .filter((d) => cityDirs.includes(d))
-            if (scannedCities.length >= 2 && xmlFiles.length > 500) {
-              if (onProgress) {
-                onProgress(
-                  `Scanned ${scannedCities.length} cities, found ${xmlFiles.length} files, stopping to prevent timeout`,
-                )
-              }
-              break
-            }
           }
         }
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error"
       console.error(`Error scanning ${normalizedUrl}:`, error)
-      if (onProgress) {
-        onProgress(`Error scanning ${normalizedUrl}: ${error instanceof Error ? error.message : "Unknown error"}`)
-      }
+      warnings.push(`Error scanning ${normalizedUrl}: ${message}`)
+      onProgress?.(`Error scanning ${normalizedUrl}: ${message}`)
     }
   }
 
   await scanDirectory(baseUrl)
 
-  if (onProgress) {
-    onProgress(`Scan complete. Found ${xmlFiles.length} XML files.`)
-  }
+  onProgress?.(
+    `Scan complete. Found ${xmlFiles.length} XML file(s) and ${mediaFiles.length} media file(s) across ${visitedUrls.size} path(s).`,
+  )
 
-  return xmlFiles
+  xmlFiles.sort((a, b) => a.name.localeCompare(b.name))
+  mediaFiles.sort((a, b) => a.name.localeCompare(b.name))
+
+  return {
+    xmlFiles,
+    mediaFiles,
+    mediaCountsByExtension,
+    warnings,
+  }
 }
 
 export async function fetchRemoteFile(url: string): Promise<string> {
