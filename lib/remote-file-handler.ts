@@ -196,14 +196,15 @@ export async function fetchDirectoryListing(
           }
         } else {
           const fileName = path.basename(href)
-          const extension = path.extname(fileName).toLowerCase()
+          const sanitizedFileName = fileName.split(/[?#]/)[0] || fileName
+          const extension = path.extname(sanitizedFileName).toLowerCase()
 
           if (!allowAllExtensions && extension && !allowedExtensions.has(extension)) {
             continue
           }
 
           // Skip if already found
-          if (files.some((f) => f.name === fileName)) continue
+          if (files.some((f) => f.name === sanitizedFileName)) continue
 
           // Construct the full URL
           let fullFileUrl: string
@@ -218,10 +219,10 @@ export async function fetchDirectoryListing(
 
           if (isWithinBasePath(baseUrl, fullFileUrl)) {
             files.push({
-              name: fileName,
+              name: sanitizedFileName,
               url: fullFileUrl,
             })
-            console.log(`Added file (${extension || "no-ext"}): ${fileName} -> ${fullFileUrl}`)
+            console.log(`Added file (${extension || "no-ext"}): ${sanitizedFileName} -> ${fullFileUrl}`)
           } else {
             console.log(`Skipping file ${fileName} - outside base path`)
           }
@@ -482,7 +483,7 @@ export async function scanRemoteDirectory(
       onProgress?.(`Scanning: ${normalizedUrl} (depth: ${depth})`)
 
       const { files, directories } = await fetchDirectoryListing(normalizedUrl, baseUrl, {
-        allowedExtensions,
+        allowedExtensions: includeMedia ? [] : allowedExtensions,
       })
 
       let xmlFoundHere = 0
