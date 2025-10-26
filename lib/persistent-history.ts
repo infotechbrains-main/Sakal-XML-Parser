@@ -27,9 +27,13 @@ export interface ProcessingSession {
     xmlFilesMissingMedia?: number
     noXmlImagesRecorded?: number
     noXmlImagesFilteredOut?: number
+    moveFailures?: number
   }
   results?: {
     outputPath: string
+    failureOutputPath?: string
+    failureCount?: number
+    failurePreview?: FailedMoveRecord[]
     stats?: {
       totalFiles: number
       processedFiles: number
@@ -38,6 +42,7 @@ export interface ProcessingSession {
       recordsWritten: number
       filteredFiles: number
       movedFiles: number
+      moveFailures?: number
       totalMediaFiles?: number
       mediaFilesMatched?: number
       localMediaFilesMatched?: number
@@ -54,6 +59,15 @@ export interface ProcessingSession {
       noXmlDestinationPath?: string
     }
   }
+}
+
+export interface FailedMoveRecord {
+  imageHref: string
+  imagePath: string
+  xmlPath: string
+  failureReason: string
+  failureDetails?: string
+  filterStatus?: string
 }
 
 export class PersistentHistory {

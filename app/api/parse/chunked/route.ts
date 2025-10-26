@@ -3,7 +3,7 @@ import { promises as fs } from "fs"
 import path from "path"
 import { Worker } from "worker_threads"
 import { getPauseState, resetPauseState } from "../pause/route"
-import { PersistentHistory } from "@/lib/persistent-history"
+import { PersistentHistory, type FailedMoveRecord } from "@/lib/persistent-history"
 import { isRemotePath, scanRemoteDirectory } from "@/lib/remote-file-handler"
 import { scanLocalDirectoryForAssets } from "@/lib/media-stats"
 import { processImagesWithoutXml } from "@/lib/no-xml-processor"
@@ -16,6 +16,7 @@ interface ProcessingStats {
   recordsWritten: number
   filteredFiles: number
   movedFiles: number
+  moveFailures: number
   totalMediaFiles: number
   mediaFilesMatched: number
   localMediaFilesMatched: number
@@ -38,6 +39,18 @@ interface WorkerResult {
   imageMoved: boolean
   error?: string
   workerId: number
+  imageFailure?: ImageFailure | null
+}
+
+interface ImageFailure {
+  reason: string
+  reasonCode: string
+  details?: string
+  destinationPath?: string
+  imageHref?: string
+  imagePath?: string
+  xmlPath?: string
+  filterStatus?: string
 }
 
 interface ChunkedProcessingState {
@@ -56,10 +69,14 @@ interface ChunkedProcessingState {
   pauseTime?: string
   processedChunks: string[][]
   scanWarnings?: string[]
+  failureOutputPath?: string
+  moveFailureCount?: number
+  failurePreview?: FailedMoveRecord[]
 }
 
 const CHUNKED_STATE_FILE = path.join(process.cwd(), "chunked_processing_state.json")
 const history = new PersistentHistory()
+const FAILURE_PREVIEW_LIMIT = 50
 
 async function saveProcessingState(state: ChunkedProcessingState): Promise<void> {
   try {
@@ -254,6 +271,7 @@ export async function POST(request: NextRequest) {
           recordsWritten: 0,
           filteredFiles: 0,
           movedFiles: 0,
+          moveFailures: 0,
           totalMediaFiles: mediaFiles.length,
           mediaFilesMatched: 0,
           localMediaFilesMatched: 0,
@@ -271,6 +289,7 @@ export async function POST(request: NextRequest) {
 
         const matchedLocalMediaPaths = new Set<string>()
         let remoteMediaMatches = 0
+  const failurePreview: FailedMoveRecord[] = []
 
         const updateMediaStatsFromRecord = (record: any) => {
           if (!record) return
@@ -313,6 +332,12 @@ export async function POST(request: NextRequest) {
           outputPath = path.join(process.cwd(), outputFile)
         }
 
+        const parsedOutputPath = path.parse(outputPath)
+        const failureOutputPath = path.join(
+          parsedOutputPath.dir,
+          `${parsedOutputPath.name}_move_failures${parsedOutputPath.ext || ".csv"}`,
+        )
+
         // Create processing state
         processingState = {
           sessionId,
@@ -336,9 +361,12 @@ export async function POST(request: NextRequest) {
           matchedImagePaths: [],
           remoteMediaMatches: 0,
           outputPath,
+          failureOutputPath,
           startTime: new Date().toISOString(),
           processedChunks: [],
           scanWarnings,
+          moveFailureCount: 0,
+          failurePreview: [],
         }
 
         const updateProcessingState = (mutator: (state: ChunkedProcessingState) => void) => {
@@ -353,6 +381,9 @@ export async function POST(request: NextRequest) {
           processingState.mediaFiles = mediaFiles
           processingState.remoteMediaMatches = remoteMediaMatches
           processingState.scanWarnings = scanWarnings
+          processingState.moveFailureCount = stats.moveFailures
+          processingState.failurePreview = failurePreview
+          processingState.failureOutputPath = failureOutputPath
           await saveProcessingState(processingState)
         }
 
@@ -385,6 +416,7 @@ export async function POST(request: NextRequest) {
             mediaFilesUnmatched: stats.totalMediaFiles,
             xmlFilesWithMedia: 0,
             xmlFilesMissingMedia: stats.totalFiles,
+            moveFailures: 0,
           },
         }
 
@@ -403,6 +435,22 @@ export async function POST(request: NextRequest) {
         await fs.mkdir(outputDir, { recursive: true })
         if (verbose) {
           console.log(`[Chunked API] Created output directory: ${outputDir}`)
+        }
+
+        const failureHeaders =
+          [
+            "imageHref",
+            "imagePath",
+            "xmlPath",
+            "failureReason",
+            "failureDetails",
+            "filterStatus",
+          ].join(",") + "\n"
+
+        await fs.writeFile(failureOutputPath, failureHeaders, "utf8")
+
+        if (verbose) {
+          console.log(`[Chunked API] Initialized failure CSV file: ${failureOutputPath}`)
         }
 
         // Initialize CSV file with headers
@@ -508,6 +556,7 @@ export async function POST(request: NextRequest) {
                   mediaFilesUnmatched: stats.mediaFilesUnmatched,
                   xmlFilesWithMedia: stats.xmlFilesWithMedia,
                   xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                  moveFailures: stats.moveFailures,
                 },
               })
             }
@@ -561,12 +610,23 @@ export async function POST(request: NextRequest) {
               activeWorkers.clear()
 
               // Process results we got before interruption
-              await processChunkResults(chunkResults, outputPath, stats, verbose, updateMediaStatsFromRecord)
+              await processChunkResults(
+                chunkResults,
+                outputPath,
+                failureOutputPath,
+                stats,
+                verbose,
+                updateMediaStatsFromRecord,
+                failurePreview,
+                FAILURE_PREVIEW_LIMIT,
+              )
 
               updateProcessingState((state) => {
                 state.stats = stats
                 state.pauseTime = new Date().toISOString()
                 state.processedChunks.push(chunk)
+                state.moveFailureCount = stats.moveFailures
+                state.failurePreview = failurePreview
               })
               await persistProcessingState()
 
@@ -594,11 +654,22 @@ export async function POST(request: NextRequest) {
             }
 
             // Process results normally
-            await processChunkResults(chunkResults, outputPath, stats, verbose, updateMediaStatsFromRecord)
+            await processChunkResults(
+              chunkResults,
+              outputPath,
+              failureOutputPath,
+              stats,
+              verbose,
+              updateMediaStatsFromRecord,
+              failurePreview,
+              FAILURE_PREVIEW_LIMIT,
+            )
 
             updateProcessingState((state) => {
               state.stats = stats
               state.processedChunks.push(chunk)
+              state.moveFailureCount = stats.moveFailures
+              state.failurePreview = failurePreview
             })
             await persistProcessingState()
 
@@ -615,6 +686,7 @@ export async function POST(request: NextRequest) {
                   mediaFilesUnmatched: stats.mediaFilesUnmatched,
                   xmlFilesWithMedia: stats.xmlFilesWithMedia,
                   xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
+                  moveFailures: stats.moveFailures,
                 },
               })
             }
@@ -643,6 +715,7 @@ export async function POST(request: NextRequest) {
               errors: stats.errorFiles,
               filtered: stats.filteredFiles,
               moved: stats.movedFiles,
+              moveFailures: stats.moveFailures,
               currentChunk: chunkIndex + 1,
               totalChunks,
               stats: {
@@ -658,6 +731,7 @@ export async function POST(request: NextRequest) {
                 xmlFilesWithMedia: stats.xmlFilesWithMedia,
                 xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
                 xmlProcessedWithoutMedia: stats.xmlProcessedWithoutMedia,
+                moveFailures: stats.moveFailures,
                 noXmlImagesConsidered: stats.noXmlImagesConsidered,
                 noXmlImagesRecorded: stats.noXmlImagesRecorded,
                 noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
@@ -796,6 +870,7 @@ export async function POST(request: NextRequest) {
           recordsWritten: stats.recordsWritten,
           filteredFiles: stats.filteredFiles,
           movedFiles: stats.movedFiles,
+          moveFailures: stats.moveFailures,
           totalMediaFiles: stats.totalMediaFiles,
           mediaFilesMatched: stats.mediaFilesMatched,
           localMediaFilesMatched: stats.localMediaFilesMatched,
@@ -828,9 +903,13 @@ export async function POST(request: NextRequest) {
               xmlFilesMissingMedia: stats.xmlFilesMissingMedia,
               noXmlImagesRecorded: stats.noXmlImagesRecorded,
               noXmlImagesFilteredOut: stats.noXmlImagesFilteredOut,
+              moveFailures: stats.moveFailures,
             },
             results: {
               outputPath,
+              failureOutputPath,
+              failureCount: stats.moveFailures,
+              failurePreview,
               stats: statsSummary,
             },
           })
@@ -852,6 +931,9 @@ export async function POST(request: NextRequest) {
           sendMessage("complete", {
             stats,
             outputFile: outputPath,
+            failureOutputFile: failureOutputPath,
+            failureCount: stats.moveFailures,
+            failurePreview,
             message: completionMessage,
             scanWarnings,
           })
@@ -900,10 +982,22 @@ export async function POST(request: NextRequest) {
 async function processChunkResults(
   chunkResults: WorkerResult[],
   outputPath: string,
+  failureOutputPath: string,
   stats: ProcessingStats,
   verbose: boolean,
   updateMediaStatsFromRecord: (record: any) => void,
+  failurePreview: FailedMoveRecord[],
+  previewLimit: number,
 ): Promise<void> {
+  const formatFailureValue = (value: unknown): string => {
+    if (value === null || value === undefined) return ""
+    const stringValue = String(value)
+    if (stringValue.includes(",") || stringValue.includes("\"") || stringValue.includes("\n")) {
+      return `"${stringValue.replace(/"/g, '""')}"`
+    }
+    return stringValue
+  }
+
   for (const result of chunkResults) {
     stats.processedFiles++
 
@@ -935,6 +1029,35 @@ async function processChunkResults(
 
     if (result.imageMoved) {
       stats.movedFiles++
+    } else if (result.imageFailure) {
+      stats.moveFailures++
+
+      const failureRecord: FailedMoveRecord = {
+        imageHref: result.imageFailure.imageHref || result.record?.imageHref || "",
+        imagePath: result.imageFailure.imagePath || result.record?.imagePath || "",
+        xmlPath: result.imageFailure.xmlPath || result.record?.xmlPath || "",
+        failureReason: result.imageFailure.reason,
+        failureDetails: result.imageFailure.details,
+        filterStatus: result.imageFailure.filterStatus,
+      }
+
+      const failureLine =
+        [
+          failureRecord.imageHref,
+          failureRecord.imagePath,
+          failureRecord.xmlPath,
+          failureRecord.failureReason,
+          failureRecord.failureDetails,
+          failureRecord.filterStatus,
+        ]
+          .map(formatFailureValue)
+          .join(",") + "\n"
+
+      await fs.appendFile(failureOutputPath, failureLine, "utf8")
+
+      if (failurePreview.length < previewLimit) {
+        failurePreview.push(failureRecord)
+      }
     }
   }
 }

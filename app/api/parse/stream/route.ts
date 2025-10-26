@@ -16,6 +16,7 @@ interface ProcessingStats {
   recordsWritten: number
   filteredFiles: number
   movedFiles: number
+  moveFailures: number
   totalMediaFiles: number
   mediaFilesMatched: number
   localMediaFilesMatched: number
@@ -38,6 +39,18 @@ interface WorkerResult {
   imageMoved: boolean
   error?: string
   workerId: number
+  imageFailure?: ImageFailure | null
+}
+
+interface ImageFailure {
+  reason: string
+  reasonCode: string
+  details?: string
+  destinationPath?: string
+  imageHref?: string
+  imagePath?: string
+  xmlPath?: string
+  filterStatus?: string
 }
 
 const history = new PersistentHistory()
@@ -189,6 +202,7 @@ export async function POST(request: NextRequest) {
           recordsWritten: 0,
           filteredFiles: 0,
           movedFiles: 0,
+          moveFailures: 0,
           totalMediaFiles: mediaFiles.length,
           mediaFilesMatched: 0,
           localMediaFilesMatched: 0,

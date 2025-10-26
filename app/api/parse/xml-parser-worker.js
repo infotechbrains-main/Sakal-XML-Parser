@@ -620,9 +620,21 @@ async function moveImage(
   try {
     logWorkerState("moving_image", sourceImagePath)
 
+    const buildFailureResult = (failureCode, failureReason, failureDetails = undefined) => ({
+      success: false,
+      failureCode,
+      failureReason,
+      failureDetails,
+      destinationPath: undefined,
+    })
+
     if (!sourceImagePath || !destinationBasePath) {
       if (verbose) console.log(`[Worker ${workerId}] Missing paths for move operation.`)
-      return false
+      return buildFailureResult(
+        "INVALID_PATHS",
+        "Source or destination path is missing",
+        JSON.stringify({ sourceImagePath, destinationBasePath }),
+      )
     }
 
     if (verbose) {
@@ -642,7 +654,11 @@ async function moveImage(
         console.log(`[Worker ${workerId}] ✗ Cannot move remote image directly: ${sourceImagePath}`)
         console.log(`[Worker ${workerId}] Remote images need to be downloaded first`)
       }
-      return false
+      return buildFailureResult(
+        "REMOTE_NOT_DOWNLOADED",
+        "Remote image was not downloaded locally before move",
+        sourceImagePath,
+      )
     }
 
     // Verify source image exists (for local files and downloaded remote files)
@@ -655,7 +671,7 @@ async function moveImage(
       if (verbose) {
         console.log(`[Worker ${workerId}] ✗ Source image does not exist: ${sourceImagePath}`)
       }
-      return false
+      return buildFailureResult("SOURCE_NOT_FOUND", "Source image does not exist", sourceImagePath)
     }
 
     // Determine destination path
@@ -772,14 +788,26 @@ async function moveImage(
       console.log(`[Worker ${workerId}] ✓ Successfully moved image: ${sourceImagePath} -> ${finalDestPath}`)
     }
 
-    return true
+    return {
+      success: true,
+      destinationPath: finalDestPath,
+      failureCode: undefined,
+      failureReason: undefined,
+      failureDetails: undefined,
+    }
   } catch (error) {
     logWorkerError(error, "moveImage")
     if (verbose) {
       console.error(`[Worker ${workerId}] ✗ Error moving image ${sourceImagePath}:`, error.message)
       console.error(`[Worker ${workerId}] Stack trace:`, error.stack)
     }
-    return false
+    return {
+      success: false,
+      failureCode: "MOVE_OPERATION_ERROR",
+      failureReason: error.message,
+      failureDetails: error.stack,
+      destinationPath: undefined,
+    }
   }
 }
 
@@ -1091,6 +1119,11 @@ async function processXmlFileInWorker(
 
     const passed = passesFilter(record, filterConfig)
     let moved = false
+    let imageFailure = null
+    let moveResultInfo = null
+    const filterStatus = filterConfig?.enabled ? (passed ? "passed" : "failed") : "not_applicable"
+    const resolvedImageHref = typeof imageHref === "string" ? imageHref : imageInfo?.fileName || ""
+    const resolvedImagePath = typeof imagePath === "string" ? imagePath : imageInfo?.path || ""
 
     // Determine if we should move the image - UPDATED for remote images
     const shouldMoveImage =
@@ -1129,7 +1162,7 @@ async function processXmlFileInWorker(
           console.log(`  - Folder structure: ${filterConfig.moveFolderStructureOption}`)
         }
 
-        moved = await moveImage(
+        moveResultInfo = await moveImage(
           imagePath,
           filterConfig.moveDestinationPath,
           filterConfig.moveFolderStructureOption || "replicate",
@@ -1141,14 +1174,80 @@ async function processXmlFileInWorker(
           imageInfo?.isRemoteDownloaded || false,
         )
 
+        moved = Boolean(moveResultInfo?.success)
+
         if (verbose) {
           console.log(`[Worker ${workerId}] Image move result: ${moved ? "SUCCESS" : "FAILED"}`)
+        }
+
+        if (!moved) {
+          imageFailure = {
+            reasonCode: moveResultInfo?.failureCode || "MOVE_FAILED",
+            reason: moveResultInfo?.failureReason || "Image move failed due to unknown error",
+            details: moveResultInfo?.failureDetails,
+            destinationPath: moveResultInfo?.destinationPath,
+            imageHref: resolvedImageHref,
+            imagePath: resolvedImagePath,
+            xmlPath: xmlFilePath,
+            filterStatus,
+          }
         }
       } catch (error) {
         logWorkerError(error, "moveImageAttempt")
         if (verbose) {
           console.error(`[Worker ${workerId}] Error during image move:`, error.message)
         }
+        imageFailure = {
+          reasonCode: "MOVE_OPERATION_ERROR",
+          reason: error?.message || "Unexpected error during move operation",
+          details: error?.stack,
+          destinationPath: filterConfig?.moveDestinationPath,
+          imageHref: resolvedImageHref,
+          imagePath: resolvedImagePath,
+          xmlPath: xmlFilePath,
+          filterStatus,
+        }
+      }
+    } else if (filterConfig?.moveImages) {
+  const failureDetails = []
+      let reasonCode = "MOVE_CONDITION_NOT_MET"
+      let reason = "Image move skipped because required conditions were not met"
+
+      if (!filterConfig?.moveDestinationPath) {
+        reasonCode = "DESTINATION_NOT_CONFIGURED"
+        reason = "Move destination path is not configured"
+      } else if (!imageExists) {
+        reasonCode = "IMAGE_NOT_FOUND"
+        reason = "Image file referenced in XML could not be located"
+        if (resolvedImagePath) failureDetails.push(`Search path: ${resolvedImagePath}`)
+      } else if (!imageHref) {
+        reasonCode = "MISSING_IMAGE_REFERENCE"
+        reason = "XML record does not include an image reference"
+      } else if (!imagePath) {
+        reasonCode = "RESOLVED_PATH_MISSING"
+        reason = "Resolved image path is empty for this record"
+      } else if (imageInfo?.downloadFailed) {
+        reasonCode = "REMOTE_DOWNLOAD_FAILED"
+        reason = "Failed to download remote image before move"
+        if (imageInfo?.remoteUrl) failureDetails.push(`Remote URL: ${imageInfo.remoteUrl}`)
+      } else if (isRemote && !imageInfo?.isRemoteDownloaded) {
+        reasonCode = "REMOTE_NOT_DOWNLOADED"
+        reason = "Remote image was not downloaded locally before move"
+        if (imageInfo?.remoteUrl) failureDetails.push(`Remote URL: ${imageInfo.remoteUrl}`)
+      } else if (filterConfig?.enabled && !passed) {
+        reasonCode = "FILTER_REJECTED"
+        reason = "Asset did not pass the active filter rules"
+      }
+
+      imageFailure = {
+        reasonCode,
+        reason,
+        details: failureDetails.length > 0 ? failureDetails.join(" | ") : undefined,
+        destinationPath: filterConfig?.moveDestinationPath,
+        imageHref: resolvedImageHref,
+        imagePath: resolvedImagePath,
+        xmlPath: xmlFilePath,
+        filterStatus,
       }
     }
 
@@ -1168,6 +1267,7 @@ async function processXmlFileInWorker(
       record: record, // Always return the record
       passedFilter: passed,
       imageMoved: moved,
+      imageFailure,
       workerId,
     }
   } catch (err) {

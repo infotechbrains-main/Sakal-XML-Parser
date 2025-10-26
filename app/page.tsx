@@ -32,6 +32,7 @@ interface ProcessingResultStats {
   recordsWritten: number
   filteredFiles: number
   movedFiles: number
+  moveFailures?: number
   totalMediaFiles?: number
   mediaFilesMatched?: number
   localMediaFilesMatched?: number
@@ -55,6 +56,7 @@ interface ProcessingStats {
   errorCount: number
   filteredCount: number
   movedCount: number
+  moveFailures: number
   totalMediaFiles: number
   mediaFilesMatched: number
   localMediaFilesMatched: number
@@ -142,9 +144,13 @@ interface ProcessingSession {
     processedFilesList?: string[]
     noXmlImagesRecorded?: number
     noXmlImagesFilteredOut?: number
+    moveFailures?: number
   }
   results?: {
     outputPath: string
+    failureOutputPath?: string
+    failureCount?: number
+    failurePreview?: FailurePreviewEntry[]
     stats?: ProcessingResultStats
   }
 }
@@ -157,6 +163,18 @@ interface ProcessingResults {
   startTime?: string
   endTime?: string
   scanWarnings?: string[]
+  failureOutputFile?: string
+  failureCount?: number
+  failurePreview?: FailurePreviewEntry[]
+}
+
+interface FailurePreviewEntry {
+  imageHref: string
+  imagePath: string
+  xmlPath: string
+  failureReason: string
+  failureDetails?: string
+  filterStatus?: string
 }
 
 const getErrorMessage = (error: unknown): string => {
@@ -180,6 +198,7 @@ const DEFAULT_PROCESSING_STATS: ProcessingStats = {
   errorCount: 0,
   filteredCount: 0,
   movedCount: 0,
+  moveFailures: 0,
   totalMediaFiles: 0,
   mediaFilesMatched: 0,
   localMediaFilesMatched: 0,
@@ -291,6 +310,7 @@ export default function Home() {
       { label: "Errors", value: stats.errorCount, accentClass: "text-red-600" },
       { label: "Filtered", value: stats.filteredCount },
       { label: "Moved", value: stats.movedCount },
+      { label: "Move Failures", value: stats.moveFailures, accentClass: "text-red-600" },
     ],
     [stats],
   )
@@ -335,6 +355,11 @@ export default function Home() {
       { label: "Records Written", value: resultStats.recordsWritten },
       { label: "Filtered", value: resultStats.filteredFiles },
       { label: "Moved", value: resultStats.movedFiles },
+      {
+        label: "Move Failures",
+        value: resultStats.moveFailures ?? processingResults.failureCount ?? 0,
+        accentClass: "text-red-600",
+      },
       { label: "Duration", value: processingTime ?? "—" },
     ]
   }, [processingResults])
@@ -386,6 +411,28 @@ export default function Home() {
 
     return Object.entries(processingResults.stats.mediaCountsByExtension).sort(([, a], [, b]) => Number(b) - Number(a))
   }, [processingResults])
+
+  const failurePreviewEntries = useMemo(() => {
+    if (!processingResults?.failurePreview || processingResults.failurePreview.length === 0) {
+      return [] as FailurePreviewEntry[]
+    }
+
+    return processingResults.failurePreview.slice(0, 25)
+  }, [processingResults])
+
+  const failureOutputFile = processingResults?.failureOutputFile ?? null
+  const failureCount =
+    processingResults?.failureCount ??
+    processingResults?.stats.moveFailures ??
+    (processingResults?.failurePreview ? processingResults.failurePreview.length : 0)
+
+  const failureDownloadURL = useMemo(() => {
+    if (!failureOutputFile) {
+      return null
+    }
+
+    return `/api/download?file=${encodeURIComponent(failureOutputFile)}`
+  }, [failureOutputFile])
 
   const scanWarnings = processingResults?.scanWarnings ?? []
   const resultStartTime = processingResults?.startTime ?? processingStartTime
@@ -704,6 +751,10 @@ export default function Home() {
               statsPayload.movedFiles ??
               data.message.moved ??
               prev.movedCount,
+            moveFailures:
+              statsPayload.moveFailures ??
+              data.message.moveFailures ??
+              prev.moveFailures,
             totalMediaFiles:
               statsPayload.totalMediaFiles ??
               statsPayload.mediaFilesTotal ??
@@ -797,6 +848,13 @@ export default function Home() {
           processingTime,
           startTime: processingStartTime ?? undefined,
           endTime: new Date().toISOString(),
+          scanWarnings: data.message.scanWarnings,
+          failureOutputFile: data.message.failureOutputFile,
+          failureCount:
+            data.message.failureCount ??
+            data.message.stats?.moveFailures ??
+            data.message.stats?.failureCount,
+          failurePreview: data.message.failurePreview,
         })
 
         setIsRunning(false)
@@ -1082,6 +1140,10 @@ export default function Home() {
           processingTime,
           startTime: processingStartTime ?? undefined,
           endTime: new Date().toISOString(),
+          scanWarnings: data.scanWarnings,
+          failureOutputFile: data.failureOutputFile,
+          failureCount: data.failureCount ?? data.stats?.moveFailures,
+          failurePreview: data.failurePreview,
         })
 
         setActiveTab("results") // Auto-switch to results tab
@@ -2582,11 +2644,16 @@ export default function Home() {
                           const xmlWithoutMedia = summaryStats?.xmlProcessedWithoutMedia
                           const filteredFiles = summaryStats?.filteredFiles
                           const movedFiles = summaryStats?.movedFiles
+                          const moveFailures =
+                            summaryStats?.moveFailures ??
+                            session.results?.failureCount ??
+                            session.progress.moveFailures
                           const noXmlConsidered = summaryStats?.noXmlImagesConsidered
                           const noXmlRecorded = summaryStats?.noXmlImagesRecorded
                           const noXmlFiltered = summaryStats?.noXmlImagesFilteredOut
                           const noXmlMoved = summaryStats?.noXmlImagesMoved
                           const noXmlDestination = summaryStats?.noXmlDestinationPath
+                          const failureOutputPath = session.results?.failureOutputPath
                           const mediaMatchRate =
                             mediaTotal !== undefined && mediaTotal !== null && mediaTotal > 0 && mediaMatched !== undefined
                               ? `${((Number(mediaMatched) / Number(mediaTotal)) * 100).toFixed(1)}%`
@@ -2645,6 +2712,12 @@ export default function Home() {
                                       <div>
                                         <div className="font-medium">Moved</div>
                                         <div>{formatMetricValue(movedFiles)}</div>
+                                      </div>
+                                    )}
+                                    {moveFailures !== undefined && (
+                                      <div>
+                                        <div className="font-medium">Move Failures</div>
+                                        <div className="text-red-600">{formatMetricValue(moveFailures)}</div>
                                       </div>
                                     )}
                                   </div>
@@ -2757,6 +2830,13 @@ export default function Home() {
                                     <Button size="sm" variant="outline" asChild className="text-xs bg-transparent">
                                       <a href={`/api/download?file=${encodeURIComponent(session.results.outputPath)}`}>
                                         Download
+                                      </a>
+                                    </Button>
+                                  )}
+                                  {failureOutputPath && (
+                                    <Button size="sm" variant="outline" asChild className="text-xs bg-transparent">
+                                      <a href={`/api/download?file=${encodeURIComponent(failureOutputPath)}`}>
+                                        Failure CSV
                                       </a>
                                     </Button>
                                   )}
@@ -2933,6 +3013,76 @@ export default function Home() {
                               </div>
                             ))}
                           </div>
+                        </div>
+                      )}
+
+                      {(failureCount > 0 || failureOutputFile || failurePreviewEntries.length > 0) && (
+                        <div className="space-y-2">
+                          <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                            Move Failures
+                          </Label>
+                          <div className="rounded-md border p-3 space-y-2 text-sm">
+                            <div className="flex items-center justify-between">
+                              <span>Total</span>
+                              <span className="font-semibold text-red-600">{formatMetricValue(failureCount)}</span>
+                            </div>
+                            {failureOutputFile && (
+                              <div className="space-y-2">
+                                <div className="text-xs text-muted-foreground break-all">
+                                  {failureOutputFile}
+                                </div>
+                                {failureDownloadURL && (
+                                  <Button asChild variant="outline" size="sm" className="w-full md:w-auto">
+                                    <a href={failureDownloadURL} download>
+                                      Download Failure CSV
+                                    </a>
+                                  </Button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+
+                          {failurePreviewEntries.length > 0 && (
+                            <div className="space-y-2">
+                              <div className="text-xs text-muted-foreground">
+                                Showing {failurePreviewEntries.length} recent failures.
+                              </div>
+                              <ScrollArea className="max-h-60 border rounded">
+                                <div className="divide-y text-xs">
+                                  {failurePreviewEntries.map((entry, index) => (
+                                    <div key={`${entry.imagePath || entry.imageHref || "unknown"}-${index}`} className="p-2 space-y-1">
+                                      <div className="font-medium text-red-600">{entry.failureReason}</div>
+                                      {entry.failureDetails && (
+                                        <div className="text-muted-foreground">{entry.failureDetails}</div>
+                                      )}
+                                      <div className="grid gap-1 text-muted-foreground">
+                                        {entry.imagePath && (
+                                          <div className="break-all">
+                                            <span className="font-semibold text-foreground">Image:</span> {entry.imagePath}
+                                          </div>
+                                        )}
+                                        {entry.imageHref && (
+                                          <div className="break-all">
+                                            <span className="font-semibold text-foreground">Href:</span> {entry.imageHref}
+                                          </div>
+                                        )}
+                                        {entry.xmlPath && (
+                                          <div className="break-all">
+                                            <span className="font-semibold text-foreground">XML:</span> {entry.xmlPath}
+                                          </div>
+                                        )}
+                                        {entry.filterStatus && (
+                                          <div>
+                                            <span className="font-semibold text-foreground">Filter:</span> {entry.filterStatus}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </ScrollArea>
+                            </div>
+                          )}
                         </div>
                       )}
 

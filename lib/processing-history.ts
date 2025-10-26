@@ -26,9 +26,20 @@ export interface ProcessingSession {
     remainingFiles?: string[]
     noXmlImagesRecorded?: number
     noXmlImagesFilteredOut?: number
+    moveFailures?: number
   }
   results?: {
     outputPath: string
+    failureOutputPath?: string
+    failureCount?: number
+    failurePreview?: Array<{
+      imageHref: string
+      imagePath: string
+      xmlPath: string
+      failureReason: string
+      failureDetails?: string
+      filterStatus?: string
+    }>
     stats?: {
       totalFiles: number
       processedFiles: number
@@ -37,6 +48,7 @@ export interface ProcessingSession {
       recordsWritten: number
       filteredFiles: number
       movedFiles: number
+      moveFailures?: number
       noXmlImagesConsidered?: number
       noXmlImagesRecorded?: number
       noXmlImagesFilteredOut?: number
