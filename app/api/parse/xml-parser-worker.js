@@ -750,11 +750,18 @@ async function moveImage(
       finalDestDir = destinationBasePath
     }
 
-    finalDestPath = path.join(finalDestDir, imageFileName)
+    // Normalize the extension to lowercase
+    const ext = path.extname(imageFileName)
+    const baseName = path.basename(imageFileName, ext)
+    const normalizedFileName = ext ? `${baseName}${ext.toLowerCase()}` : imageFileName
+
+    finalDestPath = path.join(finalDestDir, normalizedFileName)
 
     if (verbose) {
       console.log(`[Worker ${workerId}] Destination paths:`)
       console.log(`  - Final directory: ${finalDestDir}`)
+      console.log(`  - Original filename: ${imageFileName}`)
+      console.log(`  - Normalized filename: ${normalizedFileName}`)
       console.log(`  - Final file path: ${finalDestPath}`)
     }
 
@@ -771,7 +778,8 @@ async function moveImage(
       const ext = path.extname(finalDestPath)
       const baseName = path.basename(finalDestPath, ext)
       const timestamp = Date.now()
-      const uniqueFileName = `${baseName}_${timestamp}${ext}`
+      const normalizedExt = ext.toLowerCase()
+      const uniqueFileName = `${baseName}_${timestamp}${normalizedExt}`
       finalDestPath = path.join(finalDestDir, uniqueFileName)
 
       if (verbose) {

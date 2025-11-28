@@ -492,19 +492,19 @@ export default function Home() {
     checkResumeStatus()
   }, [])
 
-  // Auto-scroll logs to bottom
-  useEffect(() => {
-    if (logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: "smooth" })
-    }
-  }, [messages])
+  // Auto-scroll logs to bottom - DISABLED to keep scroll position
+  // useEffect(() => {
+  //   if (logsEndRef.current) {
+  //     logsEndRef.current.scrollIntoView({ behavior: "smooth" })
+  //   }
+  // }, [messages])
 
-  // Auto-scroll error logs to bottom
-  useEffect(() => {
-    if (errorLogsEndRef.current) {
-      errorLogsEndRef.current.scrollIntoView({ behavior: "smooth" })
-    }
-  }, [errorMessages])
+  // Auto-scroll error logs to bottom - DISABLED to keep scroll position
+  // useEffect(() => {
+  //   if (errorLogsEndRef.current) {
+  //     errorLogsEndRef.current.scrollIntoView({ behavior: "smooth" })
+  //   }
+  // }, [errorMessages])
 
   // Auto-switch tabs based on processing state
   useEffect(() => {
