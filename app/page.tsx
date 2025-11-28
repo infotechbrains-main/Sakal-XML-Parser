@@ -2094,7 +2094,7 @@ export default function Home() {
                                 }))
                               }
                               placeholder="Filter value"
-                              disabled={!filterConfig.copyright?.operator}
+                              disabled={!filterConfig.copyright?.operator || filterConfig.copyright?.operator === "isBlank" || filterConfig.copyright?.operator === "notBlank"}
                             />
                           </div>
                         </div>
