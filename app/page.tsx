@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useRef, useEffect, useMemo } from "react"
+import { useState, useRef, useEffect, useMemo, useDeferredValue } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -213,6 +213,9 @@ const DEFAULT_PROCESSING_STATS: ProcessingStats = {
   noXmlImagesMoved: 0,
 }
 
+const MAX_LOG_ENTRIES = 500
+const MAX_ERROR_LOG_ENTRIES = 200
+
 const formatMetricValue = (value: number | string | undefined | null) => {
   if (value === undefined || value === null || value === "") {
     return "—"
@@ -290,6 +293,7 @@ export default function Home() {
 
   // Tab management
   const [activeTab, setActiveTab] = useState("basic")
+  const [logsAutoFollow, setLogsAutoFollow] = useState(true)
 
   // Template management
   const [templates, setTemplates] = useState<ConfigTemplate[]>([])
@@ -301,6 +305,8 @@ export default function Home() {
   const logsEndRef = useRef<HTMLDivElement>(null)
   const errorLogsEndRef = useRef<HTMLDivElement>(null)
   const ws = useRef<WebSocket | null>(null)
+  const deferredMessages = useDeferredValue(messages)
+  const deferredErrorMessages = useDeferredValue(errorMessages)
 
   const quickProcessingMetrics = useMemo(
     () => [
@@ -492,19 +498,19 @@ export default function Home() {
     checkResumeStatus()
   }, [])
 
-  // Auto-scroll logs to bottom - DISABLED to keep scroll position
-  // useEffect(() => {
-  //   if (logsEndRef.current) {
-  //     logsEndRef.current.scrollIntoView({ behavior: "smooth" })
-  //   }
-  // }, [messages])
+  useEffect(() => {
+    if (!logsAutoFollow) return
+    if (logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" })
+    }
+  }, [deferredMessages, logsAutoFollow])
 
-  // Auto-scroll error logs to bottom - DISABLED to keep scroll position
-  // useEffect(() => {
-  //   if (errorLogsEndRef.current) {
-  //     errorLogsEndRef.current.scrollIntoView({ behavior: "smooth" })
-  //   }
-  // }, [errorMessages])
+  useEffect(() => {
+    if (!logsAutoFollow) return
+    if (errorLogsEndRef.current) {
+      errorLogsEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" })
+    }
+  }, [deferredErrorMessages, logsAutoFollow])
 
   // Auto-switch tabs based on processing state
   useEffect(() => {
@@ -678,9 +684,15 @@ export default function Home() {
     console.log(`[UI] Adding message: ${type} - ${JSON.stringify(message)}`)
 
     if (type === "error") {
-      setErrorMessages((prev) => [...prev, newMessage])
+      setErrorMessages((prev) => {
+        const next = [...prev, newMessage]
+        return next.length > MAX_ERROR_LOG_ENTRIES ? next.slice(-MAX_ERROR_LOG_ENTRIES) : next
+      })
     } else {
-      setMessages((prev) => [...prev, newMessage])
+      setMessages((prev) => {
+        const next = [...prev, newMessage]
+        return next.length > MAX_LOG_ENTRIES ? next.slice(-MAX_LOG_ENTRIES) : next
+      })
     }
   }
 
@@ -2864,13 +2876,17 @@ export default function Home() {
             <TabsContent value="logs" className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Card>
-                  <CardHeader>
+                  <CardHeader className="flex items-center justify-between">
                     <CardTitle>Processing Logs</CardTitle>
+                    <div className="flex items-center space-x-2 text-xs text-muted-foreground">
+                      <Label htmlFor="followLogs" className="text-xs">Follow logs</Label>
+                      <Switch id="followLogs" checked={logsAutoFollow} onCheckedChange={setLogsAutoFollow} />
+                    </div>
                   </CardHeader>
                   <CardContent>
                     <ScrollArea className="h-64">
                       <div className="space-y-1">
-                        {messages.map((message, index) => (
+                        {deferredMessages.map((message, index) => (
                           <div key={index} className="text-sm">
                             <span className="text-muted-foreground">{message.timestamp}</span>
                             <span className="ml-2 font-medium">[{message.type.toUpperCase()}]</span>
@@ -2890,7 +2906,7 @@ export default function Home() {
                   <CardContent>
                     <ScrollArea className="h-64">
                       <div className="space-y-1">
-                        {errorMessages.map((message, index) => (
+                        {deferredErrorMessages.map((message, index) => (
                           <div key={index} className="text-sm text-red-600">
                             <span className="text-muted-foreground">{message.timestamp}</span>
                             <span className="ml-2 font-medium">[ERROR]</span>
