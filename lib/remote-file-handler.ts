@@ -28,6 +28,8 @@ export interface RemoteDirectoryScanOptions {
   maxDepth?: number
   includeMedia?: boolean
   mediaExtensions?: string[]
+  maxXmlFiles?: number
+  maxCityDirectories?: number
 }
 
 export interface RemoteDirectoryScanResult {
@@ -446,6 +448,8 @@ export async function scanRemoteDirectory(
 ): Promise<RemoteDirectoryScanResult> {
   const maxDepth = options.maxDepth ?? 5
   const includeMedia = options.includeMedia ?? true
+  const maxXmlFiles = options.maxXmlFiles ?? Number.POSITIVE_INFINITY
+  const maxCityDirectories = options.maxCityDirectories ?? Number.POSITIVE_INFINITY
 
   const mediaExtensionsFromOptions = options.mediaExtensions ?? Array.from(MEDIA_EXTENSIONS)
   const normalizedMediaExtensions = Array.from(
@@ -464,6 +468,7 @@ export async function scanRemoteDirectory(
   const mediaCountsByExtension: Record<string, number> = {}
   const warnings: string[] = []
   const visitedUrls = new Set<string>()
+  let rootCityScanCount = 0
 
   async function scanDirectory(url: string, depth = 0): Promise<void> {
     const normalizedUrl = normalizeUrl(url)
@@ -550,22 +555,23 @@ export async function scanRemoteDirectory(
         const subUrl = normalizedUrl + dir
         await scanDirectory(subUrl, depth + 1)
 
-        if (depth === 0 && xmlFiles.length > 5000) {
-          warnings.push(
-            `Stopping scan early at root after collecting ${xmlFiles.length} XML files to avoid timeouts`,
-          )
+        if (depth === 0 && xmlFiles.length >= maxXmlFiles) {
+          if (Number.isFinite(maxXmlFiles)) {
+            warnings.push(
+              `Stopping scan after reaching remote XML limit (${maxXmlFiles}) to avoid timeouts at ${normalizedUrl}`,
+            )
+          }
           break
         }
 
         if (depth === 0 && cityDirs.includes(dir)) {
-          const scannedCities = prioritizedDirs
-            .slice(0, prioritizedDirs.indexOf(dir) + 1)
-            .filter((d) => cityDirs.includes(d))
-
-          if (scannedCities.length >= 2 && xmlFiles.length > 500) {
-            warnings.push(
-              `Stopping scan after ${scannedCities.length} city directories and ${xmlFiles.length} XML files to avoid timeouts`,
-            )
+          rootCityScanCount += 1
+          if (rootCityScanCount >= maxCityDirectories) {
+            if (Number.isFinite(maxCityDirectories)) {
+              warnings.push(
+                `Stopping scan after visiting ${rootCityScanCount} city directories to respect configured limit`,
+              )
+            }
             break
           }
         }
