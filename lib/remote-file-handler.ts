@@ -331,7 +331,7 @@ export async function scanFolderCompletely(
 
     // Recursively scan all subdirectories with priority
     const processedDirs = directories.filter((dir) => dir.toLowerCase().includes("processed"))
-    const yearDirs = directories.filter((dir) => /^20[1-3][0-9]\/$/.test(dir))
+    const yearDirs = directories.filter((dir) => /^(?:19|20)\d{2}\/$/.test(dir))
     const monthDirs = directories.filter((dir) => /^(0[1-9]|1[0-2])\/$/.test(dir))
     const cityDirs = directories.filter(
       (dir) =>
@@ -525,7 +525,7 @@ export async function scanRemoteDirectory(
       }
 
       const processedDirs = directories.filter((dir) => dir.toLowerCase().includes("processed"))
-      const yearDirs = directories.filter((dir) => /^20[1-3][0-9]\/$/.test(dir))
+      const yearDirs = directories.filter((dir) => /^(?:19|20)\d{2}\/$/.test(dir))
       const monthDirs = directories.filter((dir) => /^(0[1-9]|1[0-2])\/$/.test(dir))
       const cityDirs = directories.filter(
         (dir) =>
